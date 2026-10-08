@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <list>
@@ -307,9 +308,21 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
     default: throw std::runtime_error("AGC driver: unsupported registered shader type");
     }
-    const auto high = RegisterValue(state.shader, programRegister + 1);
+    static std::atomic<unsigned> missingReports{0};
+    if (!state.shader.contains(programRegister) && missingReports.fetch_add(1) < 6) {
+        std::fprintf(stderr, "[shader-reg] type %u at 0x%llx has no program register 0x%x; sh registers:", static_cast<unsigned>(snapshot.type), static_cast<unsigned long long>(snapshot.codeAddress), programRegister);
+        for (const auto& [offset, value] : state.shader) std::fprintf(stderr, " %x=%08x", offset, value);
+        std::fprintf(stderr, " | cx:");
+        for (const auto& [offset, value] : state.context) if (offset == 0x2d5 || offset == 0x1b6 || offset == 0x29b) std::fprintf(stderr, " %x=%08x", offset, value);
+        std::fprintf(stderr, " registration=%d\n", registration ? 1 : 0);
+    }
+    // Headers that carry only the low register describe a program below 1 TiB.
+    const auto highRegister = state.shader.find(programRegister + 1);
+    const auto high = highRegister == state.shader.end() ? 0u : highRegister->second;
     if ((high & ~0xffu) != 0) throw std::runtime_error("AGC driver: invalid registered program address");
-    const auto address = (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u);
+    // A header without program registers (the title writes them itself at draw time) enters at the
+    // start of its code.
+    const auto address = state.shader.contains(programRegister) ? (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u) : snapshot.codeAddress;
     if (address < snapshot.codeAddress || address - snapshot.codeAddress >= snapshot.code.size() * 4u) throw std::runtime_error("AGC driver: registered entry point is outside shader code");
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / 4u);
     const auto code = std::span(snapshot.code).subspan(codeOffset);
@@ -687,7 +700,14 @@ void Driver::RegisterShader(const Shader* shader) {
     registered.shader = snapshot.registeredState->shader;
     registered.context = snapshot.registeredState->context;
     registered.userConfig = snapshot.registeredState->userConfig;
-    snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true);
+    // A shader that cannot be prepared from its header alone (its entry point or linked stages are
+    // only known at draw time) is left to the draw that uses it, which reports its own failure.
+    try {
+        snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true);
+    } catch (const std::exception& error) {
+        static std::atomic<unsigned> reports{0};
+        if (reports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] type %u at 0x%llx is not prepared at registration: %s\n", static_cast<unsigned>(snapshot.type), static_cast<unsigned long long>(snapshot.codeAddress), error.what());
+    }
     if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
         std::vector<std::uint64_t> key;
         BuildRegisteredAbiKey(registered, *localDevice, key);

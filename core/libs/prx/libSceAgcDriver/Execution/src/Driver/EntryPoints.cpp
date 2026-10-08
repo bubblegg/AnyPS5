@@ -1,4 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <atomic>
+#include <cstdio>
+#include <exception>
 #include <mutex>
 
 namespace AgcDriver {
@@ -106,17 +109,29 @@ extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window) {
     AgcDriver::ReleaseWindow(window);
 }
 
+// A shader ABI that cannot be prepared ahead of its draw (a limit of the recompiler, or state only
+// known at draw time) is left to the draw that uses it, which reports its own failure.
+template<typename TCall>
+static void tolerateAbi(const char* what, TCall&& call) {
+    try {
+        call();
+    } catch (const std::exception& error) {
+        static std::atomic<unsigned> reports{0};
+        if (reports.fetch_add(1) < 16) std::fprintf(stderr, "[shader-abi] %s failed, left to the draw: %.300s\n", what, error.what());
+    }
+}
+
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
 }
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+    tolerateAbi("ResolveShaderAbi", [&] { AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive); });
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    tolerateAbi("ResolveGraphicsAbi", [&] { AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType); });
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+    tolerateAbi("ResolveGraphicsStagesAbi", [&] { AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive); });
 }
