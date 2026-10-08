@@ -2454,6 +2454,27 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
     return false;
 }
 
+std::string StorageTexture::DescribePendingOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    const auto describe = [&](const StorageTexture* texture, const char* list) -> std::string {
+        for (const auto& [begin, end] : ranges) {
+            if (end <= begin || !texture->overlaps(begin, static_cast<std::size_t>(end - begin))) continue;
+            char text[224];
+            std::snprintf(text, sizeof(text), "%s image 0x%llx+0x%llx (%ux%u) over run 0x%llx+0x%llx", list, static_cast<unsigned long long>(texture->Descriptor().baseAddress), static_cast<unsigned long long>(texture->GuestBytes()), texture->Descriptor().width, texture->Descriptor().height, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+            return text;
+        }
+        return {};
+    };
+    for (const auto* texture : pending.textures) {
+        if (auto text = describe(texture, "pending"); !text.empty()) return text;
+    }
+    for (const auto* texture : pending.flushing) {
+        if (auto text = describe(texture, "flushing"); !text.empty()) return text;
+    }
+    return {};
+}
+
 std::uint64_t StorageTexture::PendingSerial() {
     return pendingSerial.load(std::memory_order_acquire);
 }

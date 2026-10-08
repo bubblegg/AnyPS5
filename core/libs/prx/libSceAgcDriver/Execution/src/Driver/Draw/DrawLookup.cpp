@@ -1,9 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <mutex>
+#include <set>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -120,6 +125,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             static std::array<std::atomic<std::uint64_t>, 9> gates{};
                             static std::atomic<std::uint64_t> total{0};
                             ++gates[static_cast<std::size_t>(outcome)];
+                            if (outcome == EntryOutcome::FlushingImage && !variants.empty()) {
+                                static std::mutex namedMutex;
+                                static std::set<std::string> named;
+                                const auto text = Graphics::StorageTexture::DescribePendingOverlap(variants.front()->runs);
+                                std::lock_guard namedLock(namedMutex);
+                                if (named.size() < 16 && named.insert(text.substr(0, text.find(" over run"))).second) std::fprintf(stderr, "[draw-cache] flushing-image gate: %s%s\n", text.empty() ? "no pending image (a shadowed unit)" : text.c_str(), Graphics::AnyShadowedOverlaps(variants.front()->runs) ? " [shadowed]" : "");
+                            }
                             if (++total % 20000 == 0) std::fprintf(stderr, "[draw-cache] gate refusals by outcome: equal-data %llu inaccessible %llu queued-label %llu flushing-image %llu publish-moved %llu pending-moved %llu forget-moved %llu (stage %zu role %d)\n", static_cast<unsigned long long>(gates[1].load()), static_cast<unsigned long long>(gates[3].load()), static_cast<unsigned long long>(gates[4].load()), static_cast<unsigned long long>(gates[5].load()), static_cast<unsigned long long>(gates[6].load()), static_cast<unsigned long long>(gates[7].load()), static_cast<unsigned long long>(gates[8].load()), i, static_cast<int>(roles[i]));
                         }
                     }

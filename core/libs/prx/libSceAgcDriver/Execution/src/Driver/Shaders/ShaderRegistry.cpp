@@ -184,18 +184,33 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
     transaction.Commit();
 }
 
+// The recompiler is entered by one preparation at a time (the transaction's writer lock), also from
+// the draw and dispatch workers. That lock is taken without the state's mutex, as transactions
+// take the two in that order.
+auto PrepareAtFirstUse(std::unique_lock<std::mutex>& stateLock, const ShaderRecompiler::RecompileRequest& request) {
+    stateLock.unlock();
+    decltype(ShaderRecompiler::PrepareShader(request)) handle;
+    {
+        ShaderPreparationTransaction serialized;
+        handle = ShaderRecompiler::PrepareShader(request);
+        serialized.Commit();
+    }
+    stateLock.lock();
+    return handle;
+}
+
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
-    std::lock_guard lock(snapshot.prepared->mutex);
+    std::unique_lock lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
     }
     if (snapshot.header.empty()) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
         APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
-        auto handle = ShaderRecompiler::PrepareShader(request);
+        auto handle = PrepareAtFirstUse(lock, request);
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
     }
@@ -206,7 +221,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     if (!strictPrepared) {
         static std::atomic<unsigned> lazyReports{0};
         if (lazyReports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] stage %u at 0x%llx (push offset %u) is prepared at first use\n", static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.layout.pushConstantOffsetBytes));
-        auto handle = ShaderRecompiler::PrepareShader(request);
+        auto handle = PrepareAtFirstUse(lock, request);
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
     }
@@ -238,7 +253,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
-    std::lock_guard lock(snapshot.prepared->mutex);
+    std::unique_lock lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
@@ -247,7 +262,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     if (snapshot.header.empty()) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
         APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
-        auto handle = ShaderRecompiler::PrepareShader(request);
+        auto handle = PrepareAtFirstUse(lock, request);
         invocationRequest = request;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
@@ -262,7 +277,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     if (!strictPrepared) {
         static std::atomic<unsigned> lazyReports{0};
         if (lazyReports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] stage %u at 0x%llx (push offset %u) is prepared at first use\n", static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.layout.pushConstantOffsetBytes));
-        auto handle = ShaderRecompiler::PrepareShader(request);
+        auto handle = PrepareAtFirstUse(lock, request);
         invocationRequest = request;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
