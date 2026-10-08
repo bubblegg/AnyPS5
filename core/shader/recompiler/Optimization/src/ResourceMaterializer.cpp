@@ -608,6 +608,17 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             plain.dimension = image.dimension == RdnaImageDimension::Dim1DArray ? RdnaImageDimension::Dim1D : image.dimension == RdnaImageDimension::Dim2DArray ? RdnaImageDimension::Dim2D : RdnaImageDimension::Dim2DMsaa;
             modes.push_back(plain);
         }
+        // Multisampled views are decoded as plain 2D images (descriptorDimension), so a multisampled
+        // access needs the single-sample modes its descriptors select.
+        if (image.dimension == RdnaImageDimension::Dim2DMsaa || image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
+            auto single = mode;
+            single.dimension = RdnaImageDimension::Dim2D;
+            modes.push_back(single);
+            if (image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
+                single.dimension = RdnaImageDimension::Dim2DArray;
+                modes.push_back(single);
+            }
+        }
         if (image.dimension == RdnaImageDimension::Dim2DArray) {
             mode.cube = true;
             modes.push_back(mode);
@@ -711,7 +722,19 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         if (mode.numericClass == decoded.numericClass && mode.dimension == decoded.dimension && mode.conversionFormat == decoded.conversionFormat && mode.packedFormat == decoded.packedFormat && mode.cube == decoded.cube && mode.depthBits == decoded.depthBits && mode.depthUnorm16 == decoded.depthUnorm16 && mode.srgbDecode == decoded.srgbDecode) return index;
     }
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) throw std::runtime_error("image address has too few coordinate components");
-    throw std::runtime_error("image descriptor is incompatible with the static runtime image interface");
+    std::string detail = "image descriptor is incompatible with the static runtime image interface: T#";
+    char text[160];
+    for (std::uint32_t i = 0; i < 8u; ++i) {
+        std::snprintf(text, sizeof(text), " %08x", descriptor.dwords[i]);
+        detail += text;
+    }
+    std::snprintf(text, sizeof(text), "; instruction dim %u class %u compare %d; decoded class %u dim %u conv %u packed %u cube %d depthBits %d d16 %d srgb %d fmask %d emulated %d; modes:", static_cast<unsigned>(image.dimension), static_cast<unsigned>(image.resourceClass), image.depthCompare ? 1 : 0, static_cast<unsigned>(decoded.numericClass), static_cast<unsigned>(decoded.dimension), static_cast<unsigned>(decoded.conversionFormat), static_cast<unsigned>(decoded.packedFormat), decoded.cube ? 1 : 0, decoded.depthBits ? 1 : 0, decoded.depthUnorm16 ? 1 : 0, decoded.srgbDecode ? 1 : 0, decoded.fmask ? 1 : 0, emulated ? 1 : 0);
+    detail += text;
+    for (const auto& mode : modes) {
+        std::snprintf(text, sizeof(text), " [class %u dim %u conv %u packed %u cube %d depthBits %d d16 %d srgb %d cmp %u]", static_cast<unsigned>(mode.numericClass), static_cast<unsigned>(mode.dimension), static_cast<unsigned>(mode.conversionFormat), static_cast<unsigned>(mode.packedFormat), mode.cube ? 1 : 0, mode.depthBits ? 1 : 0, mode.depthUnorm16 ? 1 : 0, mode.srgbDecode ? 1 : 0, static_cast<unsigned>(mode.emulatedCompare));
+        detail += text;
+    }
+    throw std::runtime_error(detail);
 }
 
 std::uint32_t ResourceMaterializer::EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index) {

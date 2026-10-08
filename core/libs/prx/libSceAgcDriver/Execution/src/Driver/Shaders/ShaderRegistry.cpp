@@ -92,14 +92,21 @@ struct ShaderPreparationTransaction::State {
         std::shared_ptr<PreparedShaders> destination;
         PreparedShaderState prepared;
     };
-    static std::mutex writers;
+    static std::timed_mutex writers;
     static thread_local State* active;
-    std::unique_lock<std::mutex> lock{writers};
+    // Guest threads prepare shaders from job workers while a stop-the-world collection is raised: the
+    // wait returns to user mode every slice so an exception redirected onto a waiting thread is
+    // delivered (as libkernel's LockInterruptible does for guest locks).
+    std::unique_lock<std::timed_mutex> lock = [] {
+        std::unique_lock<std::timed_mutex> held(writers, std::defer_lock);
+        while (!held.try_lock_for(std::chrono::milliseconds(2))) {}
+        return held;
+    }();
     std::map<PreparedShaders*, Change> changes;
     bool failed = false;
 };
 
-std::mutex ShaderPreparationTransaction::State::writers;
+std::timed_mutex ShaderPreparationTransaction::State::writers;
 thread_local ShaderPreparationTransaction::State* ShaderPreparationTransaction::State::active = nullptr;
 
 ShaderPreparationTransaction::ShaderPreparationTransaction() {
@@ -183,6 +190,17 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
     }
+    // A variant that was not prepared ahead (a push layout or linked stage only the draw knows, or a
+    // shader whose registration-time preparation failed) is prepared at its first use, like the
+    // unregistered compute shaders above. APS5_STRICT_PREPARED_SHADERS=1 rejects it instead.
+    static const bool strictPrepared = std::getenv("APS5_STRICT_PREPARED_SHADERS") != nullptr;
+    if (!strictPrepared) {
+        static std::atomic<unsigned> lazyReports{0};
+        if (lazyReports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] stage %u at 0x%llx (push offset %u) is prepared at first use\n", static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.layout.pushConstantOffsetBytes));
+        auto handle = ShaderRecompiler::PrepareShader(request);
+        snapshot.prepared->entries.push_back({codeOffset, handle});
+        return handle;
+    }
     std::string layouts;
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset || entry.handle == nullptr || entry.handle->artifact == nullptr) continue;
@@ -225,6 +243,21 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
         if (!invocation.has_value()) throw std::runtime_error("AGC driver: raw compute artifact does not match its invocation");
+        snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
+        return std::move(*invocation);
+    }
+    // A variant that was not prepared ahead (a push layout or linked stage only the draw knows, or a
+    // shader whose registration-time preparation failed) is prepared at its first use, like the
+    // unregistered compute shaders above. APS5_STRICT_PREPARED_SHADERS=1 rejects it instead.
+    static const bool strictPrepared = std::getenv("APS5_STRICT_PREPARED_SHADERS") != nullptr;
+    if (!strictPrepared) {
+        static std::atomic<unsigned> lazyReports{0};
+        if (lazyReports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] stage %u at 0x%llx (push offset %u) is prepared at first use\n", static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.layout.pushConstantOffsetBytes));
+        auto handle = ShaderRecompiler::PrepareShader(request);
+        invocationRequest = request;
+        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
+        auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
+        if (!invocation.has_value()) throw std::runtime_error("AGC driver: artifact prepared at first use does not match its invocation");
         snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
         return std::move(*invocation);
     }
