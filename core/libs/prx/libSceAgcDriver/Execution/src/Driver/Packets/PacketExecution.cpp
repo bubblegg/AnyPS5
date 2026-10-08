@@ -255,6 +255,15 @@ void Driver::execute(const Submission& submission) {
                     if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
                 };
 
+                // A draw the driver cannot run is skipped and reported once per reason, so one unsupported
+                // state costs its own pixels, not the title. APS5_STRICT_DRAWS=1 fails instead.
+                static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
+                const auto skipDraw = [&](const std::string& what) {
+                    if (strictDraws) throw std::runtime_error(what);
+                    char suffix[80];
+                    std::snprintf(suffix, sizeof(suffix), " [%s, color target 0x%llx]", Pm4::Name(header).c_str(), static_cast<unsigned long long>(color));
+                    reportSkip("draw", what + suffix);
+                };
                 try {
                     std::string rejected;
                     const auto verdict = draw(queue, packet, submission, rejected);
@@ -262,7 +271,7 @@ void Driver::execute(const Submission& submission) {
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
                         countSkip(Graphics::DrawSkip::Prechecked);
-                        throw std::runtime_error(rejected);
+                        skipDraw(rejected);
                     } else if (verdict == DrawVerdict::Nothing) {
                         countSkip(Graphics::DrawSkip::Nothing);
                     } else if (traceDraws) {
@@ -270,8 +279,9 @@ void Driver::execute(const Submission& submission) {
                     }
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
+                    skipDraw(error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
-                    throw;
+
                 }
             });
             finishDrawPacket(drawn);

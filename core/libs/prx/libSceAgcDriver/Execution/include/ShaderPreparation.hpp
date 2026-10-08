@@ -17,6 +17,8 @@ public:
     PreparedShaderState& Edit(const ShaderSnapshot& snapshot);
     const PreparedShaderState& Read(const ShaderSnapshot& snapshot) const;
     void Commit();
+    // A failure of a nested transaction that its caller handled no longer aborts the enclosing one.
+    static void Forgive();
 
 private:
     struct State;

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include <atomic>
 #include <cstdio>
 #include <exception>
@@ -116,6 +117,7 @@ static void tolerateAbi(const char* what, TCall&& call) {
     try {
         call();
     } catch (const std::exception& error) {
+        AgcDriver::DriverDetail::ShaderPreparationTransaction::Forgive();
         static std::atomic<unsigned> reports{0};
         if (reports.fetch_add(1) < 16) std::fprintf(stderr, "[shader-abi] %s failed, left to the draw: %.300s\n", what, error.what());
     }

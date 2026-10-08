@@ -137,6 +137,10 @@ const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapsh
     return found != root->changes.end() ? found->second.prepared : *snapshot.prepared;
 }
 
+void ShaderPreparationTransaction::Forgive() {
+    if (State::active != nullptr) State::active->failed = false;
+}
+
 void ShaderPreparationTransaction::Commit() {
     require(!committed && !root->failed, "shader preparation transaction was aborted");
     if (state != nullptr) {
@@ -738,6 +742,7 @@ void Driver::RegisterShader(const Shader* shader) {
     try {
         snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true);
     } catch (const std::exception& error) {
+        ShaderPreparationTransaction::Forgive();
         static std::atomic<unsigned> reports{0};
         if (reports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] type %u at 0x%llx is not prepared at registration: %s\n", static_cast<unsigned>(snapshot.type), static_cast<unsigned long long>(snapshot.codeAddress), error.what());
     }
