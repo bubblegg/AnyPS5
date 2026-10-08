@@ -93,12 +93,13 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
             return RdnaImageDimension::Dim2DArray;
         case ImageType::Color2DArray:
             return wantArray ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
+        // Multisampled surfaces are rendered with one sample by the driver (its MsaaAsSingleSample),
+        // so their views are plain 2D images: a sample fetch reads that sample, its index ignored.
         case ImageType::Color2DMsaaArray:
-            return wantArray ? RdnaImageDimension::Dim2DMsaaArray : RdnaImageDimension::Dim2DMsaa;
+            return wantArray ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
         case ImageType::Color2D:
-            return RdnaImageDimension::Dim2D;
         case ImageType::Color2DMsaa:
-            return RdnaImageDimension::Dim2DMsaa;
+            return RdnaImageDimension::Dim2D;
         default:
             throw std::runtime_error("image descriptor has an unsupported type");
     }

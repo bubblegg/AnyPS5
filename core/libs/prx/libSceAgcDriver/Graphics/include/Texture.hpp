@@ -22,6 +22,7 @@ namespace AgcDriver::Graphics {
 
 class ResidentColor;
 class CommandBatch;
+class Recorder;
 class StorageTexture;
 struct HostImport;
 
@@ -268,6 +269,11 @@ public:
     // may carry DCC metadata, and this surface must be host-imported (the write-back is GPU-direct).
     // False, naming why, when the copy must be a transfer.
     bool CopyFrom(StorageTexture& source, const char*& refusal);
+    // A CB resolve into this surface (multisampled targets are rendered with one sample, so the
+    // resolve is a copy of the source's image): the first level of the first layer, of the same
+    // extent and storage format; DCC metadata does not matter (both images hold their texels
+    // uncompressed). False, naming why, when the images do not match.
+    bool ResolveFrom(StorageTexture& source, const char*& refusal);
     VkImage Image() const { return image; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
@@ -292,6 +298,8 @@ public:
     std::uint64_t GuestBytes() const;
 
 private:
+    // CopyFrom's and ResolveFrom's device copy (every level and layer, or the first only).
+    void copyImageFrom(StorageTexture& source, Recorder& recorder, bool firstLevelOnly);
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others

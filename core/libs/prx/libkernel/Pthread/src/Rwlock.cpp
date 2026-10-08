@@ -42,7 +42,7 @@ int APS5_VABI scePthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockatt
 int APS5_VABI scePthreadRwlockRdlock(PthreadRwlock* rwlock) {
     auto* lock = RequireRwlock(rwlock, __func__);
     if (OwnsWrite(lock)) return SCE_KERNEL_ERROR_EDEADLK;
-    lock->_lock.lock_shared();
+    TimedWait::LockSharedInterruptible(lock->_lock);
     return SCE_OK;
 }
 
@@ -62,7 +62,7 @@ int APS5_VABI scePthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds 
 int APS5_VABI scePthreadRwlockWrlock(PthreadRwlock* rwlock) {
     auto* lock = RequireRwlock(rwlock, __func__);
     if (OwnsWrite(lock)) return SCE_KERNEL_ERROR_EDEADLK;
-    lock->_lock.lock();
+    TimedWait::LockInterruptible(lock->_lock);
     lock->_writer.store(std::this_thread::get_id(), std::memory_order_release);
     return SCE_OK;
 }

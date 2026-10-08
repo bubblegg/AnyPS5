@@ -1012,8 +1012,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     const bool volume = descriptor.dimension == TextureDimension::k3D;
     Require(depthSlice == 0 || (volume && mip == 0 && depthSlice <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
     const auto found = attachmentViews.find({format, mip, depthSlice});
-    if (found != attachmentViews.end()) return found->second;
-    VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    if (found != attachmentViews.end()) return found->second;    VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = &usage;
@@ -1190,6 +1189,12 @@ LookupOutcomes& ThreadLookupOutcomes() {
 }
 
 bool StorageTexture::Refresh() {
+    // Callers reach the image through references or raw pointers as well: the flush below may drop
+    // the last owner (an eviction), which would destroy the image under its own upload, and an
+    // image whose owners are already gone (its destructor about to release the Vulkan image) must
+    // not record work on it. The reference keeps it alive until the refresh is over.
+    const auto self = weak_from_this().lock();
+    if (self == nullptr) return true;
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     struct Exempt {
@@ -3080,6 +3085,30 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         refusal = "no recorder";
         return false;
     }
+    copyImageFrom(source, *recorder, false);
+    return true;
+}
+
+bool StorageTexture::ResolveFrom(StorageTexture& source, const char*& refusal) {
+    if (&source == this || source.descriptor.width != descriptor.width || source.descriptor.height != descriptor.height || source.storageFormat != storageFormat) {
+        refusal = "shape";
+        return false;
+    }
+    if (released || source.released || !Cached() || !source.Cached()) {
+        refusal = "released";
+        return false;
+    }
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) {
+        refusal = "no recorder";
+        return false;
+    }
+    copyImageFrom(source, *recorder, true);
+    return true;
+}
+
+void StorageTexture::copyImageFrom(StorageTexture& source, Recorder& recorderRef, bool firstLevelOnly) {
+    auto* recorder = &recorderRef;
     // The source image must hold the surface: a stale one uploads first (and other images'
     // results pending over its memory land first, as the transfer's flush would have them).
     source.Refresh();
@@ -3122,8 +3151,11 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     barriers[1].image = image;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     std::vector<VkImageCopy> regions;
-    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-        for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+    // A resolve copies the one image both surfaces describe (the first level of the first layer).
+    const auto layers = firstLevelOnly ? 1u : arrayLayers;
+    const auto levels = firstLevelOnly ? 1u : descriptor.mipCount;
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t level = 0; level < levels; ++level) {
             if (!geometry.HasLayer(level, layer)) continue;
             VkImageCopy region{};
             region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
@@ -3149,7 +3181,6 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     refreshGeneration();
     forgetBorrowed(0, trackedLayers);
     MarkDirty();
-    return true;
 }
 
 // See AdjacentGenerationEnabled above.

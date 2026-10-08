@@ -64,6 +64,13 @@ const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& OwnedAddons() {
 
 extern "C" {
 
+// Entitlement keys are bound to the console's license; none is present here.
+int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label, void* key) {
+    (void)service_label;
+    if (!entitlement_label || !key) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+    return SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_FOUND;
+}
+
 int APS5_VABI sceNpEntitlementAccessGetAddcontEntitlementInfo(uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label, NpEntitlementAccessAddcontEntitlementInfo* info) {
     (void)service_label;
     if (!entitlement_label || !info) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;

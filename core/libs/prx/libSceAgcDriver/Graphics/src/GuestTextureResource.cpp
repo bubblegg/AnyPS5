@@ -35,6 +35,13 @@ TextureTileMode resolveTileMode(std::uint32_t raw) {
     }
 }
 
+// Multisampled surfaces are rendered with one sample (see MsaaAsSingleSample): their 2D MSAA views
+// read that sample as plain 2D images. APS5_NO_MSAA_DOWNGRADE=1 rejects them, as before.
+bool MsaaAsSingleSample() {
+    static const bool downgrade = std::getenv("APS5_NO_MSAA_DOWNGRADE") == nullptr;
+    return downgrade;
+}
+
 TextureDimension resolveDimension(std::uint32_t raw) {
     switch (raw) {
         case 8: return TextureDimension::k1D;
@@ -43,8 +50,11 @@ TextureDimension resolveDimension(std::uint32_t raw) {
         case 11: return TextureDimension::kCube;
         case 12: return TextureDimension::k1DArray;
         case 13: return TextureDimension::k2DArray;
-        default: throw std::runtime_error("AGC graphics: guest texture descriptor uses an unsupported image type " + std::to_string(raw));
+        case 14: if (MsaaAsSingleSample()) return TextureDimension::k2D; break;
+        case 15: if (MsaaAsSingleSample()) return TextureDimension::k2DArray; break;
+        default: break;
     }
+    throw std::runtime_error("AGC graphics: guest texture descriptor uses an unsupported image type " + std::to_string(raw));
 }
 
 }
@@ -65,7 +75,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     const auto dstSelY = (words[3] >> 3u) & 0x7u;
     const auto dstSelZ = (words[3] >> 6u) & 0x7u;
     const auto dstSelW = (words[3] >> 9u) & 0x7u;
-    const auto baseLevel = (words[3] >> 12u) & 0xfu;
+    auto baseLevel = (words[3] >> 12u) & 0xfu;
     auto lastLevel = (words[3] >> 16u) & 0xfu;
     const auto tileModeRaw = (words[3] >> 20u) & 0x1fu;
     const auto bcSwizzle = (words[3] >> 25u) & 0x7u;
@@ -75,7 +85,9 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     const auto baseArray = (words[4] >> 16u) & 0x1fffu;
 
     const auto arrayPitch = (words[5] >> 0u) & 0xfu;
-    const auto maxMip = (words[5] >> 4u) & 0xfu;
+    auto maxMip = (words[5] >> 4u) & 0xfu;
+    // A 2D MSAA view's level fields count samples (log2), not mips: its one sample is one level.
+    if ((typeRaw == 14u || typeRaw == 15u) && MsaaAsSingleSample()) baseLevel = lastLevel = maxMip = 0;
     const auto minLodWarn = (words[5] >> 8u) & 0xfffu;
     const auto cornerSample = ((words[5] >> 23u) & 0x1u) != 0;
     const auto mipStatsCntEn = ((words[5] >> 25u) & 0x1u) != 0;
@@ -110,7 +122,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     Require(!cornerSample, "guest texture descriptor uses corner sampling which is not implemented");
     Require(!prtDefColor, "guest texture descriptor uses a partially resident default color which is not implemented");
     Require(arrayPitch == 0, "guest texture descriptor uses a nonzero array pitch which is not implemented");
-    Require(!msaaDepth, "guest texture descriptor uses MSAA which is not implemented");
+    Require(!msaaDepth || MsaaAsSingleSample(), "guest texture descriptor uses MSAA which is not implemented");
     static_cast<void>(maxUncompBlkSize);
     static_cast<void>(maxCompBlkSize);
     // Surfaces are always written uncompressed here (render targets and storage images bypass DCC), so

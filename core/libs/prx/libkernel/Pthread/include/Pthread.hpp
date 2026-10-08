@@ -29,9 +29,11 @@ struct PthreadMutexPrivate {
     std::timed_mutex _mtx;
     MutexType _type;
     std::atomic<std::thread::id> _owner;
+    // The holder's host thread id, for the APS5_TRACE_MUTEX_STALL report.
+    std::atomic<unsigned long> _ownerHost;
     int _count;
 
-    PthreadMutexPrivate() : _type(MutexType::ErrorCheck), _owner(std::thread::id{}), _count(0) {}
+    PthreadMutexPrivate() : _type(MutexType::ErrorCheck), _owner(std::thread::id{}), _ownerHost(0), _count(0) {}
 };
 
 struct PthreadRwlockattrPrivate {

@@ -23,6 +23,9 @@ struct GuestRuntime {
     std::uint32_t InitRva = 0;
     std::uint32_t FiniRva = 0;
     bool UsePlatformTlsResolver = true;
+    // Loaded with the executable but initialized by the dynamic loader when the title opens it
+    // (sceKernelLoadStartModule), as the console does for modules the title loads itself.
+    bool Deferred = false;
     std::vector<std::string> Names;
 };
 

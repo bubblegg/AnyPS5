@@ -909,6 +909,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
+        RetireDepthSurfacesAt(color.address, "a color target is bound at its memory");
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
@@ -2143,6 +2144,24 @@ std::shared_ptr<StorageTexture> metadataPassResident(const Context& context, con
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
+    if (pass.mode == ColorMetadataPass::Mode::Resolve) {
+        // The multisampled source was rendered with one sample: the resolve copies its image into
+        // the destination's (both resident; the destination's keys are then uncompressed).
+        const auto& source = pass.targets.at(0);
+        const auto& destination = pass.targets.at(1);
+        const auto from = metadataPassResident(context, source);
+        const auto into = metadataPassResident(context, destination);
+        const char* refusal = from == nullptr || into == nullptr ? "not resident" : nullptr;
+        if (refusal == nullptr && into->ResolveFrom(*from, refusal)) {
+            if (destination.dccAddress != 0) MarkDccUncompressed(context, destination.dccAddress, destination.bytes);
+            return;
+        }
+        static std::mutex reportedMutex;
+        static std::set<std::uint64_t> reported;
+        std::lock_guard lock(reportedMutex);
+        if (reported.insert(destination.address).second) std::fprintf(stderr, "[gpu] CB resolve 0x%llx -> 0x%llx skipped: %s\n", static_cast<unsigned long long>(source.address), static_cast<unsigned long long>(destination.address), refusal);
+        return;
+    }
     for (const auto& color : pass.targets) {
         if (color.cmaskAddress != 0) {
             const auto resident = metadataPassResident(context, color);

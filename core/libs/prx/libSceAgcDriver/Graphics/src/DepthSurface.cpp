@@ -7,9 +7,13 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <atomic>
+#include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -20,6 +24,7 @@ class DepthSurface {
 public:
     DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target) {
         this->context.bufferPool.reset();
+        if (std::getenv("APS5_TRACE_DEPTH") != nullptr) std::fprintf(stderr, "[depth] surface created: depth 0x%llx stencil 0x%llx %ux%u VkFormat %d\n", static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), target.extent.width, target.extent.height, static_cast<int>(target.format));
         VkFormatProperties properties{};
         context.formatProperties(context.physical, target.format, &properties);
         Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be an attachment on this device");
@@ -139,6 +144,41 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
+// Surfaces whose guest memory the title reuses for something else. Their images may still be
+// referenced by recorded commands and sampled textures, so they are kept until the device goes.
+std::vector<std::unique_ptr<DepthSurface>>& retired() {
+    static auto* list = new std::vector<std::unique_ptr<DepthSurface>>();
+    return *list;
+}
+
+// Caller holds surfacesMutex().
+bool retireWhere(const std::function<bool(const DepthSurface&)>& stale, const char* why) {
+    auto& list = surfaces();
+    bool any = false;
+    for (auto it = list.begin(); it != list.end();) {
+        if (!stale(**it)) {
+            ++it;
+            continue;
+        }
+        static std::atomic<unsigned> reports{0};
+        if (reports.fetch_add(1) < 24) std::fprintf(stderr, "[gpu] depth surface 0x%llx / stencil 0x%llx (%ux%u) retired: %s\n", static_cast<unsigned long long>((*it)->target.address), static_cast<unsigned long long>((*it)->target.stencilAddress), (*it)->target.extent.width, (*it)->target.extent.height, why);
+        retired().push_back(std::move(*it));
+        it = list.erase(it);
+        any = true;
+    }
+    return any;
+}
+
+bool sharesMemory(const DepthTarget& a, const DepthTarget& b) {
+    const auto same = [](std::uint64_t x, std::uint64_t y) { return x != 0 && x == y; };
+    return same(a.address, b.address) || same(a.address, b.stencilAddress) || same(a.stencilAddress, b.address) || same(a.stencilAddress, b.stencilAddress);
+}
+
+// Caller holds surfacesMutex(): a new surface replaces older ones laid out differently over its memory.
+void retireReplaced(const Context& context, const DepthTarget& target) {
+    retireWhere([&](const DepthSurface& surface) { return surface.context.device == context.device && sharesMemory(surface.target, target) && (surface.target.address != target.address || surface.target.extent.width != target.extent.width || surface.target.extent.height != target.extent.height); }, "its memory holds a different depth target now");
+}
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -154,17 +194,66 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     for (const auto& surface : surfaces()) {
         if (surface->context.device == context.device && sameSurface(surface->target, target)) return surface->view;
     }
+    retireReplaced(context, target);
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
     return surfaces().back()->view;
+}
+
+void ClearDepthSurface(const Context& context, const DepthTarget& target, bool depth, bool stencil) {
+    if (!depth && !stencil) return;
+    VkImage image = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(surfacesMutex());
+        static std::set<std::array<std::uint64_t, 3>> reported;
+        if (reported.size() < 16 && reported.insert({target.address, target.stencilAddress, (depth ? 1u : 0u) | (stencil ? 2u : 0u)}).second) std::fprintf(stderr, "[gpu] depth clear pass: depth 0x%llx stencil 0x%llx %ux%u clears%s%s (to %g / 0x%02x)\n", static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), target.extent.width, target.extent.height, depth ? " depth" : "", stencil ? " stencil" : "", static_cast<double>(target.clearDepth), static_cast<unsigned>(target.clearStencil));
+        auto& list = surfaces();
+        auto found = std::find_if(list.begin(), list.end(), [&](const auto& surface) { return surface->context.device == context.device && sameSurface(surface->target, target); });
+        // A new surface starts cleared to the target's clear values (its constructor), which this is.
+        if (found == list.end()) {
+            retireReplaced(context, target);
+            surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+            return;
+        }
+        image = (*found)->image;
+    }
+    auto* recorder = Recorder::Active();
+    std::unique_ptr<CommandBatch> batch;
+    if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+    const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+    const VkImageAspectFlags aspects = (depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    // Earlier draws' depth tests and writes finish before the clear; later draws see it.
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    const VkClearDepthStencilValue clear{target.clearDepth, target.clearStencil};
+    const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
+    context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+    if (batch) batch->SubmitAndWait();
+    else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+}
+
+void ClearDepthPlanes(const Context& context) {
+    std::vector<DepthTarget> targets;
+    {
+        std::lock_guard lock(surfacesMutex());
+        for (const auto& surface : surfaces()) {
+            if (surface->context.device == context.device && surface->target.address != 0) targets.push_back(surface->target);
+        }
+    }
+    for (const auto& target : targets) ClearDepthSurface(context, target, true, false);
 }
 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
+    std::erase_if(retired(), [&](const auto& surface) { return surface->context.device == device; });
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
     std::lock_guard lock(surfacesMutex());
+    // A texture of another size over a surface's memory is not a view of it: the memory was reused.
+    retireWhere([&](const DepthSurface& surface) {
+        return surface.context.device == context.device && (surface.target.address == resource.baseAddress || (surface.target.stencilAddress != 0 && surface.target.stencilAddress == resource.baseAddress)) && (surface.target.extent.width != resource.width || surface.target.extent.height != resource.height);
+    }, "a texture of another size is sampled from its memory");
     const auto& list = surfaces();
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
         return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
@@ -175,6 +264,12 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
+}
+
+void RetireDepthSurfacesAt(std::uint64_t address, const char* why) {
+    if (address == 0) return;
+    std::lock_guard lock(surfacesMutex());
+    retireWhere([&](const DepthSurface& surface) { return surface.target.address == address || surface.target.stencilAddress == address; }, why);
 }
 
 }

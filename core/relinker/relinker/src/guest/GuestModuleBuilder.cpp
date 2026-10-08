@@ -12,7 +12,7 @@
 
 namespace Relinker {
 
-std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool toIntel, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules) const {
+std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool toIntel, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::vector<std::filesystem::path>& extraDirectories) const {
     const auto root = std::filesystem::absolute(inputPath).parent_path();
     const auto singular = root / "sce_module";
     const auto plural = root / "sce_modules";
@@ -25,6 +25,16 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     std::vector<std::filesystem::path> directories;
     if (hasSingular || hasPlural) directories.push_back(hasSingular ? singular : plural);
     if (hasPrx) directories.push_back(prx);
+    // Modules the title loads itself (sceKernelLoadStartModule), e.g. Unity's Media/Plugins: the
+    // loader picks up <module>.guest.prx beside the original path.
+    std::set<std::filesystem::path> deferredDirectories;
+    for (const auto& extra : extraDirectories) {
+        if (extra.is_absolute()) throw Domain::RelinkerException("Guest module directory must be relative to the input executable: " + extra.string());
+        const auto directory = (root / extra).lexically_normal();
+        if (!std::filesystem::is_directory(directory)) throw Domain::RelinkerException("Guest module directory not found: " + directory.string());
+        if (std::find(directories.begin(), directories.end(), directory) == directories.end()) directories.push_back(directory);
+        deferredDirectories.insert(directory);
+    }
     std::vector<std::filesystem::path> paths;
     std::set<std::string> unmatchedExclusions = excludedModules;
     const auto isElf = [](const std::filesystem::path& path) {
@@ -253,6 +263,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         if (std::filesystem::exists(target) && std::filesystem::equivalent(inputPath, target)) throw Domain::RelinkerException("Guest output would overwrite the input executable");
         Domain::GuestRuntime runtime;
         runtime.UsePlatformTlsResolver = image.UsePlatformTlsResolver;
+        runtime.Deferred = deferredDirectories.contains(image.SourcePath.parent_path().lexically_normal());
         runtime.Path = relativeDirectory + "/" + image.OutputName;
         runtime.Names = {image.SourcePath.filename().string(), image.Soname};
         std::vector<std::uint8_t> output;

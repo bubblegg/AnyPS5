@@ -4,6 +4,12 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <utility>
+#include <vector>
 #endif
 #ifdef __APPLE__
 #include <dlfcn.h>
@@ -172,54 +178,90 @@ bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
 #endif
     return DecodeCandidate(context, frame, query);
 #else
-    MEMORY_BASIC_INFORMATION memory{};
-    if (!VirtualQuery(reinterpret_cast<void*>(query.pc), &memory, sizeof(memory)) || memory.Type != MEM_IMAGE)
-        return false;
-    const auto* base = static_cast<const Byte*>(memory.AllocationBase);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    const auto* sections = IMAGE_FIRST_SECTION(nt);
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        const auto& section = sections[i];
-        if (std::memcmp(section.Name, ".ehmeta", 8) == 0) {
-            const Byte* metadata = base + section.VirtualAddress;
-            const Byte* header = base + Read<std::uint32_t>(metadata);
-            if (header[0] != 1 || header[3] == 255) return false;
-            const Byte* p = header + 4;
-            Encoded(p, header[1], Word(header));
-            const Word count = Encoded(p, header[2]);
-            const auto width = EncodingSize(header[3]);
-            const Byte* table = p;
-            Word lo = 0, hi = count;
-            while (lo < hi) {
-                const Word mid = lo + (hi - lo) / 2;
-                p = table + mid * width * 2;
-                if (Encoded(p, header[3], Word(header)) <= query.pc) lo = mid + 1;
-                else hi = mid;
+    // Each image is looked up once: its extent, and its .ehmeta search table or (images with only
+    // .eh_frame, the host libraries) its FDEs sorted by start address. A throw decodes a frame per
+    // step, and a VirtualQuery plus a linear scan of the whole section per frame made every
+    // exception a host library raises (a skipped draw) cost milliseconds.
+    struct ImageFrames {
+        Word end {};
+        const Byte* header {};
+        std::vector<std::pair<Word, const Byte*>> fdes;
+    };
+    static std::shared_mutex imagesLock;
+    static std::map<Word, ImageFrames> images;
+    const ImageFrames* image = nullptr;
+    {
+        std::shared_lock lock(imagesLock);
+        if (auto it = images.upper_bound(query.pc); it != images.begin() && query.pc < (--it)->second.end) image = &it->second;
+    }
+    if (image == nullptr) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (!VirtualQuery(reinterpret_cast<void*>(query.pc), &memory, sizeof(memory)) || memory.Type != MEM_IMAGE)
+            return false;
+        const auto* base = static_cast<const Byte*>(memory.AllocationBase);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+        ImageFrames entry;
+        entry.end = Word(base) + nt->OptionalHeader.SizeOfImage;
+        const auto* sections = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+            const auto& section = sections[i];
+            if (std::memcmp(section.Name, ".ehmeta", 8) == 0) {
+                const Byte* metadata = base + section.VirtualAddress;
+                const Byte* header = base + Read<std::uint32_t>(metadata);
+                if (header[0] == 1 && header[3] != 255) entry.header = header;
+                break;
             }
-            if (!lo) return false;
-            p = table + (lo - 1) * width * 2 + width;
-            query.fde = reinterpret_cast<const Byte*>(Encoded(p, header[3], Word(header)));
-            return DecodeCandidate(context, frame, query);
-        }
-        if (std::memcmp(section.Name, ".ehfram", 8) != 0) continue;
-        const Byte* p = base + section.VirtualAddress;
-        const Byte* end = p + section.Misc.VirtualSize;
-        while (end - p >= 8) {
-            const Byte* record = p;
-            const auto length = Read<std::uint32_t>(p);
-            if (!length) continue;
-            if (length == 0xffffffff || length < 4 || Word(end - p) < length) return false;
-            const Byte* next = p + length;
-            if (Read<std::uint32_t>(p)) {
-                query.fde = record;
-                frame = {};
-                if (DecodeCandidate(context, frame, query)) return true;
+            if (std::memcmp(section.Name, ".ehfram", 8) != 0) continue;
+            const Byte* p = base + section.VirtualAddress;
+            const Byte* end = p + section.Misc.VirtualSize;
+            while (end - p >= 8) {
+                const Byte* record = p;
+                const auto length = Read<std::uint32_t>(p);
+                if (!length) continue;
+                if (length == 0xffffffff || length < 4 || Word(end - p) < length) break;
+                const Byte* next = p + length;
+                if (Read<std::uint32_t>(p)) {
+                    // A probe at address 0 decodes the FDE's range and then fails the range test.
+                    _Unwind_Context probe {};
+                    Frame decoded {};
+                    DecodeCandidate(probe, decoded, Lookup{0, record});
+                    if (decoded.length != 0) entry.fdes.emplace_back(decoded.start, record);
+                }
+                p = next;
             }
-            p = next;
         }
+        std::sort(entry.fdes.begin(), entry.fdes.end());
+        std::unique_lock lock(imagesLock);
+        image = &images.emplace(Word(base), std::move(entry)).first->second;
+    }
+    if (const Byte* header = image->header) {
+        const Byte* p = header + 4;
+        Encoded(p, header[1], Word(header));
+        const Word count = Encoded(p, header[2]);
+        const auto width = EncodingSize(header[3]);
+        const Byte* table = p;
+        Word lo = 0, hi = count;
+        while (lo < hi) {
+            const Word mid = lo + (hi - lo) / 2;
+            p = table + mid * width * 2;
+            if (Encoded(p, header[3], Word(header)) <= query.pc) lo = mid + 1;
+            else hi = mid;
+        }
+        if (!lo) return false;
+        p = table + (lo - 1) * width * 2 + width;
+        query.fde = reinterpret_cast<const Byte*>(Encoded(p, header[3], Word(header)));
+        return DecodeCandidate(context, frame, query);
+    }
+    // The FDEs starting at or below the address, nearest first (ranges may nest in hand-written code).
+    auto it = std::upper_bound(image->fdes.begin(), image->fdes.end(), std::pair<Word, const Byte*>{query.pc, reinterpret_cast<const Byte*>(~Word{})});
+    for (int tries = 0; it != image->fdes.begin() && tries < 4; ++tries) {
+        --it;
+        query.fde = it->second;
+        frame = {};
+        if (DecodeCandidate(context, frame, query)) return true;
     }
     return false;
 #endif

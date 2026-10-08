@@ -188,6 +188,14 @@ void Driver::execute(const Submission& submission) {
         } else if (header == FlipPacketHeader) {
             CheckFailure();
             std::uint64_t batchesAtFlip = 0, unsignaledAtFlip = 0;
+            // Debug aid: APS5_CLEAR_DEPTH_ON_FLIP=1 clears every depth plane at each flip, for
+            // titles whose depth clears do not arrive as draws.
+            static const bool clearDepthOnFlip = std::getenv("APS5_CLEAR_DEPTH_ON_FLIP") != nullptr;
+            if (clearDepthOnFlip) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load()) localDevice->ClearDepthPlanes();
+            }
             if (!drains) {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);

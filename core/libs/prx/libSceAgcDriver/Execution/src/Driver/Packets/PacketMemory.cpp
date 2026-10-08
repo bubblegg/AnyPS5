@@ -5,9 +5,12 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <set>
 
 namespace AgcDriver::DriverDetail {
 
@@ -96,6 +99,14 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         }
     }
 
+    static const bool traceDepth = std::getenv("APS5_TRACE_DEPTH") != nullptr;
+    if (traceDepth && opcode == 0x50 && packet.size() >= 7) {
+        static std::mutex reportedMutex;
+        static std::set<std::pair<std::uint64_t, std::uint32_t>> reported;
+        std::lock_guard lock(reportedMutex);
+        const auto destination = (static_cast<std::uint64_t>(packet[5]) << 32u) | packet[4];
+        if (reported.size() < 64 && reported.insert({destination, packet[6]}).second) std::fprintf(stderr, "[depth] DMA_DATA control 0x%08x source 0x%08x%08x destination 0x%llx bytes 0x%x\n", packet[1], packet[3], packet[2], static_cast<unsigned long long>(destination), packet[6] & 0x3ffffffu);
+    }
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;

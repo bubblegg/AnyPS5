@@ -92,7 +92,15 @@ bool fillModuleInfoForUnwind(std::uint64_t addr, ModuleInfoForUnwind* info) {
 
 extern "C" {
 
+int APS5_VABI sceKernelGetModuleInfoForUnwind(std::uint64_t addr, int flags, ModuleInfoForUnwind* info);
+
 int APS5_VABI sceSysmoduleGetModuleInfoForUnwind(std::uint64_t addr, int flags, ModuleInfoForUnwind* info) {
+#ifdef _WIN32
+    // The kernel's answer: a guest image's eh_frame (which the title's unwinder needs to walk its
+    // frames) and a per-image cache, where this one described only the memory region, with two
+    // system calls per frame of every stack walk.
+    if (sceKernelGetModuleInfoForUnwind(addr, flags, info) == 0) return 0;
+#endif
     (void)flags;
     if (!fillModuleInfoForUnwind(addr, info)) {
         throw std::runtime_error("sceSysmoduleGetModuleInfoForUnwind: address not found");

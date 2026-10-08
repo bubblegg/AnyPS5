@@ -107,11 +107,20 @@ std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
 
 struct ColorMetadataPass {
-    enum class Mode { EliminateFastClear, DccDecompress };
+    // Resolve (multisampled rendering drawn with one sample only): targets[0] into targets[1].
+    enum class Mode { EliminateFastClear, DccDecompress, Resolve };
     Mode mode;
     std::vector<ColorTarget> targets;
 };
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
+// A draw whose DB_RENDER_CONTROL clears the bound depth and/or stencil plane and writes no color:
+// the planes are cleared to DB_DEPTH_CLEAR / DB_STENCIL_CLEAR instead of drawing.
+struct DepthClearPass {
+    DepthTarget target;
+    bool depth;
+    bool stencil;
+};
+std::optional<DepthClearPass> DecodeDepthClearPass(const QueueState& queue);
 std::string DepthMaintenanceRejection(const QueueState& queue);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they

@@ -43,6 +43,7 @@
 #include <deque>
 #include <limits>
 #include <list>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1944,9 +1945,14 @@ std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Co
 Graphics::DccKeys DisplayKeys(const DisplayBuffer& buffer, std::size_t bytes) {
     const auto keys = Graphics::CurrentDccKeys(buffer.dccAddress, bytes);
     if (keys != Graphics::DccKeys::Uncompressed && !Graphics::IsDccClear(keys)) {
-        char message[256];
-        std::snprintf(message, sizeof(message), "VideoOut: display buffer 0x%llx reads %s DCC keys at 0x%llx: presenting DCC metadata that is not uniformly uncompressed or fast-cleared is not implemented", static_cast<unsigned long long>(buffer.address), Graphics::DccKeysName(keys), static_cast<unsigned long long>(buffer.dccAddress));
-        throw std::runtime_error(message);
+        // As for sampled textures (textureClearKeys): the driver never writes compressed blocks, so
+        // blocks that are not fast-cleared hold their pixels as stored. Fast-cleared blocks among
+        // them show stale bytes until the per-block clear is modeled.
+        static std::mutex reportedMutex;
+        static std::set<std::uint64_t> reported;
+        std::lock_guard lock(reportedMutex);
+        if (reported.size() < 32 && reported.insert(buffer.address).second) std::fprintf(stderr, "[videoout] display buffer 0x%llx has %s DCC keys at 0x%llx; its pixels are presented as stored\n", static_cast<unsigned long long>(buffer.address), Graphics::DccKeysName(keys), static_cast<unsigned long long>(buffer.dccAddress));
+        return Graphics::DccKeys::Uncompressed;
     }
     return keys;
 }
@@ -2521,6 +2527,14 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+void VulkanDevice::DepthClearPass(const Graphics::DepthClearPass& pass) {
+    Graphics::ClearDepthSurface(graphicsContext(), pass.target, pass.depth, pass.stencil);
+}
+
+void VulkanDevice::ClearDepthPlanes() {
+    Graphics::ClearDepthPlanes(graphicsContext());
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {

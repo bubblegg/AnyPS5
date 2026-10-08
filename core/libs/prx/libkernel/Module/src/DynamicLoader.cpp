@@ -3,9 +3,12 @@
 #include <array>
 #include <filesystem>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -61,6 +64,41 @@ void* FindSymbol(Module& module, const char* name) {
     return Symbol(module, (nid + guestSuffix).c_str());
 #endif
 }
+#ifdef _WIN32
+// A guest module the relinker marked deferred (--guest-module-dir) is mapped by the executable's
+// startup, which binds its imports but leaves its initializers to the first load by the title.
+// Its .aps5ini section holds the DT_INIT RVA, the INIT_ARRAY slot count and the slot RVAs. A PS5
+// module's DT_INIT is its start routine: it runs the constructors and then module_start with
+// the start arguments, whose result is returned.
+int RunDeferredInitializers(HMODULE native, std::size_t args, const void* argp) {
+    static std::mutex initializedMutex;
+    static std::set<HMODULE> initialized;
+    const auto base = reinterpret_cast<const std::uint8_t*>(native);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    const auto* section = IMAGE_FIRST_SECTION(nt);
+    const std::uint32_t* lifecycle = nullptr;
+    for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
+        if (std::memcmp(section->Name, ".aps5ini", 8) == 0) lifecycle = reinterpret_cast<const std::uint32_t*>(base + section->VirtualAddress);
+    }
+    if (lifecycle == nullptr) return 0;
+    {
+        std::lock_guard lock(initializedMutex);
+        if (!initialized.insert(native).second) return 0;
+    }
+    using Start = int (APS5_VABI *)(std::size_t, const void*, void*);
+    using Lifecycle = void (APS5_VABI *)(int, char**, char**);
+    int result = 0;
+    if (lifecycle[0] != 0) result = reinterpret_cast<Start>(const_cast<std::uint8_t*>(base) + lifecycle[0])(args, argp, nullptr);
+    for (std::uint32_t index = 0; index < lifecycle[1]; ++index) {
+        const auto entry = *reinterpret_cast<Lifecycle const*>(base + lifecycle[2 + index]);
+        if (entry != nullptr) entry(0, nullptr, nullptr);
+    }
+    return result;
+}
+#endif
 }
 
 extern "C" {
@@ -76,7 +114,7 @@ static std::filesystem::path RelinkedModulePath(const std::filesystem::path& pat
     return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
 }
 
-void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
+static void* OpenModule(const char* path, int flags, std::size_t args, const void* argp, int* started) {
     if ((flags & ~0x103) || (flags & 3) == 0 || (flags & 3) == 3) {
         Error("dlopen: unsupported flags"); return nullptr;
     }
@@ -90,14 +128,42 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
         } else {
             if (!*path) { Error("dlopen: empty module path"); return nullptr; }
             const auto resolved = RelinkedModulePath(ResolvePath_nid_no_patch(path));
+            // A module the relinker did not convert is still the console's ELF: the Windows loader
+            // would reject it with a modal "Bad Image" box that stops the title until dismissed.
+            // The title gets the loader error instead, as for any module it cannot load.
+            if (char magic[4]{}; std::FILE* file = _wfopen(resolved.c_str(), L"rb")) {
+                const auto read = std::fread(magic, 1, sizeof(magic), file);
+                std::fclose(file);
+                if (read == sizeof(magic) && std::memcmp(magic, "\x7f" "ELF", 4) == 0) {
+                    // Titles retry such a load per call (Unity per plugin import): reported once.
+                    static std::mutex reportedMutex;
+                    static std::set<std::filesystem::path> reported;
+                    std::lock_guard lock(reportedMutex);
+                    if (reported.insert(resolved).second) std::fprintf(stderr, "[module] %s was not converted by the relinker (no .guest.prx beside it); its loads fail\n", path);
+                    Error("dlopen: module is an unconverted guest ELF");
+                    return nullptr;
+                }
+            }
+            DWORD previousMode = 0;
+            SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &previousMode);
             module->native = LoadLibraryExW(resolved.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            const DWORD loadError = GetLastError();
+            SetThreadErrorMode(previousMode, nullptr);
+            SetLastError(loadError);
         }
         if (!module->native) {
             char message[128];
             std::snprintf(message, sizeof(message), "dlopen: Windows loader error %lu (module must be host-compatible)", GetLastError());
             Error(message); return nullptr;
         }
+        if (path) {
+            const int result = RunDeferredInitializers(static_cast<HMODULE>(module->native), args, argp);
+            if (started) *started = result;
+        }
 #else
+        (void)args;
+        (void)argp;
+        (void)started;
         const auto resolved = path ? RelinkedModulePath(ResolvePath_nid_no_patch(path)).string() : std::string{};
         const int nativeFlags = ((flags & 3) == 1 ? RTLD_LAZY : RTLD_NOW) |
             ((flags & 0x100) ? RTLD_GLOBAL : RTLD_LOCAL);
@@ -110,6 +176,16 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
         return reinterpret_cast<void*>(handle);
     } catch (const std::exception& error) { Error(error.what()); return nullptr; }
 }
+
+void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
+    return OpenModule(path, flags, 0, nullptr, nullptr);
+}
+
+// sceKernelLoadStartModule: the start arguments reach the module's start routine.
+void* LoadStartModule_nid_no_patch(const char* path, std::size_t args, const void* argp, int* result) {
+    return OpenModule(path, 2, args, argp, result);
+}
+
 void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
     if (!name || !*name) { Error("dlsym: empty symbol name"); return nullptr; }
     try {
@@ -124,7 +200,15 @@ void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
                 search.push_back(found->second);
             }
         }
-        for (const auto& module : search) if (auto* result = FindSymbol(*module, name)) return result;
+        // Debug aid: APS5_TRACE_DLSYM=1 prints every lookup and its result.
+        static const bool trace = std::getenv("APS5_TRACE_DLSYM") != nullptr;
+        for (const auto& module : search) {
+            if (auto* result = FindSymbol(*module, name)) {
+                if (trace) std::fprintf(stderr, "[dlsym] %p %s -> %p\n", handle, name, result);
+                return result;
+            }
+        }
+        if (trace) std::fprintf(stderr, "[dlsym] %p %s -> not found (NID %s)\n", handle, name, Nid::ComputeNid(name, "").c_str());
         Error("dlsym: symbol not found in supported module scope");
         return nullptr;
     } catch (const std::exception& error) { Error(error.what()); return nullptr; }

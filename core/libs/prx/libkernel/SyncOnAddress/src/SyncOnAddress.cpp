@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <stdexcept>
@@ -41,17 +42,25 @@ int WaitOnAddress(TValue* address, TValue expected, const KernelUseconds* timeou
     AddressWaiter waiter;
     auto& queue = g_waiters[key];
     const auto position = queue.insert(queue.end(), &waiter);
-    const auto isWoken = [&] { return waiter.woken; };
+    // Like a futex, the wait may end spuriously, and callers check the value again. It also ends
+    // once the value differs from `expected`, checked every slice: a title that changes the
+    // value and skips the wake while it believes nobody waits (its own waiter bookkeeping, raced
+    // under host scheduling) would otherwise leave the waiter asleep for good.
+    const auto changed = [&] { return std::atomic_ref<TValue>(*address).load() != expected; };
+    const auto isWoken = [&] { return waiter.woken || changed(); };
     const auto waitStart = std::chrono::steady_clock::now();
-    if (timeout == nullptr) {
-        waiter.condition.Wait(lock, isWoken);
-    } else {
-        waiter.condition.WaitUntil(lock, TimedWait::DeadlineNanos(*timeout), isWoken);
+    const auto deadline = timeout == nullptr ? std::numeric_limits<std::uint64_t>::max() : TimedWait::DeadlineNanos(*timeout);
+    constexpr std::uint64_t RecheckNanos = 4000000ULL;
+    while (!isWoken()) {
+        const auto now = TimedWait::NowNanos();
+        if (now >= deadline) break;
+        const auto slice = deadline - now > RecheckNanos ? now + RecheckNanos : deadline;
+        waiter.condition.WaitUntil(lock, slice, isWoken);
     }
     const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart);
 
-    const bool woken = waiter.woken;
-    if (!woken) {
+    const bool woken = waiter.woken || changed();
+    if (!waiter.woken) {
         queue.erase(position);
         if (queue.empty()) {
             g_waiters.erase(key);

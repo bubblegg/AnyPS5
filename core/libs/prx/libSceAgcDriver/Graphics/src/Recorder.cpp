@@ -409,6 +409,31 @@ ReleaseQueue& ReleaseThreadQueue() {
     return *queue;
 }
 
+// The release thread destroys under GuestMemory::GpuMutex: a kept storage image's destructor
+// (its Vulkan image, its place in the pending and live registries) otherwise runs while a worker
+// uses the same images under the mutex, and the storage cache then hands out an image that was
+// destroyed (an invalid VkImage at its next view or barrier, then a driver fault). The thread
+// still keeps the destruction off the workers. A joiner may hold the mutex while it stops the
+// thread (~Recorder), so the wait gives up once `stop` is set and the batches go without it.
+// APS5_RELEASE_UNLOCKED=1 destroys without the mutex, as before.
+void DestroyDeferredOnReleaseThread(std::vector<DeferredBatch> items, ReleaseQueue& queue) {
+    static const bool unlocked = std::getenv("APS5_RELEASE_UNLOCKED") != nullptr;
+    auto& gpu = GuestMemory::GpuMutex();
+    while (!unlocked) {
+        if (gpu.try_lock()) {
+            DestroyDeferred(std::move(items), true);
+            gpu.unlock();
+            return;
+        }
+        {
+            std::lock_guard lock(queue.mutex);
+            if (queue.stop) break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    DestroyDeferred(std::move(items), true);
+}
+
 void ReleaseThreadMain() {
     CpuTopology::PinHelperThread("release thread");
     auto& queue = ReleaseThreadQueue();
@@ -419,7 +444,7 @@ void ReleaseThreadMain() {
         auto items = std::move(queue.items);
         queue.items.clear();
         lock.unlock();
-        DestroyDeferred(std::move(items), true);
+        DestroyDeferredOnReleaseThread(std::move(items), queue);
         lock.lock();
     }
 }

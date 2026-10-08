@@ -95,6 +95,12 @@ int APS5_VABI sceNetCtlGetNatInfo(NetCtlNatInfo* nat_info) {
     return SCE_NET_CTL_ERROR_NOT_CONNECTED;
 }
 
+int APS5_VABI sceNetCtlGetIfStat(const char* interface_name, void* stat) {
+    (void)interface_name;
+    if (!stat) return SCE_NET_CTL_ERROR_INVALID_ADDR;
+    return SCE_NET_CTL_ERROR_NOT_CONNECTED;
+}
+
 int APS5_VABI sceNetCtlGetResult(int event_type, int* error_code) {
     (void)event_type;
     if (!error_code) return SCE_NET_CTL_ERROR_INVALID_ADDR;
