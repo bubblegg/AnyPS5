@@ -169,11 +169,17 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/Acb.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/CommandBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/Dcb.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HeapGuard.cpp
 )
 
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
 )
+
+# The heap guard's operator new/delete serve this library only: exported, other libraries would bind to them.
+if(WIN32)
+    target_link_options(libSceAgcDriver PRIVATE "-Wl,--exclude-symbols,_Znwy:_Znay:_ZnwyRKSt9nothrow_t:_ZnayRKSt9nothrow_t:_ZdlPv:_ZdaPv:_ZdlPvy:_ZdaPvy:_ZdlPvRKSt9nothrow_t:_ZdaPvRKSt9nothrow_t")
+endif()
 
 target_include_directories(libSceAgcDriver PRIVATE
         ${LIBS_INCLUDE_DIR}
