@@ -36,7 +36,8 @@ inline constexpr std::uint32_t BufferCapacity = 128u;
 inline constexpr std::uint32_t ImageCapacity = 256u;
 inline constexpr std::uint32_t SampledHeapCapacity = 16u;
 inline constexpr std::uint32_t StorageHeapCapacity = 4u;
-inline constexpr std::uint32_t SamplerHeapCapacity = 16u;
+// Two heap entries per sampler: 16 samplers, the most a stage can bind.
+inline constexpr std::uint32_t SamplerHeapCapacity = 32u;
 
 struct ResourceMetadata {
     std::uint32_t binding;
@@ -74,9 +75,9 @@ inline std::uint32_t HeapCapacity(Binding binding) {
 }
 
 static_assert(std::is_standard_layout_v<ResourceMetadata> && std::is_trivially_copyable_v<ResourceMetadata> && sizeof(ResourceMetadata) == 48u);
-static_assert(std::is_standard_layout_v<ShaderData> && std::is_trivially_copyable_v<ShaderData> && sizeof(ShaderData) == 13760u);
+static_assert(std::is_standard_layout_v<ShaderData> && std::is_trivially_copyable_v<ShaderData> && sizeof(ShaderData) == 14528u);
 static_assert(UserDataDword == 4u && BufferOffsetsDword == 132u && DispatchThreadLimitDword == 164u);
-static_assert(ExportMappingsDword == 3432u);
+static_assert(ExportMappingsDword == 3624u);
 static_assert(offsetof(ResourceMetadata, descriptor) == 16u && offsetof(ShaderData, images) == 672u && offsetof(ShaderData, samplers) == 12960u);
 
 inline void RequireVersion(std::uint32_t version) {
