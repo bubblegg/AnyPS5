@@ -61,9 +61,21 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         if (written != 0) leased.AddWritable(written, 32);
         leased.Upload(true);
         const auto ranges = leased.AddressRanges();
-        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address && range.end == address + bytes; });
-        Require(found != ranges.end() && found->permissions == ShaderRecompiler::BdaAbi::Read, "the heap range is missing from the BDA table");
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address; });
+        Require(found != ranges.end() && found->deviceAddress != 0u, "the heap range is missing from the BDA table");
         const auto device = found->deviceAddress;
+        auto cursor = address;
+        std::uint64_t writableBytes = 0;
+        for (auto part = found; cursor < address + bytes && part != ranges.end(); ++part) {
+            Require(part->begin == cursor && part->end > cursor && part->end <= address + bytes, "heap BDA ranges have gaps or overlap");
+            Require(part->deviceAddress == device + cursor - address, "heap BDA ranges are not contiguous on the device");
+            const bool writable = written != 0u && part->begin >= written && part->end <= written + 32u;
+            const auto permissions = ShaderRecompiler::BdaAbi::Read | (writable ? ShaderRecompiler::BdaAbi::Write : 0u);
+            Require(part->permissions == permissions, "heap BDA range has incorrect permissions");
+            if (writable) writableBytes += part->end - part->begin;
+            cursor = part->end;
+        }
+        Require(cursor == address + bytes && writableBytes == (written != 0u ? 32u : 0u), "heap BDA coverage or writable extent is incorrect");
         if (gpu) gpu(leased);
         leased.WriteBack();
         return device;
@@ -240,7 +252,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     Require(first.buffer == alias.buffer && alias.offset + adjustment == 16 && alias.range == 16 + adjustment, "aliased guest buffers have different owners");
     const auto ranges = memory.AddressRanges();
     Require(ranges.size() == 1 && ranges[0].begin == address && ranges[0].end == address + sizeof(guest), "incorrect BDA range bounds");
-    Require(ranges[0].deviceAddress != 0 && ranges[0].permissions == ShaderRecompiler::BdaAbi::Read, "incorrect BDA address or permissions");
+    Require(ranges[0].deviceAddress != 0 && ranges[0].permissions == (ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write), "incorrect BDA address or permissions");
     std::uint32_t changed = 321;
     std::memcpy(access.bytes(alias.buffer).data() + alias.offset, &changed, sizeof(changed));
     memory.WriteBack();

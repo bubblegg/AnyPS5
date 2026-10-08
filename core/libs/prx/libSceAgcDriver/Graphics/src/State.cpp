@@ -106,7 +106,7 @@ constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 constexpr std::uint32_t ShaderControlMask = ~(0x0000f870u | 0x00020600u | 0x00010000u);
 constexpr std::uint32_t PixelStageRunsMask = 0x00020747u;
 constexpr std::uint32_t AlphaToCoverageMask = ~0x0001ff00u;
-constexpr std::uint32_t ScanModeMask = ~2u;
+constexpr std::uint32_t ScanModeMask = ~0x22u;
 constexpr std::uint32_t ScanControlMask = ~0x06023fffu;
 constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
 // Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
@@ -293,7 +293,8 @@ std::uint32_t effectiveDepthControl(std::uint32_t depthControl) {
 }
 
 bool colorControlSupported(std::uint32_t colorControl, bool hasColorTarget) {
-    return colorControl == 0xcc0010u || (!hasColorTarget && (colorControl & ~0x70u) == 0xcc0000u);
+    colorControl &= ~1u;
+    return colorControl == 0xcc0010u || ((colorControl >> 4u) & 7u) == 0u || (!hasColorTarget && (colorControl & ~0x70u) == 0xcc0000u);
 }
 
 std::string colorControlMessage(std::uint32_t colorControl) {
@@ -351,7 +352,7 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
     };
     const bool alternate = swap == 1;
     const auto single = [&](VkFormat vkFormat, std::uint32_t bytes) { return DecodedColorFormat{vkFormat, bytes, static_cast<std::uint8_t>((0xe4u & ~3u) | swap)}; };
-    if (swap > 1 && format != 1 && format != 2 && format != 4) return fail();
+    if (swap > 1 && format != 1 && format != 2 && format != 4 && format != 10 && format != 12) return fail();
     switch (format) {
         case 1:
             if (number == unorm) return single(VK_FORMAT_R8_UNORM, 1);
@@ -390,23 +391,27 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
             // COLOR_2_10_10_10 keeps red in the low bits, the Vulkan A2B10G10R10 packing.
             if (number != unorm) return fail();
             return {alternate ? VK_FORMAT_A2R10G10B10_UNORM_PACK32 : VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4};
-        case 10:
-            if (number == unorm) return {alternate ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, 4};
-            if (number == snorm) return {alternate ? VK_FORMAT_B8G8R8A8_SNORM : VK_FORMAT_R8G8B8A8_SNORM, 4};
-            if (number == srgb) return {alternate ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_R8G8B8A8_SRGB, 4};
+        case 10: {
+            const auto reversed = static_cast<std::uint8_t>(swap == 2 ? 0x1bu : swap == 3 ? 0x93u : 0xe4u);
+            if (number == unorm) return {alternate ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, 4, reversed};
+            if (number == snorm) return {alternate ? VK_FORMAT_B8G8R8A8_SNORM : VK_FORMAT_R8G8B8A8_SNORM, 4, reversed};
+            if (number == srgb) return {alternate ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_R8G8B8A8_SRGB, 4, reversed};
             return fail();
+        }
         case 11:
             if (swap != 0) return fail();
             if (number == floating) return {VK_FORMAT_R32G32_SFLOAT, 8};
             if (number == uint) return {VK_FORMAT_R32G32_UINT, 8};
             return fail();
-        case 12:
-            if (swap != 0) return fail();
-            if (number == floating) return {VK_FORMAT_R16G16B16A16_SFLOAT, 8};
-            if (number == unorm) return {VK_FORMAT_R16G16B16A16_UNORM, 8};
-            if (number == snorm) return {VK_FORMAT_R16G16B16A16_SNORM, 8};
-            if (number == uint) return {VK_FORMAT_R16G16B16A16_UINT, 8};
+        case 12: {
+            if (swap == 1) return fail();
+            const auto reversed = static_cast<std::uint8_t>(swap == 2 ? 0x1bu : swap == 3 ? 0x93u : 0xe4u);
+            if (number == floating) return {VK_FORMAT_R16G16B16A16_SFLOAT, 8, reversed};
+            if (number == unorm) return {VK_FORMAT_R16G16B16A16_UNORM, 8, reversed};
+            if (number == snorm) return {VK_FORMAT_R16G16B16A16_SNORM, 8, reversed};
+            if (number == uint) return {VK_FORMAT_R16G16B16A16_UINT, 8, reversed};
             return fail();
+        }
         case 14:
             if (swap != 0) return fail();
             if (number == floating) return {VK_FORMAT_R32G32B32A32_SFLOAT, 16};
@@ -456,7 +461,7 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
     APS5_LOG_OUT_DEBUG("DecodeShaderStages value=0x%x primitive=%u path=%u vertexWave=%u", value, primitive, static_cast<unsigned>(result.path), result.vertexWaveSize);
     if (path == ShaderPath::Vertex) {
         validate((value & 0x2000u) != 0, "legacy vertex routing without PRIMGEN_EN is unsupported");
-        validate((value & ~0x02402010u) == 0, "unsupported vertex routing, scheduling or wave-ID state");
+        validate((value & ~0x0247a010u) == 0, "unsupported vertex routing, scheduling or wave-ID state");
     } else if (path == ShaderPath::Tessellation) {
         validate((value & 0x00600020u) == 0, "wave32 tessellation or geometry amplification is unsupported");
         validate((value & ~0x0007ed0du) == 0 && (value & 3u) == 1u && ((value >> 3u) & 3u) == 1u, "unsupported tessellation routing");
@@ -607,6 +612,7 @@ State DecodeState(const QueueState& queue) {
     for (std::uint32_t index = 0; index < exportSlots.size(); ++index) {
         if (written(exportSlots[index])) exportCount = index + 1;
     }
+    if (((read(cx, 0x202) >> 4u) & 7u) == 0u) exportCount = 0;
     result.hasColorTarget = exportCount != 0;
     APS5_LOG_OUT_DEBUG("hasColorTarget=%u exports=%u", result.hasColorTarget ? 1u : 0u, exportCount);
 
@@ -682,6 +688,7 @@ State DecodeState(const QueueState& queue) {
             if (((exportedMask >> ((mapping >> (2u * component)) & 3u)) & 1u) != 0) state.colorWriteMask |= 1u << component;
         }
         state.blendEnable = (blend >> 30u) & 1u;
+        if (state.blendEnable && (mapping == 0x1bu || mapping == 0x93u)) throw std::runtime_error("AGC graphics: blending into a color target with a reversed component order is not implemented");
         if (state.blendEnable) {
             Require((read(cx, 0x31c + slot * 0xfu) & 0x10000u) == 0, "blend bypass conflicts with enabled blending");
             state.srcColorBlendFactor = blendFactor(blend & 0x1fu);
@@ -806,6 +813,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
             const auto dccHigh = find(cx, 0x3a8 + slot);
             color.dccAddress = ((dccHigh == cx.end() ? 0ull : static_cast<std::uint64_t>(dccHigh->second & 0xffu)) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x325 + stride)) << 8u);
             color.dccAlphaOnMsb = DccAlphaOnMsb(color.format, swap);
+            color.dccPipeAligned = ((attrib3 >> 30u) & 1u) != 0;
         } else {
             static bool reported = false;
             if (!reported) {

@@ -163,9 +163,8 @@ int APS5_VABI sceAppContentTemporaryDataUnmount(const AppContentMountPoint* moun
 }
 
 
-APS5_EXPORT("7gxh+5QubhY", sceAppContentUnknown00);
-int APS5_VABI sceAppContentUnknown00(void) {
-    NotImplemented_nid_no_patch("7gxh+5QubhY");
+int APS5_VABI sceAppContentAddcontEnqueueDownload(void) {
+    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 }

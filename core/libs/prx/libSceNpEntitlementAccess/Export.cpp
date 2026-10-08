@@ -64,13 +64,6 @@ const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& OwnedAddons() {
 
 extern "C" {
 
-// Entitlement keys are bound to the console's license; none is present here.
-int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label, void* key) {
-    (void)service_label;
-    if (!entitlement_label || !key) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
-    return SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_FOUND;
-}
-
 int APS5_VABI sceNpEntitlementAccessGetAddcontEntitlementInfo(uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label, NpEntitlementAccessAddcontEntitlementInfo* info) {
     (void)service_label;
     if (!entitlement_label || !info) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
@@ -96,6 +89,16 @@ int APS5_VABI sceNpEntitlementAccessGetSkuFlag(uint32_t* sku_flag) {
     if (!sku_flag) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
     *sku_flag = SKU_FLAG_FULL;
     return 0;
+}
+
+int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(
+    uint32_t serviceLabel, const NpUnifiedEntitlementLabel* entitlementLabel,
+    NpEntitlementAccessEntitlementKey* key) {
+    (void)serviceLabel;
+    constexpr int errorParameter = static_cast<int>(0x817D0002);
+    constexpr int errorNoEntitlement = static_cast<int>(0x817D0007);
+    if (!entitlementLabel || !key) return errorParameter;
+    return errorNoEntitlement;
 }
 
 int APS5_VABI sceNpEntitlementAccessInitialize(const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {

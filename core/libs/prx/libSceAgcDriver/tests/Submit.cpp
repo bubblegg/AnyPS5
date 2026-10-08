@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "execution/VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -440,15 +441,28 @@ void testMultiSubmissions() {
 
 void testShaderHeaderAlignment() {
     alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
-    alignas(8) static std::array<std::byte, 2 * sizeof(Shader)> storage{};
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        ShaderSpecialRegs specials{};
+    };
+    alignas(8) static std::array<std::byte, sizeof(Header) + 8> storage{};
     Shader shader{};
     shader.file_header = 0x34333231;
     shader.version = 0x18;
-    shader.header_size = sizeof(Shader);
+    shader.header_size = sizeof(Header);
     shader.shader_size = sizeof(code);
     shader.code = code.data();
     const auto at = [](std::size_t offset, const Shader& fields) {
-        std::memcpy(storage.data() + offset, &fields, sizeof(fields));
+        Header header;
+        header.shader = fields;
+        const auto address = reinterpret_cast<std::uintptr_t>(fields.code);
+        header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+        header.specials.dispatch_modifier = 0x8000u;
+        header.shader.sh_registers = reinterpret_cast<ShaderRegister*>(storage.data() + offset + offsetof(Header, registers));
+        header.shader.num_sh_registers = header.registers.size();
+        header.shader.specials = reinterpret_cast<ShaderSpecialRegs*>(storage.data() + offset + offsetof(Header, specials));
+        std::memcpy(storage.data() + offset, &header, sizeof(header));
         return reinterpret_cast<const Shader*>(storage.data() + offset);
     };
     for (const std::size_t offset : {0, 4, 1}) AgcDriverRegisterShader_nid_postfix(at(offset, shader));
@@ -486,6 +500,8 @@ void testWorkerFailure() {
 
 int main() {
     try {
+        const auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
         alignas(256) std::array<std::uint32_t, 64> rawCode{};
         rawCode.fill(0xbf800000);
         rawCode[0] = 0xbe8003ff;

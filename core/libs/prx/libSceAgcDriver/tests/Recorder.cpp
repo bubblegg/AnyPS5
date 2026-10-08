@@ -1172,6 +1172,10 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
         return;
     }
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: draw snapshot reuse not tested\n";
+        return;
+    }
     const auto element = address + 4096;
     constexpr std::size_t elementBytes = 1024;
     ShaderRecompiler::RecompileResult program;
@@ -1688,8 +1692,8 @@ void importWatchTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
 #ifdef _WIN32
-    static_cast<void>(context);
-    std::cout << "import watch decisions: Linux write watch only\n";
+    Require(PrepareImportWatch(context) == ImportWatch::Unwatch, "Windows host imports stayed watched by default");
+    std::cout << "import watch decisions: Windows host imports use comparisons\n";
 #else
     if (context.hostImportAlignment == 0 || !WriteWatched()) {
         std::cout << "host imports or write watching unavailable: import watch decisions not tested\n";
@@ -2219,6 +2223,18 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     recorder.NotePendingWrite(address, 2 * keyCount);
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a later wider writer over a pending fill was not waited for");
     recorder.Sync();
+    constexpr std::uint64_t displayBytes = 15u * 9u * 65536u;
+    constexpr std::size_t consoleKeys = 49152;
+    const auto displayKeys = DccKeyCount(TextureTileMode::kR64KBX, 4, 1920, 1080, displayBytes);
+    std::memset(keys, 0x00, consoleKeys);
+    MarkDccUncompressed(context, address, displayBytes, displayKeys);
+    Require(recorder.PendingWriteOverlaps(address, consoleKeys) && keys[consoleKeys - 1] == 0x00, "the uncompressed key store over a 1920x1080 surface did not stay pending");
+    Require(CurrentDccKeys(address + displayBytes / 256, (consoleKeys - displayBytes / 256) * 256) == DccKeys::Uncompressed && recorder.PendingWriteOverlaps(address, consoleKeys), "the keys past one per 256 bytes of a pending 1920x1080 store did not read as uncompressed without a wait");
+    Require(CurrentDccKeys(address, displayBytes, displayKeys) == DccKeys::Uncompressed && recorder.PendingWriteOverlaps(address, consoleKeys), "the keys of a pending 1920x1080 store did not read as uncompressed over the console's extent without a wait");
+    recorder.NotePendingWrite(address + 40000, 1);
+    Require(CurrentDccKeys(address, displayBytes, displayKeys) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address + 40000, 1), "a later writer of key 40000 over a pending 1920x1080 store was not waited for");
+    Require(std::all_of(keys, keys + consoleKeys, [](std::uint8_t key) { return key == 0xff; }), "the uncompressed key store over a 1920x1080 surface did not land on all 49152 keys");
+    recorder.Sync();
 }
 
 void sampleDumpTests(const Device& device, Recorder& recorder) {
@@ -2335,6 +2351,7 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     color.tileMode = ColorTileMode::RenderTarget;
     color.elementBytes = 4;
     color.dccAddress = address + surfaceBytes;
+    color.dccPipeAligned = true;
     color.clearWords = {0x80402010u, 0};
     const ColorMetadataPass pass{ColorMetadataPass::Mode::EliminateFastClear, {color}};
     const auto memoryHolds = [&](std::array<std::uint8_t, 4> texel) {
@@ -2350,13 +2367,15 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
         return true;
     };
     const auto keysUncompressed = [&] { return ReadDccKeys(color.dccAddress, surfaceBytes) == DccKeys::Uncompressed; };
+    const auto extent = DccKeyCount(TextureTileMode::kR64KBX, 4, side, side, surfaceBytes);
     std::memset(texels, 0x55, surfaceBytes);
-    std::memset(keys, 0x20, keyCount);
+    std::memset(keys, 0x20, extent);
     RunColorMetadataPass(context, pass);
     Require(StorageTexture::FindPending(address, surfaceBytes) != nullptr && texels[0] == 0x55, "the register fast clear eliminate did not stay in the resident image");
     Require(keysUncompressed(), "the register fast clear eliminate left the keys compressed");
+    Require(CurrentDccKeys(color.dccAddress, surfaceBytes, extent) == DccKeys::Uncompressed, "the register fast clear eliminate did not store uncompressed keys over the target's console DCC extent");
     Require(memoryHolds({0x10, 0x20, 0x40, 0x80}), "the register fast clear eliminate did not store CB_COLOR_CLEAR_WORD");
-    Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the stored keys are not uncompressed");
+    Require(std::all_of(keys, keys + extent, [](std::uint8_t key) { return key == 0xff; }), "the stored keys are not uncompressed");
     std::memset(keys, 0xc0, keyCount);
     RunColorMetadataPass(context, {ColorMetadataPass::Mode::DccDecompress, {color}});
     Require(StorageTexture::FindPending(address, surfaceBytes) != nullptr, "the DCC decompress did not stay in the resident image");
@@ -2453,6 +2472,17 @@ void dataRefreshTests(const Device& device, Recorder& recorder) {
     Require(resources.RefreshData(recorder.Commands(), original, &recorder), "the refresh back recorded nothing");
     Require(resources.DataWordsHash() == ShaderResources::DataWordsHash(original), "the refreshed template's hash is not the original words'");
     Require(!resources.RefreshData(recorder.Commands(), original, &recorder), "a refresh with equal words recorded");
+    auto replaced = patched;
+    replaced.bindings[0].role = ShaderRecompiler::DescriptorRole::GuestSamplers;
+    replaced.bindings[0].kind = ShaderRecompiler::DescriptorKind::Sampler;
+    const CompiledShader changedResources{ShaderRecompiler::ShaderStage::Compute, &replaced, 0};
+    bool rejected = false;
+    try {
+        static_cast<void>(resources.RefreshData(recorder.Commands(), changedResources, &recorder));
+    } catch (const std::exception& error) {
+        rejected = std::string_view(error.what()).find("cannot replace bound resources") != std::string_view::npos;
+    }
+    Require(rejected && resources.DataWordsHash() == ShaderResources::DataWordsHash(original), "a data refresh changed the bound resources");
     recorder.Submit();
     device.WaitQueue();
     recorder.Sync();
