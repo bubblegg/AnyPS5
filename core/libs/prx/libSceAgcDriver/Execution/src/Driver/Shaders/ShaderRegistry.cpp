@@ -115,10 +115,29 @@ ShaderPreparationTransaction::ShaderPreparationTransaction() {
         State::active = state.get();
     }
     root = State::active;
+    // A nested transaction that fails is rolled back to this copy, so its caller may handle the
+    // failure and go on with the state it had.
+    if (state == nullptr) savepoint = std::make_shared<std::map<PreparedShaders*, State::Change>>(root->changes);
 }
 
 ShaderPreparationTransaction::~ShaderPreparationTransaction() {
-    if (!committed) root->failed = true;
+    if (!committed) {
+        if (savepoint != nullptr) {
+            // In place: the enclosing transaction holds references to the entries it edited.
+            const auto& saved = *std::static_pointer_cast<std::map<PreparedShaders*, State::Change>>(savepoint);
+            for (auto it = root->changes.begin(); it != root->changes.end();) {
+                const auto before = saved.find(it->first);
+                if (before == saved.end()) {
+                    it = root->changes.erase(it);
+                } else {
+                    it->second.prepared = before->second.prepared;
+                    ++it;
+                }
+            }
+        } else {
+            root->failed = true;
+        }
+    }
     if (state != nullptr) State::active = nullptr;
 }
 
@@ -210,7 +229,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     if (snapshot.header.empty()) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
         APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
-        auto handle = PrepareAtFirstUse(lock, request);
+        auto handle = ShaderRecompiler::PrepareShader(request);
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
     }
@@ -221,7 +240,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     if (!strictPrepared) {
         static std::atomic<unsigned> lazyReports{0};
         if (lazyReports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] stage %u at 0x%llx (push offset %u) is prepared at first use\n", static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.layout.pushConstantOffsetBytes));
-        auto handle = PrepareAtFirstUse(lock, request);
+        auto handle = ShaderRecompiler::PrepareShader(request);
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
     }
@@ -262,7 +281,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     if (snapshot.header.empty()) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
         APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
-        auto handle = PrepareAtFirstUse(lock, request);
+        auto handle = ShaderRecompiler::PrepareShader(request);
         invocationRequest = request;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
@@ -277,7 +296,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     if (!strictPrepared) {
         static std::atomic<unsigned> lazyReports{0};
         if (lazyReports.fetch_add(1) < 12) std::fprintf(stderr, "[shader-reg] stage %u at 0x%llx (push offset %u) is prepared at first use\n", static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.layout.pushConstantOffsetBytes));
-        auto handle = PrepareAtFirstUse(lock, request);
+        auto handle = ShaderRecompiler::PrepareShader(request);
         invocationRequest = request;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);

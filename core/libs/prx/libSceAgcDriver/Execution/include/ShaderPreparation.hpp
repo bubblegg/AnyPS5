@@ -24,6 +24,7 @@ private:
     struct State;
     std::unique_ptr<State> state;
     State* root = nullptr;
+    std::shared_ptr<void> savepoint;
     bool committed = false;
 };
 
