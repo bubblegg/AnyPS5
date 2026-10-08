@@ -133,8 +133,13 @@ PreparedShaderState& ShaderPreparationTransaction::Edit(const ShaderSnapshot& sn
 
 const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapshot& snapshot) const {
     require(!committed, "shader preparation transaction is already committed");
-    const auto found = root->changes.find(snapshot.prepared.get());
-    return found != root->changes.end() ? found->second.prepared : *snapshot.prepared;
+    // The draw and dispatch workers append artifacts prepared at first use under the state's mutex, so
+    // the live state is not read outside it: a read works on the transaction's copy, as an edit does.
+    auto& changes = root->changes;
+    const auto found = changes.find(snapshot.prepared.get());
+    if (found != changes.end()) return found->second.prepared;
+    std::lock_guard lock(snapshot.prepared->mutex);
+    return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared}).first->second.prepared;
 }
 
 void ShaderPreparationTransaction::Forgive() {
