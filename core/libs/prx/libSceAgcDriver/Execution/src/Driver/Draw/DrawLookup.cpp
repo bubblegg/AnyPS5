@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <array>
+#include <atomic>
+#include <cstdio>
 
 namespace AgcDriver::DriverDetail {
 
@@ -110,7 +113,16 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     }
                     if (matched[i] != nullptr) continue;
                     if (!anyLayout) miss = DrawMiss::Layout;
-                    else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
+                    else if (outcome != EntryOutcome::Differing) {
+                        miss = DrawMiss::Gate;
+                        if (profile) {
+                            // Which validation gate refused the entry, by EntryOutcome, every 20000 refusals.
+                            static std::array<std::atomic<std::uint64_t>, 9> gates{};
+                            static std::atomic<std::uint64_t> total{0};
+                            ++gates[static_cast<std::size_t>(outcome)];
+                            if (++total % 20000 == 0) std::fprintf(stderr, "[draw-cache] gate refusals by outcome: equal-data %llu inaccessible %llu queued-label %llu flushing-image %llu publish-moved %llu pending-moved %llu forget-moved %llu (stage %zu role %d)\n", static_cast<unsigned long long>(gates[1].load()), static_cast<unsigned long long>(gates[3].load()), static_cast<unsigned long long>(gates[4].load()), static_cast<unsigned long long>(gates[5].load()), static_cast<unsigned long long>(gates[6].load()), static_cast<unsigned long long>(gates[7].load()), static_cast<unsigned long long>(gates[8].load()), i, static_cast<int>(roles[i]));
+                        }
+                    }
                     else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
                 }
             }
