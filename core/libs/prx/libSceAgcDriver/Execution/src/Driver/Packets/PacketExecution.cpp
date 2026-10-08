@@ -9,9 +9,53 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void* __stdcall GetProcessHeap();
+extern "C" __declspec(dllimport) int __stdcall HeapValidate(void* heap, unsigned long flags, const void* block);
+#endif
+
+namespace {
+
+// Debug aid: APS5_HEAP_CHECK=<n> validates the process heap after every n-th packet of a queue worker
+// and after every flip, and stops at the first failure with the packets executed since the last clean
+// check, to tell which kind of packet a heap corruption follows.
+void HeapCheckAfter(const AgcDriver::DriverDetail::PacketHistory& recent, std::uint32_t header, bool flip) {
+#ifdef _WIN32
+    static const unsigned period = [] {
+        const char* text = std::getenv("APS5_HEAP_CHECK");
+        return text == nullptr ? 0u : static_cast<unsigned>(std::max(1, std::atoi(text)));
+    }();
+    if (period == 0) return;
+    thread_local unsigned count = 0;
+    thread_local std::array<std::uint32_t, 64> since{};
+    thread_local unsigned filled = 0;
+    since[filled++ % since.size()] = header;
+    if (!flip && ++count % period != 0) return;
+    if (HeapValidate(GetProcessHeap(), 0, nullptr) != 0) {
+        filled = 0;
+        return;
+    }
+    std::fprintf(stderr, "[heap-check] the process heap is corrupt after %s (checked every %u packets and at flips); packets since the last clean check, oldest first:\n", flip ? "a flip" : AgcDriver::Pm4::Name(header).c_str(), period);
+    const auto shown = std::min<unsigned>(filled, static_cast<unsigned>(since.size()));
+    for (unsigned i = 0; i < shown; ++i) std::fprintf(stderr, "[heap-check]   %s\n", since[(filled - shown + i) % since.size()] == 0 ? "flip or wait" : AgcDriver::Pm4::Name(since[(filled - shown + i) % since.size()]).c_str());
+    recent.Print(stderr, "[heap-check] history: %s\n");
+    std::fflush(stderr);
+    std::abort();
+#else
+    static_cast<void>(recent);
+    static_cast<void>(header);
+    static_cast<void>(flip);
+#endif
+}
+
+}
 
 namespace AgcDriver::DriverDetail {
 
@@ -306,6 +350,7 @@ void Driver::execute(const Submission& submission) {
         timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();
+        HeapCheckAfter(recent, header, header == FlipPacketHeader);
         cursor = nextCursor;
     }
 

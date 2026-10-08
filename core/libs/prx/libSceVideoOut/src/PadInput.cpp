@@ -78,6 +78,10 @@ void PadInput::applyOutput() {
         if (motionChanged) enableSensors();
     }
     if (controller == nullptr) return;
+    // Debug aid: APS5_NO_PAD_OUTPUT=1 sends no rumble, light bar or trigger effect to the controller,
+    // to tell whether a crash comes from the output path (SDL's rumble thread) of a flaky connection.
+    static const bool noOutput = std::getenv("APS5_NO_PAD_OUTPUT") != nullptr;
+    if (noOutput) return;
     const auto now = std::chrono::steady_clock::now();
     const bool rumbling = outputState.vibrationLarge != 0 || outputState.vibrationSmall != 0;
     const bool triggerRumble = outputState.trigger[0].fallback != 0 || outputState.trigger[1].fallback != 0;
