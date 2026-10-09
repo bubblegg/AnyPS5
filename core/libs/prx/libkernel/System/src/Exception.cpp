@@ -4,13 +4,19 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 extern "C" Pthread APS5_VABI scePthreadSelf();
@@ -190,6 +196,61 @@ bool Exited(HANDLE native) {
     return WaitForSingleObject(native, 0) == WAIT_OBJECT_0;
 }
 
+// The images that hold guest code: the relinked executable and the converted guest modules
+// (*.guest.prx). Listed before a target is suspended, as the loader lock may be the target's.
+std::vector<std::uintptr_t>& GuestImageBases() {
+    static auto* bases = new std::vector<std::uintptr_t>();
+    return *bases;
+}
+
+void RefreshGuestImages() {
+    static DWORD listedBytes = 0;
+    static std::vector<HMODULE> modules(1024);
+    DWORD needed = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed)) return;
+    if (needed == listedBytes) return;
+    listedBytes = needed;
+    auto& bases = GuestImageBases();
+    bases.clear();
+    bases.push_back(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)));
+    const auto count = std::min<std::size_t>(needed / sizeof(HMODULE), modules.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        char path[MAX_PATH] = {};
+        const auto length = GetModuleFileNameA(modules[i], path, sizeof(path));
+        constexpr char suffix[] = ".guest.prx";
+        if (length >= sizeof(suffix) - 1 && _stricmp(path + length - (sizeof(suffix) - 1), suffix) == 0) bases.push_back(reinterpret_cast<std::uintptr_t>(modules[i]));
+    }
+}
+
+// Whether a suspended thread's instruction pointer is in guest code. No lock and no allocation: the
+// suspended thread may hold any of them. Code outside every image (trampolines) counts as guest code.
+bool InGuestCode(DWORD64 rip) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<void*>(rip), &info, sizeof(info)) != sizeof(info) || info.Type != MEM_IMAGE) return true;
+    const auto base = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+    for (const auto guest : GuestImageBases()) {
+        if (guest == base) return true;
+    }
+    return false;
+}
+
+std::atomic<std::uint64_t> forcedRaises{0};
+std::atomic<DWORD64> forcedRip{0};
+
+// A delivery that had to start in host code after all, reported once its target runs again.
+void ReportForcedRaise() {
+    static std::atomic<std::uint64_t> reported{0};
+    const auto count = forcedRaises.load(std::memory_order_relaxed);
+    if (count == reported.load(std::memory_order_relaxed) || count > 12) return;
+    reported.store(count, std::memory_order_relaxed);
+    const auto rip = forcedRip.load(std::memory_order_relaxed);
+    HMODULE module = nullptr;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(rip), &module) && module != nullptr) GetModuleFileNameA(module, path, sizeof(path));
+    const char* leaf = std::strrchr(path, '\\');
+    std::fprintf(stderr, "[signal] a thread stayed in host code; the exception was delivered at %s+0x%llx (%llu so far)\n", leaf != nullptr ? leaf + 1 : path, static_cast<unsigned long long>(rip - reinterpret_cast<DWORD64>(module)), static_cast<unsigned long long>(count));
+}
+
 bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     if (thread == scePthreadSelf()) {
         CONTEXT context{};
@@ -199,26 +260,45 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     }
     const auto native = static_cast<HANDLE>(thread->nativeHandle);
     auto queued = std::make_unique<Delivery>(Delivery{handler, signum, {}});
-    if (SuspendThread(native) == static_cast<DWORD>(-1)) {
-        if (Exited(native)) return false;
-        throw std::runtime_error("sceKernelRaiseException: cannot suspend the target thread");
-    }
-    if (Exited(native)) {
-        ResumeThread(native);
-        return false;
-    }
-    if (thread->waitCount.load(std::memory_order_seq_cst) > 0) {
-        const bool accepted = QueueUserAPC(WaitingEntry, native, reinterpret_cast<ULONG_PTR>(queued.get())) != 0;
-        ResumeThread(native);
-        if (!accepted) throw std::runtime_error("sceKernelRaiseException: cannot queue delivery to the waiting thread");
-        queued.release();
-        return true;
-    }
+    // The handler must not start inside host code: a thread stopped in the host allocator, or holding
+    // a host lock, would run the title's handler there (which allocates and waits), corrupting the heap
+    // or deadlocking with whoever needs that lock. A thread in host code is let run and looked at again
+    // until it is in guest code or in an alertable wait; APS5_FORCE_RAISE=1 redirects at once, as before.
+    static const bool forceRaise = std::getenv("APS5_FORCE_RAISE") != nullptr;
+    static std::mutex raiseMutex;
+    std::lock_guard raiseLock(raiseMutex);
+    RefreshGuestImages();
+    constexpr int patientAttempts = 300;
     alignas(16) Delivery delivery{handler, signum, {}};
-    delivery.context.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
-    if (!GetThreadContext(native, &delivery.context)) {
+    for (int attempt = 0;; ++attempt) {
+        if (SuspendThread(native) == static_cast<DWORD>(-1)) {
+            if (Exited(native)) return false;
+            throw std::runtime_error("sceKernelRaiseException: cannot suspend the target thread");
+        }
+        if (Exited(native)) {
+            ResumeThread(native);
+            return false;
+        }
+        if (thread->waitCount.load(std::memory_order_seq_cst) > 0) {
+            const bool accepted = QueueUserAPC(WaitingEntry, native, reinterpret_cast<ULONG_PTR>(queued.get())) != 0;
+            ResumeThread(native);
+            if (!accepted) throw std::runtime_error("sceKernelRaiseException: cannot queue delivery to the waiting thread");
+            queued.release();
+            return true;
+        }
+        delivery.context.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
+        if (!GetThreadContext(native, &delivery.context)) {
+            ResumeThread(native);
+            throw std::runtime_error("sceKernelRaiseException: cannot read the target thread context");
+        }
+        if (forceRaise || InGuestCode(delivery.context.Rip)) break;
+        if (attempt >= patientAttempts) {
+            forcedRaises.fetch_add(1, std::memory_order_relaxed);
+            forcedRip.store(delivery.context.Rip, std::memory_order_relaxed);
+            break;
+        }
         ResumeThread(native);
-        throw std::runtime_error("sceKernelRaiseException: cannot read the target thread context");
+        Sleep(attempt < 20 ? 0 : 1);
     }
     const DWORD64 slot = (delivery.context.Rsp - RedZone - sizeof(Delivery)) & ~static_cast<DWORD64>(15);
     if (!StackWritable(slot - HomeArea - 8, delivery.context.Rsp - RedZone)) {
@@ -234,6 +314,7 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
         throw std::runtime_error("sceKernelRaiseException: cannot redirect the target thread");
     }
     ResumeThread(native);
+    ReportForcedRaise();
     return true;
 }
 #endif

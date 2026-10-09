@@ -87,6 +87,27 @@ void SleepNanosCoarse(std::uint64_t nanos) {
 
 }  // namespace
 
+// A lock wait in slices (LockInterruptible) is marked as a wait, so sceKernelRaiseException queues
+// its delivery, which runs between slices and once more when the wait ends.
+void BeginInterruptibleLockWait() {
+#ifdef _WIN32
+    waitState->fetch_add(1, std::memory_order_seq_cst);
+#endif
+}
+
+void PollInterruptibleLockWait() {
+#ifdef _WIN32
+    DrainApcs();
+#endif
+}
+
+void EndInterruptibleLockWait() {
+#ifdef _WIN32
+    waitState->fetch_sub(1, std::memory_order_seq_cst);
+    DrainApcs();
+#endif
+}
+
 #ifdef _WIN32
 
 struct Waiter {

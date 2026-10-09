@@ -11,6 +11,9 @@ namespace TimedWait {
 
 bool Coarse();
 void BindThreadWaitState(std::atomic<int>* state);
+void BeginInterruptibleLockWait();
+void PollInterruptibleLockWait();
+void EndInterruptibleLockWait();
 std::uint64_t NowNanos();
 std::uint64_t DeadlineNanos(std::uint64_t microseconds);
 std::uint64_t RemainingMicros(std::uint64_t deadlineNanos);
@@ -37,7 +40,10 @@ void LockInterruptible(TLockable& lockable) {
         else return TimedMutex<TLockable>;
     }();
     if constexpr (timed) {
-        while (!lockable.try_lock_for(std::chrono::microseconds(LOCK_INTERRUPT_SLICE_MICROS))) {}
+        if (lockable.try_lock()) return;
+        BeginInterruptibleLockWait();
+        while (!lockable.try_lock_for(std::chrono::microseconds(LOCK_INTERRUPT_SLICE_MICROS))) PollInterruptibleLockWait();
+        EndInterruptibleLockWait();
         return;
     }
 #endif
@@ -47,7 +53,10 @@ void LockInterruptible(TLockable& lockable) {
 template <class TLockable>
 void LockSharedInterruptible(TLockable& lockable) {
 #ifdef _WIN32
-    while (!lockable.try_lock_shared_for(std::chrono::microseconds(LOCK_INTERRUPT_SLICE_MICROS))) {}
+    if (lockable.try_lock_shared()) return;
+    BeginInterruptibleLockWait();
+    while (!lockable.try_lock_shared_for(std::chrono::microseconds(LOCK_INTERRUPT_SLICE_MICROS))) PollInterruptibleLockWait();
+    EndInterruptibleLockWait();
 #else
     lockable.lock_shared();
 #endif
