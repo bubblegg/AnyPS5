@@ -867,7 +867,7 @@ private:
         const bool depth = (memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0;
         for (std::uint32_t i = 0; i < m_info.images.size(); i++) {
             auto& image = m_info.images[i];
-            if (image.source == source && image.resourceClass == resourceClass && image.dimension == memory.imageDimension && image.mipMode == mip && image.depthCompare == depth && image.r128 == memory.imageR128 && image.packed == memory.imagePacked) {
+            if (image.source == source && image.resourceClass == resourceClass && image.dimension == memory.imageDimension && image.mipMode == mip && image.depthCompare == depth && image.r128 == memory.imageR128 && image.packed == memory.imagePacked && image.byElements == memory.imageByElements && image.byComponents == (memory.imageByElements != 0u ? memory.dataDwords / memory.imageByElements : 0u)) {
                 Merge(image, memory, op, pc);
                 return i;
             }
@@ -884,6 +884,8 @@ private:
         image.depthCompare = depth;
         image.r128 = memory.imageR128;
         image.packed = memory.imagePacked;
+        image.byElements = memory.imageByElements;
+        image.byComponents = memory.imageByElements != 0u ? memory.dataDwords / memory.imageByElements : 0u;
         Merge(image, memory, op, pc);
         m_info.images.push_back(image);
         return static_cast<std::uint32_t>(m_info.images.size() - 1);

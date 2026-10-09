@@ -29,8 +29,10 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return true;
     case RdnaOpcode::SSetpcB64:
         return true;
+    case RdnaOpcode::SSwappcB64:
     case RdnaOpcode::SCallB64:
-        throw std::runtime_error("s_call_b64 at pc " + std::to_string(inst.programCounter) + " is not implemented");
+        sSwappcB64(inst);
+        return true;
     case RdnaOpcode::SSubvectorLoopBegin:
         sSubvectorLoop(inst, true);
         return true;

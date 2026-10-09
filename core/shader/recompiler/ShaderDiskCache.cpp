@@ -74,7 +74,7 @@ static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: updat
 static_assert(sizeof(CompiledShaderInfo) == 336, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 224, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
-static_assert(sizeof(ImageResource) == 104, "ImageResource changed: update the info encoder");
+static_assert(sizeof(ImageResource) == 112, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 16, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
 static_assert(sizeof(StageInput) == 56, "StageInput changed: update the info encoder");
@@ -472,6 +472,8 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.packed);
         out.Value(image.fmaskCompatible);
         out.Value(image.depthBitsCompatible);
+        out.Value(image.byElements);
+        out.Value(image.byComponents);
         out.Value(image.packedFormat);
         out.Value(image.emulatedCompare);
         out.Value(image.indirectRoot);
@@ -570,6 +572,8 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.packed);
         in.Value(image.fmaskCompatible);
         in.Value(image.depthBitsCompatible);
+        in.Value(image.byElements);
+        in.Value(image.byComponents);
         in.Value(image.packedFormat);
         in.Value(image.emulatedCompare);
         in.Value(image.indirectRoot);

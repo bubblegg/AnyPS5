@@ -86,6 +86,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     tools.SetMessageConsumer(consumer);
     spvtools::ValidatorOptions validatorOptions;
     validatorOptions.SetAllowOffsetTextureOperand(allowOffsetTextureOperand);
+    validatorOptions.SetFriendlyNames(false);
     if (!tools.Validate(spirv.data(), spirv.size(), validatorOptions)) {
         throw std::runtime_error("SPIR-V validation before optimization failed:\n" + diagnostics);
     }

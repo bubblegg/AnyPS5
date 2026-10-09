@@ -287,13 +287,12 @@ void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
 #ifdef _WIN32
     state.watchDevice = context.device;
-    // Imports stay write-watched: comparing them makes every draw of a title that renders into imported
-    // memory start its own render pass and write its target back (Phasmophobia: 5.8 ms per draw instead
-    // of 0.04). APS5_COMPARE_HOST_IMPORTS=1 compares them, for driver writes arriving after the import window.
-    static const bool watchImports = std::getenv("APS5_COMPARE_HOST_IMPORTS") == nullptr;
+    // Upstream compares direct imports (driver writes can arrive after the import window).
+    // APS5_WATCH_HOST_IMPORTS=1 keeps them write-watched, as before that change.
+    static const bool watchImports = std::getenv("APS5_WATCH_HOST_IMPORTS") != nullptr;
     state.unwatchImports = !watchImports;
     state.unwatchDmaBufImports = false;
-    if (!watchImports && context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] host imports are compared on Windows because driver writes can arrive after the import window\n");
+    if (!watchImports && context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
 #else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;
@@ -416,6 +415,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         return step == nullptr;
     });
     entry.unwatched = step == nullptr && (entry.dmaBuf ? state.unwatchDmaBufImports : state.unwatchImports);
+#ifdef _WIN32
+    if (entry.alias != nullptr) entry.unwatched = false;
+#endif
     if (entry.unwatched) GuestMemory::Unwatch(base, bytes);
     if (step != nullptr) {
 #ifdef _WIN32
