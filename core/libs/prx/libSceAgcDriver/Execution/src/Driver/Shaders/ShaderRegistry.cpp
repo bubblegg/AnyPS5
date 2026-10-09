@@ -396,9 +396,9 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     const auto highRegister = state.shader.find(programRegister + 1);
     const auto high = highRegister == state.shader.end() ? 0u : highRegister->second;
     if ((high & ~0xffu) != 0) throw std::runtime_error("AGC driver: invalid registered program address");
-    // A header without program registers (the title writes them itself at draw time) enters at the
-    // start of its code.
-    const auto address = state.shader.contains(programRegister) ? (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u) : snapshot.codeAddress;
+    // A header without program registers (the title writes them itself at draw time) has no known entry
+    // point yet: it is prepared at its first use, not from a guess.
+    const auto address = (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u);
     if (address < snapshot.codeAddress || address - snapshot.codeAddress >= snapshot.code.size() * 4u) throw std::runtime_error("AGC driver: registered entry point is outside shader code");
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / 4u);
     const auto code = std::span(snapshot.code).subspan(codeOffset);
