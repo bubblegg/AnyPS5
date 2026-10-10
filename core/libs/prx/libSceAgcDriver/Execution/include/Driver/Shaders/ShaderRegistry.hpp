@@ -80,7 +80,8 @@ struct DestructionTripwire {
     DestructionTripwire& operator=(const DestructionTripwire&) { return *this; }
     ~DestructionTripwire();
     std::uint64_t state = 0x534e4150414c4956ull;
-    void* first[20] = {};
+    static constexpr unsigned FirstCapacity = 64;
+    void* first[FirstCapacity] = {};
     unsigned firstCount = 0;
     unsigned firstThread = 0;
 };
