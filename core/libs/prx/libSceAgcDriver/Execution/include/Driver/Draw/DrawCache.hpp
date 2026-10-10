@@ -57,6 +57,7 @@ struct DrawEntry {
     std::atomic<std::shared_ptr<const std::vector<DrawRecipeRecord>>> recipes;
     std::uint64_t touched = 0;
     std::list<std::uint64_t>::iterator order;
+    DestructionTripwire tripwire{"draw entry"};
 };
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };

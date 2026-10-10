@@ -219,9 +219,11 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
             }
         }
     }
+    if (registry != nullptr) AuditShaderRegistries(*registry, "before a registration");
     auto next = registry != nullptr ? std::make_shared<ShaderRegistry>(*registry) : std::make_shared<ShaderRegistry>();
     next->insert_or_assign(snapshot->codeAddress, snapshot);
     registry = std::move(next);
+    AuditShaderRegistries(*registry, "after a registration");
     transaction.Commit();
 }
 

@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -63,6 +66,78 @@ void printFrames(const char* title, unsigned thread, void* const* frames, unsign
 
 }
 
+namespace {
+
+std::mutex& liveMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::set<const ShaderRegistry*>& liveRegistries() {
+    static auto* live = new std::set<const ShaderRegistry*>();
+    return *live;
+}
+
+std::atomic<std::uint64_t> registriesMade{0};
+std::atomic<std::uint64_t> audits{0};
+
+}
+
+ShaderRegistry::ShaderRegistry() {
+    std::lock_guard lock(liveMutex());
+    liveRegistries().insert(this);
+    ++registriesMade;
+}
+
+ShaderRegistry::ShaderRegistry(const ShaderRegistry& other) : std::map<std::uint64_t, std::shared_ptr<const ShaderSnapshot>>(other) {
+    std::lock_guard lock(liveMutex());
+    liveRegistries().insert(this);
+    ++registriesMade;
+}
+
+ShaderRegistry::~ShaderRegistry() {
+    std::lock_guard lock(liveMutex());
+    liveRegistries().erase(this);
+}
+
+void AuditShaderRegistries(const ShaderRegistry& current, const char* when) {
+    std::lock_guard lock(liveMutex());
+    ++audits;
+    const auto& live = liveRegistries();
+    std::size_t low = 0;
+    for (const auto& [address, snapshot] : current) {
+        long holders = 0;
+        for (const auto* registry : live) {
+            const auto found = registry->find(address);
+            if (found != registry->end() && found->second == snapshot) ++holders;
+        }
+        const long count = snapshot.use_count();
+        if (count >= holders) continue;
+        if (low++ >= 6) continue;
+        std::fprintf(stderr, "[audit] %s: snapshot %p (code 0x%llx, type %u) has use count %ld but %ld live registries hold it\n", when, static_cast<const void*>(snapshot.get()), static_cast<unsigned long long>(address), static_cast<unsigned>(snapshot->type), count, holders);
+#ifdef _WIN32
+        // The control block of a make_shared object sits 16 bytes before it: vtable pointer, use count, weak count.
+        const auto* raw = reinterpret_cast<const std::uint64_t*>(snapshot.get()) - 6;
+        std::fprintf(stderr, "[audit]   memory from 32 bytes before its control block:");
+        for (int i = 0; i < 14; ++i) std::fprintf(stderr, " %016llx", static_cast<unsigned long long>(raw[i]));
+        std::fprintf(stderr, "\n[audit]   code address field 0x%llx, header address 0x%llx, code words %zu, header bytes %zu\n", static_cast<unsigned long long>(snapshot->codeAddress), static_cast<unsigned long long>(snapshot->headerAddress), snapshot->code.size(), snapshot->header.size());
+        const auto& wire = snapshot->tripwire;
+        if (wire.state == Destroyed) printFrames("it was already destroyed; that destruction", wire.firstThread, wire.first, wire.firstCount < DestructionTripwire::FirstCapacity ? wire.firstCount : DestructionTripwire::FirstCapacity);
+        else std::fprintf(stderr, "[audit]   it has not been destroyed (marker 0x%llx): its count was changed without a release reaching zero\n", static_cast<unsigned long long>(wire.state));
+#endif
+    }
+    if (low == 0) return;
+    std::fprintf(stderr, "[audit] %s: %zu of %zu snapshots are short of references; %zu live registries, %llu made, audit %llu, thread %lu\n", when, low, current.size(), live.size(), static_cast<unsigned long long>(registriesMade.load()), static_cast<unsigned long long>(audits.load()),
+#ifdef _WIN32
+                 static_cast<unsigned long>(GetCurrentThreadId())
+#else
+                 0ul
+#endif
+    );
+    std::fflush(stderr);
+    std::abort();
+}
+
 DestructionTripwire::~DestructionTripwire() {
 #ifdef _WIN32
     // Stores into an object that is being destroyed are dead to the compiler; go through a volatile pointer.
@@ -76,7 +151,7 @@ DestructionTripwire::~DestructionTripwire() {
     void* second[FirstCapacity] = {};
     const unsigned secondCount = scanStack(second, FirstCapacity);
     if (self->state == Destroyed) {
-        std::fprintf(stderr, "[snapshot] a shader snapshot at %p is destroyed a second time\n", static_cast<void*>(this));
+        std::fprintf(stderr, "[snapshot] a %s at %p is destroyed a second time\n", self->name, static_cast<void*>(this));
         printFrames("first destruction", self->firstThread, self->first, self->firstCount < FirstCapacity ? self->firstCount : FirstCapacity);
     } else {
         std::fprintf(stderr, "[snapshot] a shader snapshot at %p is destroyed after its memory was reused (marker 0x%llx)\n", static_cast<void*>(this), static_cast<unsigned long long>(self->state));

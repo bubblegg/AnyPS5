@@ -27,7 +27,33 @@ class VulkanDevice;
 namespace AgcDriver::DriverDetail {
 
 struct ShaderSnapshot;
-using ShaderRegistry = std::map<std::uint64_t, std::shared_ptr<const ShaderSnapshot>>;
+// Crash hunt: a snapshot has been destroyed twice (its header freed twice). The tripwire is the last
+// member, so it is destroyed first: it keeps the stack of its first destruction and, if it is destroyed
+// again, prints both and stops before the heap is damaged.
+struct DestructionTripwire {
+    DestructionTripwire() = default;
+    explicit DestructionTripwire(const char* what) : name(what) {}
+    DestructionTripwire(const DestructionTripwire& other) : name(other.name) {}
+    DestructionTripwire& operator=(const DestructionTripwire&) { return *this; }
+    ~DestructionTripwire();
+    std::uint64_t state = 0x534e4150414c4956ull;
+    static constexpr unsigned FirstCapacity = 64;
+    void* first[FirstCapacity] = {};
+    unsigned firstCount = 0;
+    unsigned firstThread = 0;
+    const char* name = "shader snapshot";
+};
+
+struct ShaderRegistry : std::map<std::uint64_t, std::shared_ptr<const ShaderSnapshot>> {
+    ShaderRegistry();
+    ShaderRegistry(const ShaderRegistry& other);
+    ~ShaderRegistry();
+    DestructionTripwire tripwire{"shader registry"};
+};
+
+// Crash hunt: every snapshot in `current` must be referenced at least once per live registry that
+// holds it. Reports and stops on the first registration that finds a count too low.
+void AuditShaderRegistries(const ShaderRegistry& current, const char* when);
 
 struct PreparedShaderState {
     struct Entry {
@@ -69,21 +95,6 @@ struct RegisteredShaderState {
     Registers shader;
     Registers context;
     Registers userConfig;
-};
-
-// Crash hunt: a snapshot has been destroyed twice (its header freed twice). The tripwire is the last
-// member, so it is destroyed first: it keeps the stack of its first destruction and, if it is destroyed
-// again, prints both and stops before the heap is damaged.
-struct DestructionTripwire {
-    DestructionTripwire() = default;
-    DestructionTripwire(const DestructionTripwire&) {}
-    DestructionTripwire& operator=(const DestructionTripwire&) { return *this; }
-    ~DestructionTripwire();
-    std::uint64_t state = 0x534e4150414c4956ull;
-    static constexpr unsigned FirstCapacity = 64;
-    void* first[FirstCapacity] = {};
-    unsigned firstCount = 0;
-    unsigned firstThread = 0;
 };
 
 struct ShaderSnapshot {
