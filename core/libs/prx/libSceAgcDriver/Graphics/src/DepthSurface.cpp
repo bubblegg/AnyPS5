@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -160,6 +161,20 @@ std::set<std::uint64_t>& clearedHtiles() {
     return *cleared;
 }
 
+// What the title did about depth clears since the last report (DepthSurfacesAtFlip).
+struct DepthStats {
+    std::atomic<std::uint64_t> clearDraws{0};
+    std::atomic<std::uint64_t> htileNoted{0};
+    std::atomic<std::uint64_t> htileApplied{0};
+    std::uint64_t flips = 0;
+    unsigned reports = 0;
+};
+
+DepthStats& depthStats() {
+    static DepthStats stats;
+    return stats;
+}
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -175,7 +190,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     const bool cleared = target.htileAddress != 0 && clearedHtiles().erase(target.htileAddress) != 0;
     for (const auto& surface : surfaces()) {
         if (surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
-        if (cleared) surface->ClearDepth(target.clearDepth);
+        if (cleared) {
+            surface->ClearDepth(target.clearDepth);
+            ++depthStats().htileApplied;
+        }
         return surface->view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
@@ -193,6 +211,31 @@ std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::s
 void NoteHtileDepthClear(std::uint64_t htileAddress) {
     std::lock_guard lock(surfacesMutex());
     clearedHtiles().insert(htileAddress);
+    ++depthStats().htileNoted;
+}
+
+void NoteDepthClearDraw() {
+    ++depthStats().clearDraws;
+}
+
+void DepthSurfacesAtFlip(const Context& context) {
+    static const bool clearOnFlip = std::getenv("APS5_CLEAR_DEPTH_ON_FLIP") != nullptr;
+    auto& stats = depthStats();
+    std::lock_guard lock(surfacesMutex());
+    std::size_t planes = 0;
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device || surface->target.address == 0) continue;
+        ++planes;
+        if (clearOnFlip) surface->ClearDepth(surface->target.clearDepth);
+    }
+    const auto flips = ++stats.flips;
+    if (flips % 600 != 0 || stats.reports >= 10) return;
+    ++stats.reports;
+    std::fprintf(stderr, "[depth] last 600 flips: %llu depth-clear draws, %llu HTILE clears seen, %llu applied; %zu depth planes%s\n", static_cast<unsigned long long>(stats.clearDraws.exchange(0)), static_cast<unsigned long long>(stats.htileNoted.exchange(0)), static_cast<unsigned long long>(stats.htileApplied.exchange(0)), planes, clearOnFlip ? "; APS5_CLEAR_DEPTH_ON_FLIP clears them all at each flip" : "");
+    for (const auto& surface : surfaces()) {
+        const auto& target = surface->target;
+        if (surface->context.device == context.device) std::fprintf(stderr, "[depth]   plane 0x%llx stencil 0x%llx htile 0x%llx %ux%u clear value %g\n", static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.htileAddress), target.extent.width, target.extent.height, static_cast<double>(target.clearDepth));
+    }
 }
 
 void ClearDepthSurfaces(VkDevice device) {

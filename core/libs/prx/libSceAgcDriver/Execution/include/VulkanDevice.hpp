@@ -201,6 +201,8 @@ public:
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
     // APS5_PROFILE_DRAW, how many in flight have not signaled (the frame record's batches_at_flip).
     void FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const;
+    // At the flip packet (under the mutex): Graphics::DepthSurfacesAtFlip for this device.
+    void DepthSurfacesAtFlip() const;
     // Cumulative presentation counters for the [present] line (APS5_PROFILE_DRAW): presentations
     // submitted; over the batches the retired blits waited for: GPU busy time, idle gaps and the
     // batches whose completion record was missing; sums of the batches submitted between the flip

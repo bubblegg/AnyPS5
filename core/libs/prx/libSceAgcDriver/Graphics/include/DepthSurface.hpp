@@ -19,6 +19,11 @@ bool DepthSurfaceAt(std::uint64_t address);
 void RetireDepthSurfacesAt(std::uint64_t address);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
 void NoteHtileDepthClear(std::uint64_t htileAddress);
+// Counts a draw that clears depth through DB_RENDER_CONTROL, for the report below.
+void NoteDepthClearDraw();
+// At each flip: reports now and then how the title cleared depth, and under APS5_CLEAR_DEPTH_ON_FLIP
+// clears the depth plane of every surface of the device (a debug aid for ghosting).
+void DepthSurfacesAtFlip(const Context& context);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
 
 }

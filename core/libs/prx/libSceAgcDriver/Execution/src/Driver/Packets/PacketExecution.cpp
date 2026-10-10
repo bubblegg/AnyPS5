@@ -245,6 +245,7 @@ void Driver::execute(const Submission& submission) {
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
 
+                if (localDevice != nullptr) localDevice->DepthSurfacesAtFlip();
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }

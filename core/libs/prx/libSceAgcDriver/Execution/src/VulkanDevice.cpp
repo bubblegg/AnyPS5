@@ -2542,6 +2542,10 @@ bool VulkanDevice::PresentWaitsForSlots(const DisplayBuffer* buffer) const {
     return state->scaler == nullptr || state->scaler->SourceWidth() != buffer->width || state->scaler->SourceHeight() != buffer->height;
 }
 
+void VulkanDevice::DepthSurfacesAtFlip() const {
+    Graphics::DepthSurfacesAtFlip(graphicsContext());
+}
+
 void VulkanDevice::FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     submissions = state->recorder ? state->recorder->Submissions() : 0;

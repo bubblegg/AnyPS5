@@ -246,6 +246,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
         result.minDepthBounds = readFloat(cx, 0x008);
         result.maxDepthBounds = readFloat(cx, 0x009);
     }
+    if (depthClear) NoteDepthClearDraw();
     if (depthClear) {
         result.depthTest = true;
         result.depthWrite = true;
