@@ -71,6 +71,20 @@ struct RegisteredShaderState {
     Registers userConfig;
 };
 
+// Crash hunt: a snapshot has been destroyed twice (its header freed twice). The tripwire is the last
+// member, so it is destroyed first: it keeps the stack of its first destruction and, if it is destroyed
+// again, prints both and stops before the heap is damaged.
+struct DestructionTripwire {
+    DestructionTripwire() = default;
+    DestructionTripwire(const DestructionTripwire&) {}
+    DestructionTripwire& operator=(const DestructionTripwire&) { return *this; }
+    ~DestructionTripwire();
+    std::uint64_t state = 0x534e4150414c4956ull;
+    void* first[20] = {};
+    unsigned firstCount = 0;
+    unsigned firstThread = 0;
+};
+
 struct ShaderSnapshot {
     std::uint64_t codeAddress;
     std::uint64_t headerAddress;
@@ -79,6 +93,7 @@ struct ShaderSnapshot {
     std::vector<std::byte> header;
     std::shared_ptr<PreparedShaders> prepared = std::make_shared<PreparedShaders>();
     std::shared_ptr<const RegisteredShaderState> registeredState;
+    DestructionTripwire tripwire;
 };
 
 
