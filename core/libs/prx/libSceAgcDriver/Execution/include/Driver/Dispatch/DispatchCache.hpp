@@ -45,7 +45,6 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
-    DestructionTripwire tripwire{"dispatch variant"};
 };
 
 struct DispatchEntry {
