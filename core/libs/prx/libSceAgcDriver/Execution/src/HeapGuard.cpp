@@ -41,7 +41,7 @@ void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
     return block;
 }
 
-void guardedFree(void* pointer) noexcept {
+__attribute__((always_inline)) inline void guardedFree(void* pointer, std::size_t deleting = static_cast<std::size_t>(-1)) noexcept {
     if (pointer == nullptr) return;
     if (guardEnabled()) {
         auto* block = static_cast<unsigned char*>(pointer);
@@ -51,6 +51,16 @@ void guardedFree(void* pointer) noexcept {
             std::uint64_t signature = 0;
             std::memcpy(&signature, block + size + CanaryBytes + 8, sizeof(signature));
             if (signature == (Signature ^ reinterpret_cast<std::uintptr_t>(block) ^ (static_cast<std::uint64_t>(size) << 20u))) {
+                // A sized delete names the size of the object it destroys: another size means this block
+                // belongs to a different owner now, so the caller is deleting something a second time.
+                if (deleting != static_cast<std::size_t>(-1) && deleting != size) {
+                    void* owner = nullptr;
+                    std::memcpy(&owner, block + size + CanaryBytes, sizeof(owner));
+                    const auto image = reinterpret_cast<std::uintptr_t>(&__ImageBase);
+                    std::fprintf(stderr, "[heap-guard] a delete of %llu bytes at libSceAgcDriver.prx+0x%llx hit a live block of %llu bytes that was allocated at +0x%llx: the deleted object was already freed once\n", static_cast<unsigned long long>(deleting), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - image), static_cast<unsigned long long>(size), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(owner) - image));
+                    std::fflush(stderr);
+                    std::abort();
+                }
                 for (std::size_t i = 0; i < CanaryBytes; ++i) {
                     if (block[size + i] == CanaryByte) continue;
                     void* site = nullptr;
@@ -78,7 +88,7 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept { return gu
 void* operator new[](std::size_t size, const std::nothrow_t&) noexcept { return guardedAllocate(size, __builtin_return_address(0), true); }
 void operator delete(void* pointer) noexcept { guardedFree(pointer); }
 void operator delete[](void* pointer) noexcept { guardedFree(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { guardedFree(pointer); }
-void operator delete[](void* pointer, std::size_t) noexcept { guardedFree(pointer); }
+void operator delete(void* pointer, std::size_t size) noexcept { guardedFree(pointer, size); }
+void operator delete[](void* pointer, std::size_t size) noexcept { guardedFree(pointer, size); }
 void operator delete(void* pointer, const std::nothrow_t&) noexcept { guardedFree(pointer); }
 void operator delete[](void* pointer, const std::nothrow_t&) noexcept { guardedFree(pointer); }
