@@ -27,6 +27,16 @@ option(ANYPS5_ENABLE_SPIRV_TOOLS "Enable SPIRV-Tools validation and optimization
 option(APS5_ENABLE_TIMING_LOG "Write frame timings asynchronously to frame-timing.log" OFF)
 add_compile_definitions(APS5_ENABLE_TIMING_LOG=$<BOOL:${APS5_ENABLE_TIMING_LOG}>)
 
+# Some MinGW GCC builds (WinLibs 16.1.0 r3) ship a libstdc++ configured without
+# _GLIBCXX_ATOMIC_WORD_BUILTINS while keeping the atomic shared_ptr lock policy. Reference counts
+# are then added through a mutex-guarded, non-atomic routine in libstdc++-6.dll, but weak_ptr::lock
+# and the fast release path stay lock-free and ignore that mutex, so counts are lost between threads
+# (shader snapshots destroyed while still registered). Defining the macro makes every count
+# operation an atomic instruction.
+if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_definitions(_GLIBCXX_ATOMIC_WORD_BUILTINS=1)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
