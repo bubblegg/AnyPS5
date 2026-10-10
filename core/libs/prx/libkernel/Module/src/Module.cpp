@@ -397,10 +397,14 @@ KernelModule APS5_VABI sceKernelLoadStartModule(const char* module_file_name, si
  (void)opt;
  if (res) *res = 0;
  if (!module_file_name) return static_cast<KernelModule>(SCE_KERNEL_ERROR_EFAULT);
+ // Modules converted by this tree's relinker (--guest-module-dir) take their arguments through
+ // DT_INIT and run their deferred initializers in LoadStartModule; the pending-argument block
+ // serves modules whose startup asks for it.
  pendingModuleArgs = {args, argp};
  pendingModuleInitResult = 0;
- void* handle = dlopen_nid_postfix(module_file_name, kRtldNow);
- const int started = pendingModuleInitResult;
+ int started = 0;
+ void* handle = LoadStartModule_nid_no_patch(module_file_name, args, argp, &started);
+ if (pendingModuleInitResult != 0) started = pendingModuleInitResult;
  pendingModuleArgs = {};
  pendingModuleInitResult = 0;
  if (res) *res = started;
