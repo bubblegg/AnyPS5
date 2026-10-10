@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -470,9 +471,41 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count) {
     return readDccKeys(metaAddress, count, memoized);
 }
 
+// The longest fill a title made from each address (NoteTitleMetadataFill): how much metadata it owns there.
+std::mutex& titleFillsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::uint64_t, std::size_t>& titleFills() {
+    static auto* fills = new std::map<std::uint64_t, std::size_t>();
+    return *fills;
+}
+
+// A key count above one per 256 surface bytes is the console's rounded-up extent (DccKeyCount). A
+// title may allocate less than that from its own heap (a 1920x1080 target: about 48000 bytes against
+// 49152), and keys stored past its allocation land in the next heap block. The extra keys are used
+// only as far as the title itself has filled from this address, and not at all when it never did.
+std::size_t titleKeyCount(std::uint64_t metaAddress, std::size_t keys, std::size_t keyCount) {
+    if (keyCount <= keys) return keyCount;
+    std::size_t filled = 0;
+    {
+        std::lock_guard lock(titleFillsMutex());
+        const auto found = titleFills().find(metaAddress);
+        if (found != titleFills().end()) filled = found->second;
+    }
+    const auto count = std::min(keyCount, std::max(filled, keys));
+    if (count != keyCount) {
+        static std::atomic<unsigned> reports{0};
+        if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] DCC metadata 0x%llx: 0x%zx keys are used, not the console extent 0x%zx (the title filled 0x%zx from there; one key per 256 surface bytes is 0x%zx)\n", static_cast<unsigned long long>(metaAddress), count, keyCount, filled, keys);
+    }
+    return count;
+}
+
 std::size_t StoredKeyCount(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
     const auto keys = DccKeyBytes(surfaceBytes);
     Require(keyCount >= keys, "a DCC key range covers fewer keys than one per 256 surface bytes");
+    keyCount = titleKeyCount(metaAddress, keys, keyCount);
     if (metaAddress == 0 || keyCount == 0) return 0;
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), keyCount, true)) return keyCount;
     if (keyCount == keys) return 0;
@@ -494,7 +527,17 @@ DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
 
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
     Require(keyCount >= DccKeyBytes(surfaceBytes), "a DCC key range covers fewer keys than one per 256 surface bytes");
-    return currentDccKeys(metaAddress, keyCount);
+    return currentDccKeys(metaAddress, titleKeyCount(metaAddress, DccKeyBytes(surfaceBytes), keyCount));
+}
+
+void NoteTitleMetadataFill(std::uint64_t base, std::size_t bytes) {
+    constexpr std::size_t LargestMetadata = 4u << 20u;
+    if (bytes == 0 || bytes > LargestMetadata) return;
+    std::lock_guard lock(titleFillsMutex());
+    auto& fills = titleFills();
+    if (fills.size() >= 16384 && !fills.contains(base)) return;
+    auto& longest = fills[base];
+    longest = std::max(longest, bytes);
 }
 
 bool IsDccClear(DccKeys keys) {

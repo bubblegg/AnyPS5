@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include <algorithm>
 #include <bit>
@@ -180,7 +181,10 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     static auto fillReport = std::chrono::steady_clock::now();
     ++fills;
     filledBytes += bytes;
-    if (bytes != 0 && pattern[0] == pattern[1] && pattern[0] == pattern[2] && pattern[0] == pattern[3]) Graphics::NoteHtileFill(base, bytes, pattern[0]);
+    if (bytes != 0 && pattern[0] == pattern[1] && pattern[0] == pattern[2] && pattern[0] == pattern[3]) {
+        Graphics::NoteHtileFill(base, bytes, pattern[0]);
+        if (pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) Graphics::NoteTitleMetadataFill(base, bytes);
+    }
     if (bytes != 0) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
