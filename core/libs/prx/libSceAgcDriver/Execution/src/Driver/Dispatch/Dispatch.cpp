@@ -75,6 +75,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        Graphics::ReportHtileDispatch(address, userData, compute.numThreads);
+        // A fill of a depth plane's HTILE from a one-element source buffer (Unity's fast depth clear):
+        // user data holds the destination buffer in words 0-3 and the source in words 4-7.
+        if (userData.size() >= 8 && userData[6] == 1) {
+            const auto destination = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+            if (Graphics::DepthHtileAt(destination)) {
+                const auto source = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+                std::array<std::uint32_t, 1> word{0xffffffffu};
+                if (GuestMemory::Accessible(reinterpret_cast<const void*>(source), 4)) GuestMemory::Read(source, std::as_writable_bytes(std::span(word)), 4);
+                Graphics::NoteHtileFill(destination, 4, word[0]);
+            }
+        }
         if (fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;

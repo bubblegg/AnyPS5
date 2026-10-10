@@ -218,6 +218,42 @@ void NoteDepthClearDraw() {
     ++depthStats().clearDraws;
 }
 
+void ReportHtileDispatch(std::uint64_t codeAddress, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {
+    static std::atomic<unsigned> reports{0};
+    if (reports.load(std::memory_order_relaxed) >= 8) return;
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        const auto htile = surface->target.htileAddress;
+        if (htile == 0) continue;
+        for (std::size_t i = 0; i + 1 < userData.size(); ++i) {
+            if (userData[i] != static_cast<std::uint32_t>(htile) || (userData[i + 1] & 0xffffu) != static_cast<std::uint32_t>(htile >> 32u)) continue;
+            if (reports.fetch_add(1) >= 8) return;
+            std::fprintf(stderr, "[depth] compute shader 0x%llx (%ux%ux%u threads) is given the HTILE of depth plane 0x%llx in user data word %zu:", static_cast<unsigned long long>(codeAddress), numThreads[0], numThreads[1], numThreads[2], static_cast<unsigned long long>(surface->target.address), i);
+            for (const auto word : userData) std::fprintf(stderr, " %08x", word);
+            std::fprintf(stderr, "\n");
+            return;
+        }
+    }
+}
+
+bool DepthHtileAt(std::uint64_t address) {
+    std::lock_guard lock(surfacesMutex());
+    return address != 0 && std::ranges::any_of(surfaces(), [&](const auto& surface) { return surface->target.htileAddress == address; });
+}
+
+void NoteHtileFill(std::uint64_t base, std::uint64_t bytes, std::uint32_t word) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        const auto htile = surface->target.htileAddress;
+        if (htile == 0 || htile < base || htile - base >= bytes) continue;
+        static std::atomic<unsigned> reports{0};
+        if (reports.fetch_add(1) < 12) std::fprintf(stderr, "[depth] fill of 0x%llx bytes at 0x%llx with 0x%08x covers the HTILE of depth plane 0x%llx: %s\n", static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(base), word, static_cast<unsigned long long>(surface->target.address), (word & 0xfu) == 0 ? "a depth clear" : "not a clear (ZMASK is set)");
+        if ((word & 0xfu) != 0) continue;
+        clearedHtiles().insert(htile);
+        ++depthStats().htileNoted;
+    }
+}
+
 void DepthSurfacesAtFlip(const Context& context) {
     static const bool clearOnFlip = std::getenv("APS5_CLEAR_DEPTH_ON_FLIP") != nullptr;
     auto& stats = depthStats();
