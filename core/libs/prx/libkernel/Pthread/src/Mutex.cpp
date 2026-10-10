@@ -5,15 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <limits>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 #include <memory>
 #include <stdexcept>
 
@@ -80,30 +72,7 @@ int acquireMutex(PthreadMutex mutex, TAcquire acquire, int unavailable, bool try
             return unavailable;
     }
     mutex->_owner.store(thread, std::memory_order_release);
-#ifdef _WIN32
-    mutex->_ownerHost.store(GetCurrentThreadId(), std::memory_order_relaxed);
-#endif
     return 0;
-}
-
-// Debug aid: APS5_TRACE_MUTEX_STALL=1 reports a lock that waited 5 s, with the host thread ids of the
-// waiter and the holder (thread ids as a debugger lists them), once per wait.
-template <class TNative>
-void lockReportingStalls(TNative& native, PthreadMutex mutex) {
-    static const bool trace = std::getenv("APS5_TRACE_MUTEX_STALL") != nullptr;
-    if (trace) {
-        const auto start = std::chrono::steady_clock::now();
-        while (!native.try_lock_for(std::chrono::milliseconds(2))) {
-            if (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) continue;
-#ifdef _WIN32
-            std::fprintf(stderr, "[mutex] host thread 0x%lx waits 5 s for mutex %p held by host thread 0x%lx\n", GetCurrentThreadId(), static_cast<void*>(mutex), mutex->_ownerHost.load(std::memory_order_relaxed));
-#endif
-            TimedWait::LockInterruptible(native);
-            return;
-        }
-        return;
-    }
-    TimedWait::LockInterruptible(native);
 }
 
 }
@@ -118,17 +87,7 @@ int MutexOperations::Timedlock(PthreadMutex* mutex, const KernelTimespec* abstim
     if (std::chrono::duration<long double>(duration) >= std::chrono::duration<long double>(std::chrono::system_clock::duration::max()))
         throw std::overflow_error("Absolute mutex timeout exceeds the host clock range");
     const auto deadline = std::chrono::system_clock::time_point(std::chrono::duration_cast<std::chrono::system_clock::duration>(duration));
-    return acquireMutex(resolveMutex(mutex, true), [&](auto& native) {
-#ifdef _WIN32
-        for (;;) {
-            const auto slice = std::chrono::system_clock::now() + std::chrono::microseconds(TimedWait::LOCK_INTERRUPT_SLICE_MICROS);
-            if (slice >= deadline) return native.try_lock_until(deadline);
-            if (native.try_lock_until(slice)) return true;
-        }
-#else
-        return native.try_lock_until(deadline);
-#endif
-    }, sceTimedOut, false);
+    return acquireMutex(resolveMutex(mutex, true), [&](auto& native) { return native.try_lock_until(deadline); }, sceTimedOut, false);
 }
 
 extern "C" {
@@ -195,15 +154,21 @@ int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex) {
         return 0;
     }
     if (*mutex && (*mutex)->_owner.load(std::memory_order_acquire) != std::thread::id{})
-        throw std::runtime_error("Cannot destroy a locked mutex");
+        return SCE_KERNEL_ERROR_EBUSY;
     delete *mutex;
     std::atomic_ref<PthreadMutex>(*mutex).store(destroyedMutex(), std::memory_order_release);
     return 0;
 }
 
 int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex) {
-    auto* resolved = resolveMutex(mutex, true);
-    return acquireMutex(resolved, [resolved](auto& native) { lockReportingStalls(native, resolved); return true; }, 0, false);
+    return acquireMutex(resolveMutex(mutex, true), [](auto& native) {
+#ifdef _WIN32
+        while (!native.try_lock()) TimedWait::SleepNanos(1000000);
+#else
+        native.lock();
+#endif
+        return true;
+    }, 0, false);
 }
 
 int APS5_VABI scePthreadMutexUnlock(PthreadMutex* mutex) {

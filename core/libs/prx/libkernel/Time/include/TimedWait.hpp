@@ -11,9 +11,6 @@ namespace TimedWait {
 
 bool Coarse();
 void BindThreadWaitState(std::atomic<int>* state);
-void BeginInterruptibleLockWait();
-void PollInterruptibleLockWait();
-void EndInterruptibleLockWait();
 std::uint64_t NowNanos();
 std::uint64_t DeadlineNanos(std::uint64_t microseconds);
 std::uint64_t RemainingMicros(std::uint64_t deadlineNanos);
@@ -24,43 +21,6 @@ void PollSleepUntil(std::uint64_t deadlineNanos);
 constexpr std::uint64_t LOCK_BULK_NANOS = 40000000ULL;
 constexpr std::uint64_t LOCK_POLL_NANOS = 500000ULL;
 constexpr std::uint64_t LOCK_TAIL_NANOS = 1000000ULL;
-constexpr std::uint64_t LOCK_INTERRUPT_SLICE_MICROS = 2000ULL;
-
-// An untimed host lock wait never returns to user mode, so an exception redirected onto the
-// thread by sceKernelRaiseException would stay pending until the lock is free. Guest code
-// raises them while holding that lock (stop-the-world GC), so the wait returns every slice.
-template <class TMutex>
-constexpr bool TimedMutex = requires(TMutex& mutex) { mutex.try_lock_for(std::chrono::microseconds(1)); };
-
-template <class TLockable>
-void LockInterruptible(TLockable& lockable) {
-#ifdef _WIN32
-    constexpr bool timed = [] {
-        if constexpr (requires { typename TLockable::mutex_type; }) return TimedMutex<typename TLockable::mutex_type>;
-        else return TimedMutex<TLockable>;
-    }();
-    if constexpr (timed) {
-        if (lockable.try_lock()) return;
-        BeginInterruptibleLockWait();
-        while (!lockable.try_lock_for(std::chrono::microseconds(LOCK_INTERRUPT_SLICE_MICROS))) PollInterruptibleLockWait();
-        EndInterruptibleLockWait();
-        return;
-    }
-#endif
-    lockable.lock();
-}
-
-template <class TLockable>
-void LockSharedInterruptible(TLockable& lockable) {
-#ifdef _WIN32
-    if (lockable.try_lock_shared()) return;
-    BeginInterruptibleLockWait();
-    while (!lockable.try_lock_shared_for(std::chrono::microseconds(LOCK_INTERRUPT_SLICE_MICROS))) PollInterruptibleLockWait();
-    EndInterruptibleLockWait();
-#else
-    lockable.lock_shared();
-#endif
-}
 
 template <class TTryLock, class TTryLockFor>
 bool AcquireUntil(std::uint64_t deadlineNanos, TTryLock tryLock, TTryLockFor tryLockFor) {
@@ -71,11 +31,7 @@ bool AcquireUntil(std::uint64_t deadlineNanos, TTryLock tryLock, TTryLockFor try
         if (now >= deadlineNanos) return false;
         const std::uint64_t remaining = deadlineNanos - now;
         if (remaining > LOCK_BULK_NANOS) {
-            std::uint64_t bulkMicros = (remaining - LOCK_BULK_NANOS) / 1000ULL;
-#ifdef _WIN32
-            if (bulkMicros > LOCK_INTERRUPT_SLICE_MICROS) bulkMicros = LOCK_INTERRUPT_SLICE_MICROS;
-#endif
-            if (tryLockFor(bulkMicros)) return true;
+            if (tryLockFor((remaining - LOCK_BULK_NANOS) / 1000ULL)) return true;
             continue;
         }
         if (remaining <= LOCK_TAIL_NANOS) SleepUntil(deadlineNanos);
@@ -102,7 +58,7 @@ public:
             Waiter* waiter = enqueue();
             lock.unlock();
             waitSignal(waiter);
-            LockInterruptible(lock);
+            lock.lock();
             return;
         }
 #endif
@@ -116,7 +72,7 @@ public:
             Waiter* waiter = enqueue();
             lock.unlock();
             const bool signaled = waitSignalUntil(waiter, deadlineNanos);
-            LockInterruptible(lock);
+            lock.lock();
             return signaled;
         }
 #endif
