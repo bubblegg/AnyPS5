@@ -1005,7 +1005,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
     Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
-    if (state.rectList) Require(draw.indexCount % 3 == 0, "incomplete rect-list primitive");
+    if (state.rectList && draw.indexCount % 3 != 0) {
+        // The hardware drops the vertices left over after the last whole rectangle, and so does Vulkan
+        // for the three-point patches a rect list is drawn as.
+        static std::atomic<unsigned> reported{0};
+        if (reported.fetch_add(1) < 4) APS5_LOG_ERR("Rect-list draw of %u vertices (indexed %d, instances %u): the %u after the last whole rectangle are dropped", draw.indexCount, draw.indexed ? 1 : 0, draw.instanceCount, draw.indexCount % 3);
+    }
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
