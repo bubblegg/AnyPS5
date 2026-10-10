@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -54,6 +55,9 @@ bool formatOf(std::uint32_t param, Format& format) {
 }
 
 SDL_AudioDeviceID openDevice(std::uint32_t freq, std::uint32_t samples, const Format& format) {
+    // APS5_NO_MICROPHONE=1: no capture device is opened; the port reads silence, as with no microphone.
+    static const bool noMicrophone = std::getenv("APS5_NO_MICROPHONE") != nullptr;
+    if (noMicrophone) return 0;
     if (!g_sdlAudio) {
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) return 0;
         g_sdlAudio = true;
