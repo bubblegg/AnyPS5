@@ -241,7 +241,19 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
+        // Each of these faults was dispatched on the writer's own stack: Windows put its exception
+        // frame directly below the stack pointer, over the 128 bytes a guest function may keep live
+        // there (the System V red zone). Counted and sampled so their frequency is known.
+        static std::atomic<unsigned long long> resumed{0};
+        const auto count = ++resumed;
+        if (count == 1 || count == 10 || count == 100 || count == 1000 || count == 10000 || count == 100000 || count % 1000000 == 0) {
+            char where[MAX_PATH + 64];
+            DescribeAddress(info->ContextRecord->Rip, where, sizeof(where));
+            Report("[write-fault] %llu guest writes resumed after a tracking fault so far; this one at %s on thread %lu writing 0x%llx\n", count, where, GetCurrentThreadId(), static_cast<unsigned long long>(fault->ExceptionInformation[1]));
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
