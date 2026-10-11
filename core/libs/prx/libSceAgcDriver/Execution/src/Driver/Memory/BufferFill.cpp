@@ -181,6 +181,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     static auto fillReport = std::chrono::steady_clock::now();
     ++fills;
     filledBytes += bytes;
+    if (bytes != 0) Graphics::TraceGuestFill(dwordFill ? "title dword-pattern fill" : "title fill kernel", base, bytes, pattern[0]);
     if (bytes != 0 && pattern[0] == pattern[1] && pattern[0] == pattern[2] && pattern[0] == pattern[3]) {
         Graphics::NoteHtileFill(base, bytes, pattern[0]);
         if (pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) Graphics::NoteTitleMetadataFill(base, bytes);

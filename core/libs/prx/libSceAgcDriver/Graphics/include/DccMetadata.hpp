@@ -36,6 +36,8 @@ bool KeysServeSurface(std::uint64_t followedDcc, DccKeys uploaded, DccKeys fille
 // A buffer fill by the title with one repeated byte: recorded as the extent of the metadata it owns
 // at `base`, which bounds the keys the driver reads and stores there beyond one per 256 surface bytes.
 void NoteTitleMetadataFill(std::uint64_t base, std::size_t bytes);
+// APS5_TRACE_GUEST_FILLS=1: lists each distinct fill stored into guest memory (who, range, first word).
+void TraceGuestFill(const char* who, std::uint64_t base, std::size_t bytes, std::uint32_t word);
 // The keys covering a surface of `surfaceBytes`, when they all agree.
 DccKeys ReadDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 bool IsDccClear(DccKeys keys);

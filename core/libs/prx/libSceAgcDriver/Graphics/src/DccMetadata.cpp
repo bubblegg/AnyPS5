@@ -21,8 +21,14 @@
 #include <utility>
 #include <vector>
 
+extern "C" char __ImageBase;
+
 namespace AgcDriver::Graphics {
 namespace {
+
+const void* TraceModuleBase() {
+    return &__ImageBase;
+}
 
 constexpr std::uint64_t KeyBytes = 256;
 
@@ -218,6 +224,7 @@ void TraceKeyStore(const char* path, std::uint64_t begin, std::size_t count) {
 // buffer of 0xff instead. Under GuestMemory::GpuMutex (it records). False when the keys cannot be
 // stored this way (memory the GPU has no view of): the caller stores them on the CPU.
 bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    TraceGuestFill("driver DCC keys (GPU)", begin, count, 0xffffffffu);
     const auto* import = HostImportFor(context, begin, count);
     if (import == nullptr) return false;
     const VkDeviceSize first = begin - import->base;
@@ -256,6 +263,7 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
 }
 
 void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
+    TraceGuestFill("driver DCC keys (CPU)", begin, count, 0xffffffffu);
     TraceKeyStore("cpu", begin, count);
     // The write waits for recorded work over the range (the flush hook), so the bytes are current after.
     ForgetStores(begin, begin + count);
@@ -540,6 +548,16 @@ void NoteTitleMetadataFill(std::uint64_t base, std::size_t bytes) {
     longest = std::max(longest, bytes);
 }
 
+void TraceGuestFill(const char* who, std::uint64_t base, std::size_t bytes, std::uint32_t word) {
+    static const bool enabled = std::getenv("APS5_TRACE_GUEST_FILLS") != nullptr;
+    if (!enabled) return;
+    static std::mutex seenMutex;
+    static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+    std::lock_guard lock(seenMutex);
+    if (seen.size() >= 6000 || !seen.insert({base, (static_cast<std::uint64_t>(bytes) << 32u) ^ word}).second) return;
+    std::fprintf(stderr, "[fill-trace] %s 0x%llx..0x%llx (0x%zx bytes) word 0x%08x\n", who, static_cast<unsigned long long>(base), static_cast<unsigned long long>(base + bytes), bytes, word);
+}
+
 bool IsDccClear(DccKeys keys) {
     return keys == DccKeys::Clear0000 || keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110 || keys == DccKeys::Clear1111 || keys == DccKeys::ClearRegister;
 }
@@ -551,6 +569,7 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes) 
 void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
+    TraceGuestFill("driver marks DCC keys, caller", metaAddress, count, static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<std::uintptr_t>(TraceModuleBase())));
     // The bytes are trusted only when no recorded work writes them (lock-free, with or without
     // GuestMemory::GpuMutex); otherwise the store runs and waits through the flush hook. A pending
     // GPU store of the driver's own is no reason to skip: a title kernel recorded into the same
@@ -566,6 +585,7 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
 void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
+    TraceGuestFill("driver marks DCC keys, caller", metaAddress, count, static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<std::uintptr_t>(TraceModuleBase())));
     auto* recorder = CpuKeysOnly() || !GuestMemory::GpuMutex().HeldByThisThread() ? nullptr : Recorder::Active();
     // The bytes are scanned only when no recorded work writes them: a pending clear kernel's keys are
     // not in memory yet, so the bytes could read as uncompressed while the kernel will store a clear
