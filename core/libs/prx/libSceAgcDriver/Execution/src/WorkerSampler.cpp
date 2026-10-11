@@ -29,6 +29,7 @@ namespace {
 
 std::jthread processSamplerThread;
 std::jthread workerSamplerThread;
+std::jthread committerSamplerThread;
 
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm, and the
@@ -41,6 +42,10 @@ struct Sampler {
     std::uint64_t samples = 0;
     int depth = 12;
     bool chains = false;
+    // APS5_SAMPLE_WINDOWS=1: every write goes to its own file (<file>.0, <file>.1, ...) and starts
+    // the counts again, so one scene can be read apart from the menus and loads around it.
+    bool windows = false;
+    int window = 0;
     std::map<std::vector<std::uint64_t>, std::uint64_t> stacks;
 
     ~Sampler() noexcept(false) {
@@ -136,8 +141,8 @@ struct Sampler {
     }
 
     // Called with the mutex held: the 2000 most frequent chains as "count frame;frame;..." lines.
-    void writeStacks() {
-        std::FILE* file = std::fopen((path + ".stacks").c_str(), "w");
+    void writeStacks(const std::string& output) {
+        std::FILE* file = std::fopen((output + ".stacks").c_str(), "w");
         if (file == nullptr) return;
         std::vector<std::pair<std::uint64_t, const std::vector<std::uint64_t>*>> order;
         order.reserve(stacks.size());
@@ -160,7 +165,8 @@ struct Sampler {
 
     void write() {
         std::lock_guard lock(mutex);
-        std::FILE* file = std::fopen(path.c_str(), "w");
+        const std::string output = windows ? path + "." + std::to_string(window++) : path;
+        std::FILE* file = std::fopen(output.c_str(), "w");
         if (file == nullptr) return;
         std::fprintf(file, "# %llu samples\n", static_cast<unsigned long long>(samples));
         for (const auto& [address, count] : counts) {
@@ -171,7 +177,12 @@ struct Sampler {
             std::fprintf(file, "%s 0x%llx %llu %llu\n", base ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)), static_cast<unsigned long long>(count.first), static_cast<unsigned long long>(count.second));
         }
         std::fclose(file);
-        if (chains) writeStacks();
+        if (chains) writeStacks(output);
+        if (windows) {
+            counts.clear();
+            stacks.clear();
+            samples = 0;
+        }
     }
 };
 
@@ -257,17 +268,33 @@ void StartProcessSampler() {
 
 }
 
+namespace {
+
+void startSampler(const char* path, std::jthread& thread);
+
+}
+
 void StartWorkerSampler() {
     StartProcessSampler();
-    const char* path = std::getenv("APS5_SAMPLE_WORKER");
-    if (path == nullptr) return;
+    startSampler(std::getenv("APS5_SAMPLE_WORKER"), workerSamplerThread);
+}
+
+void StartCommitterSampler() {
+    startSampler(std::getenv("APS5_SAMPLE_COMMITTER"), committerSamplerThread);
+}
+
+namespace {
+
+void startSampler(const char* path, std::jthread& thread) {
+    if (path == nullptr || thread.joinable()) return;
     auto sampler = std::make_unique<Sampler>();
     sampler->path = path;
     // Deep enough to reach the driver from inside the Vulkan driver's compiler and from host waits.
     sampler->depth = 96;
     sampler->chains = true;
+    sampler->windows = std::getenv("APS5_SAMPLE_WINDOWS") != nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
-    workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
+    thread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -281,14 +308,19 @@ void StartWorkerSampler() {
     });
 }
 
+}
+
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
+    committerSamplerThread.request_stop();
+    if (committerSamplerThread.joinable()) committerSamplerThread.join();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
 }
 #else
 void StartWorkerSampler() {}
+void StartCommitterSampler() {}
 void StopWorkerSampler() {}
 #endif
 

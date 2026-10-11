@@ -5,6 +5,8 @@ namespace AgcDriver {
 
 // Starts sampling the calling thread when APS5_SAMPLE_WORKER names an output file.
 void StartWorkerSampler();
+// The same for the thread that records pipelined draws, with APS5_SAMPLE_COMMITTER.
+void StartCommitterSampler();
 void StopWorkerSampler();
 
 }

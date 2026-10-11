@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include <algorithm>
@@ -171,6 +172,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    StartCommitterSampler();
     // An empty queue is usually refilled within microseconds: the committer polls for up to
     // APS5_PIPELINE_SPIN_US (default 50) before it sleeps, which saves the worker a wake-up per draw
     // (suggested by Raghav314 on boykopovar/AnyPS5#1201).
