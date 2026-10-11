@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <immintrin.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -108,8 +109,19 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    // An empty queue is usually refilled within microseconds: the committer polls for up to
+    // APS5_PIPELINE_SPIN_US (default 50) before it sleeps, which saves the worker a wake-up per draw
+    // (suggested by Raghav314 on boykopovar/AnyPS5#1201).
+    static const auto spin = std::chrono::microseconds([] {
+        const char* text = std::getenv("APS5_PIPELINE_SPIN_US");
+        return text != nullptr ? std::strtoll(text, nullptr, 10) : 50ll;
+    }());
     for (;;) {
         Commit* commit = nullptr;
+        if (outstanding.load(std::memory_order_acquire) == 0 && spin.count() > 0) {
+            const auto until = std::chrono::steady_clock::now() + spin;
+            while (outstanding.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < until) _mm_pause();
+        }
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
