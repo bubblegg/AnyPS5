@@ -6,12 +6,14 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <span>
 #include <stop_token>
 #include <system_error>
 #include <thread>
@@ -45,18 +47,24 @@ struct Sampler {
         if (target != nullptr && !CloseHandle(target)) throw std::system_error(GetLastError(), std::system_category(), "Closing sampler thread handle");
     }
 
+    static constexpr int MaxDepth = 128;
+    static constexpr std::size_t StackWords = 4096;
+    std::vector<std::uint64_t> stackWords = std::vector<std::uint64_t>(StackWords);
+
     void sample() {
+        // Nothing may allocate while the target is suspended: it may hold the heap lock (the draw
+        // thread spends much of its time in malloc), and the sampler would then wait for good.
+        std::array<std::uint64_t, MaxDepth> walked{};
+        std::size_t walkedCount = 0, stackCount = 0;
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
         if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
         const bool captured = GetThreadContext(target, &context) != 0;
-        std::vector<std::uint64_t> frames;
-        std::vector<std::uint64_t> stack;
         if (captured) {
             // Unwinding reads the target's stack while it is suspended; frames without unwind data
             // (JIT/guest code) end the walk.
-            for (int frame = 0; frame < depth && context.Rip != 0; ++frame) {
-                frames.push_back(context.Rip);
+            for (int frame = 0; frame < std::min(depth, MaxDepth) && context.Rip != 0; ++frame) {
+                walked[walkedCount++] = context.Rip;
                 DWORD64 imageBase = 0;
                 auto* entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
                 if (entry == nullptr) break;
@@ -67,10 +75,11 @@ struct Sampler {
             // Most of this library has only DWARF unwind data, which ends the walk at its first
             // frame. For call chains, the stack above that point is copied and scanned for return
             // addresses into this library afterwards.
-            if (chains && context.Rsp != 0) stack = copyStack(context.Rsp);
+            if (chains && context.Rsp != 0) stackCount = copyStack(context.Rsp, stackWords);
         }
         ResumeThread(target);
-        if (!stack.empty()) scanReturnAddresses(stack, frames);
+        std::vector<std::uint64_t> frames(walked.begin(), walked.begin() + static_cast<std::ptrdiff_t>(walkedCount));
+        if (stackCount != 0) scanReturnAddresses(std::span<const std::uint64_t>(stackWords).first(stackCount), frames);
         std::lock_guard lock(mutex);
         ++samples;
         for (std::size_t i = 0; i < frames.size(); ++i) {
@@ -82,22 +91,20 @@ struct Sampler {
         if (chains && !frames.empty()) ++stacks[frames];
     }
 
-    static std::vector<std::uint64_t> copyStack(std::uint64_t rsp) {
-        constexpr std::size_t MaxBytes = 32u << 10u;
+    // Copies the stack from rsp into words without allocating; returns the words copied.
+    static std::size_t copyStack(std::uint64_t rsp, std::vector<std::uint64_t>& words) {
         MEMORY_BASIC_INFORMATION region{};
-        if (VirtualQuery(reinterpret_cast<const void*>(rsp), &region, sizeof(region)) == 0 || region.State != MEM_COMMIT) return {};
+        if (VirtualQuery(reinterpret_cast<const void*>(rsp), &region, sizeof(region)) == 0 || region.State != MEM_COMMIT) return 0;
         const auto end = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
-        const auto bytes = std::min<std::uint64_t>(end - rsp, MaxBytes) & ~std::uint64_t{7};
-        std::vector<std::uint64_t> words(bytes / 8);
+        const auto bytes = std::min<std::uint64_t>(end - rsp, words.size() * 8) & ~std::uint64_t{7};
         SIZE_T read = 0;
-        if (words.empty() || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(rsp), words.data(), bytes, &read)) return {};
-        words.resize(read / 8);
-        return words;
+        if (bytes == 0 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(rsp), words.data(), bytes, &read)) return 0;
+        return read / 8;
     }
 
     // Appends 0 (a marker: the frames after it are guessed) and every stack word that points into
     // this library's code just after a call instruction, nearest first.
-    static void scanReturnAddresses(const std::vector<std::uint64_t>& stack, std::vector<std::uint64_t>& frames) {
+    static void scanReturnAddresses(std::span<const std::uint64_t> stack, std::vector<std::uint64_t>& frames) {
         static const auto [begin, end] = [] {
             const auto base = reinterpret_cast<std::uint64_t>(&__ImageBase);
             const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
