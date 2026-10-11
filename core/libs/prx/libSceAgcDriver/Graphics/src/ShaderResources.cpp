@@ -3411,7 +3411,17 @@ namespace {
 struct DrawRing {
     static constexpr std::uint64_t Bytes = std::uint64_t{64} << 20u;
     // A larger element keeps its own snapshot buffer, which is reused while its memory is unchanged.
-    static constexpr std::uint64_t MaxElement = 16384;
+    static constexpr std::uint64_t MaxElement = std::uint64_t{1} << 20u;
+    // From this size an element is copied once per batch for all the draws that read it unchanged.
+    static constexpr std::uint64_t SharedBytes = 2048;
+    struct Shared {
+        std::uint64_t begin;
+        std::uint64_t range;
+        std::uint64_t generation;
+        std::uint64_t position;
+    };
+    std::array<Shared, 64> shared;
+    std::size_t sharedCount = 0;
     std::unique_ptr<Buffer> buffer;
     std::mutex mutex;
     std::uint64_t head = 0;
@@ -3455,7 +3465,7 @@ struct DrawRingCounters {
         std::uint64_t total = ring;
         for (const auto count : fallbacks) total += count;
         if (total % (std::uint64_t{1} << 18u) != 0) return;
-        std::fprintf(stderr, "[draws] draw ring: %llu draws bound through the ring (%.1f KiB each, %llu ring sets made), own sets by reason: nothing for the ring %llu, an element over 16 KiB %llu, moved non-ring element %llu, data size %llu, guest size %llu, written %llu, not direct %llu, pending write %llu, ring full %llu\n", static_cast<unsigned long long>(ring), ring != 0 ? static_cast<double>(bytes) / 1024.0 / static_cast<double>(ring) : 0.0, static_cast<unsigned long long>(sets), static_cast<unsigned long long>(fallbacks[Unusable]), static_cast<unsigned long long>(fallbacks[Large]), static_cast<unsigned long long>(fallbacks[ForeignMove]), static_cast<unsigned long long>(fallbacks[DataSize]), static_cast<unsigned long long>(fallbacks[GuestSize]), static_cast<unsigned long long>(fallbacks[Written]), static_cast<unsigned long long>(fallbacks[NotDirect]), static_cast<unsigned long long>(fallbacks[PendingWrite]), static_cast<unsigned long long>(fallbacks[Full]));
+        std::fprintf(stderr, "[draws] draw ring: %llu draws bound through the ring (%.1f KiB each, %llu ring sets made), own sets by reason: nothing for the ring %llu, an element over 1 MiB %llu, moved non-ring element %llu, data size %llu, guest size %llu, written %llu, not direct %llu, pending write %llu, ring full %llu\n", static_cast<unsigned long long>(ring), ring != 0 ? static_cast<double>(bytes) / 1024.0 / static_cast<double>(ring) : 0.0, static_cast<unsigned long long>(sets), static_cast<unsigned long long>(fallbacks[Unusable]), static_cast<unsigned long long>(fallbacks[Large]), static_cast<unsigned long long>(fallbacks[ForeignMove]), static_cast<unsigned long long>(fallbacks[DataSize]), static_cast<unsigned long long>(fallbacks[GuestSize]), static_cast<unsigned long long>(fallbacks[Written]), static_cast<unsigned long long>(fallbacks[NotDirect]), static_cast<unsigned long long>(fallbacks[PendingWrite]), static_cast<unsigned long long>(fallbacks[Full]));
         fallbacks = {};
         ring = bytes = sets = 0;
     }
@@ -3506,10 +3516,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
             return refuse(DrawRingCounters::Unusable);
         }
     }
+    // `shared`: an element of DrawRing::SharedBytes or more, placed apart so the draws of a batch
+    // that read the same unchanged memory (a frame's light or bone tables) share one copy.
     struct Copy {
         std::size_t allocation;
         const void* source;
         std::uint64_t collect;
+        bool shared = false;
+        bool fresh = true;
+        std::uint64_t generation = 0;
+        std::uint64_t position = 0;
     };
     std::array<Copy, 64> copies;
     std::size_t copyCount = 0;
@@ -3556,6 +3572,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
             }
             const auto begin = address - item.adjustment;
             copies[copyCount++] = {index, reinterpret_cast<const void*>(begin), begin};
+            if (range >= DrawRing::SharedBytes) {
+                copies[copyCount - 1].shared = true;
+                copies[copyCount - 1].generation = GuestMemory::CollectWrites(begin, range);
+                continue;
+            }
         }
         total += (range + alignment - 1) / alignment * alignment;
     }
@@ -3579,15 +3600,35 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
             lock.lock();
             ring->heldBy = &recorder;
             ring->heldSerial = recorder.Submissions();
+            ring->sharedCount = 0;
         }
-        auto start = ring->head;
-        if (start % DrawRing::Bytes + total > DrawRing::Bytes) start += DrawRing::Bytes - start % DrawRing::Bytes;
-        if (start + total - ring->tail > DrawRing::Bytes) {
+        // Room for `bytes` in one piece, or false: the ring is full of what pending batches read.
+        const auto take = [&](std::uint64_t bytes, std::uint64_t& at) {
+            auto start = ring->head;
+            if (start % DrawRing::Bytes + bytes > DrawRing::Bytes) start += DrawRing::Bytes - start % DrawRing::Bytes;
+            if (start + bytes - ring->tail > DrawRing::Bytes) return false;
+            ring->head = start + bytes;
+            at = start % DrawRing::Bytes;
+            return true;
+        };
+        bool room = total == 0 || take(total, position);
+        for (std::size_t copy = 0; room && copy < copyCount; ++copy) {
+            auto& entry = copies[copy];
+            if (!entry.shared) continue;
+            const std::uint64_t range = ringRanges[entry.allocation];
+            const auto known = std::find_if(ring->shared.begin(), ring->shared.begin() + ring->sharedCount, [&](const DrawRing::Shared& item) { return item.begin == entry.collect && item.range == range && GuestMemory::UnchangedSince(entry.collect, range, item.generation); });
+            if (entry.generation != 0 && known != ring->shared.begin() + ring->sharedCount) {
+                entry.position = known->position;
+                entry.fresh = false;
+                continue;
+            }
+            room = take((range + alignment - 1) / alignment * alignment, entry.position);
+            if (room && entry.generation != 0 && ring->sharedCount < ring->shared.size()) ring->shared[ring->sharedCount++] = {entry.collect, range, entry.generation, entry.position};
+        }
+        if (!room) {
             lock.unlock();
             return refuse(DrawRingCounters::Full);
         }
-        ring->head = start + total;
-        position = start % DrawRing::Bytes;
     }
     if (ringAllocation.set == VK_NULL_HANDLE) {
         std::map<VkDescriptorType, std::uint32_t> counts;
@@ -3622,6 +3663,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
         const auto& entry = copies[copy];
         const auto& item = allocations[entry.allocation];
         const auto range = ringRanges[entry.allocation];
+        if (entry.shared) {
+            if (entry.fresh) std::memcpy(bytes + entry.position, entry.source, range);
+            placed[copy] = static_cast<std::uint32_t>(entry.position);
+            counters.bytes += entry.fresh ? range : 0;
+            continue;
+        }
         if (item.guest) static_cast<void>(GuestMemory::CollectWrites(entry.collect, range));
         std::memcpy(bytes + position, entry.source, range);
         if (!item.guest) {

@@ -983,6 +983,24 @@ struct DrawInputs {
     std::vector<std::uint32_t> restartTable;
 };
 
+// The highest index of index buffers read in place, by address: a mesh drawn every frame from the
+// same unchanged memory is scanned once, as a copied index buffer's snapshot remembers it. Used
+// under the GPU mutex only.
+struct HighestIndexMemo {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t registryGeneration = 0;
+    std::uint32_t kind = 0;
+    bool found = false;
+    std::uint32_t highest = 0;
+};
+
+HighestIndexMemo& highestIndexMemo(std::uint64_t address) {
+    static auto* table = new std::array<HighestIndexMemo, 4096>();
+    return (*table)[static_cast<std::size_t>((address >> 1u) * 0x9e3779b97f4a7c15ull >> 52u)];
+}
+
 std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
     auto zero = std::make_shared<Buffer>(context, DecodeVertexFormat(attribute).bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
@@ -1071,9 +1089,23 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
-        if (!copy.reused) {
+        // APS5_NO_INDEX_MEMO=1 scans an index buffer read in place on every draw, as before.
+        static const bool indexMemo = std::getenv("APS5_NO_INDEX_MEMO") == nullptr;
+        HighestIndexMemo* memo = nullptr;
+        std::uint64_t memoGeneration = 0;
+        bool memoHit = false;
+        if (import != nullptr && indexMemo) {
+            memo = &highestIndexMemo(draw.indexAddress);
+            memoGeneration = GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+            const auto kind = draw.indexSize | (skipRestart ? 0x100u : 0u);
+            memoHit = memoGeneration != 0 && memo->address == draw.indexAddress && memo->bytes == indexBytes && memo->kind == kind && memo->generation != 0 && memo->registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && GuestMemory::UnchangedSince(draw.indexAddress, static_cast<std::size_t>(indexBytes), memo->generation);
+            if (memoHit && memo->found) highest = memo->highest;
+        }
+        if (memoHit) {
+        } else if (!copy.reused) {
             const auto bytes = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             highest = HighestDrawIndex(bytes, draw.indexSize, skipRestart);
+            if (memo != nullptr) *memo = {draw.indexAddress, indexBytes, memoGeneration, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), draw.indexSize | (skipRestart ? 0x100u : 0u), highest.has_value(), highest.value_or(0u)};
             if (import == nullptr) KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
             highest = copy.derived;
