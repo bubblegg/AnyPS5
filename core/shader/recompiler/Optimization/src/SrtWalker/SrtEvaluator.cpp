@@ -10,8 +10,43 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 namespace ShaderRecompiler::Detail {
+
+namespace {
+
+std::vector<std::unique_ptr<DenseValues>>& spareDenseValues() {
+    thread_local std::vector<std::unique_ptr<DenseValues>> spare;
+    return spare;
+}
+
+}
+
+DenseValues* AcquireDenseValues() {
+    auto& spare = spareDenseValues();
+    DenseValues* values = nullptr;
+    if (spare.empty()) {
+        values = new DenseValues();
+    } else {
+        values = spare.back().release();
+        spare.pop_back();
+    }
+    if (++values->generation == 0) {
+        std::fill(values->stamps.begin(), values->stamps.end(), 0u);
+        values->generation = 1;
+    }
+    return values;
+}
+
+void ReleaseDenseValues(DenseValues* values) noexcept {
+    try {
+        spareDenseValues().emplace_back(values);
+    } catch (...) {
+        delete values;
+    }
+}
 
 bool Evaluator::Evaluate(IrValue* value, std::uint32_t& result) {
     std::uint64_t wide = 0;
