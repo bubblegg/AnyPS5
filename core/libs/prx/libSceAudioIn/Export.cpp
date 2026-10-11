@@ -6,7 +6,9 @@
 #include "SDL.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -42,6 +44,7 @@ struct Port {
 
 std::mutex g_mutex;
 std::array<Port, 8> g_ports{};
+std::atomic<bool> g_floatInput{false};
 bool g_sdlAudio = false;
 
 bool formatOf(std::uint32_t param, Format& format) {
@@ -70,7 +73,41 @@ SDL_AudioDeviceID openDevice(std::uint32_t freq, std::uint32_t samples, const Fo
     SDL_AudioSpec obtained{};
     const SDL_AudioDeviceID device = SDL_OpenAudioDevice(nullptr, 1, &desired, &obtained, 0);
     if (device != 0) SDL_PauseAudioDevice(device, 0);
+    const char* name = SDL_GetNumAudioDevices(1) > 0 ? SDL_GetAudioDeviceName(0, 1) : nullptr;
+    if (device != 0) std::fprintf(stderr, "[audio-in] microphone opened: %u Hz, %u channel(s), %u samples per read; first capture device listed: %s\n", freq, static_cast<unsigned>(format.channels), samples, name != nullptr ? name : "(none)");
+    else std::fprintf(stderr, "[audio-in] no microphone could be opened (%s); the game hears silence\n", SDL_GetError());
     return device;
+}
+
+// Every few seconds: how much of what the game asked for came from the microphone, and how loud it was.
+void reportLevel(const std::uint8_t* data, std::size_t bytes, std::size_t captured, int samples) {
+    static std::atomic<std::uint64_t> reads{0}, wanted{0}, got{0};
+    static std::atomic<int> peak{0};
+    static std::atomic<unsigned> reports{0};
+    const bool floats = samples > 0 && bytes / static_cast<std::size_t>(samples) >= 4 && g_floatInput.load();
+    int loudest = 0;
+    if (floats) {
+        for (std::size_t at = 0; at + 4 <= captured; at += 4) {
+            float value;
+            std::memcpy(&value, data + at, 4);
+            const int scaled = static_cast<int>((value < 0 ? -value : value) * 32767.0f);
+            if (scaled > loudest) loudest = scaled;
+        }
+    } else {
+        for (std::size_t at = 0; at + 2 <= captured; at += 2) {
+            std::int16_t value;
+            std::memcpy(&value, data + at, 2);
+            const int magnitude = value < 0 ? -static_cast<int>(value) : value;
+            if (magnitude > loudest) loudest = magnitude;
+        }
+    }
+    int previous = peak.load();
+    while (loudest > previous && !peak.compare_exchange_weak(previous, loudest)) {}
+    wanted += bytes;
+    got += captured;
+    if (++reads % 1500 != 0 || reports.load() >= 40) return;
+    ++reports;
+    std::fprintf(stderr, "[audio-in] last 1500 reads: %llu of %llu bytes came from the microphone, loudest sample %d of 32767\n", static_cast<unsigned long long>(got.exchange(0)), static_cast<unsigned long long>(wanted.exchange(0)), peak.exchange(0));
 }
 
 Port* find(int handle) {
@@ -129,6 +166,7 @@ int APS5_VABI sceAudioInInput(int handle, void* dest) {
         PreciseSleepUntil(wake);
     }
     std::memset(out + captured, 0, bytes - captured);
+    reportLevel(out, bytes, captured, samples);
     lock.lock();
     port->busy = false;
     return samples;
@@ -146,6 +184,7 @@ int APS5_VABI sceAudioInOpen(int user_id, uint32_t type, uint32_t index, uint32_
     }
     Format format{};
     if (!formatOf(param, format)) return AUDIO_IN_ERROR_INVALID_PARAM;
+    g_floatInput = format.format == AUDIO_F32SYS;
     std::lock_guard lock(g_mutex);
     for (std::size_t i = 0; i < g_ports.size(); ++i) {
         if (g_ports[i].used) continue;
