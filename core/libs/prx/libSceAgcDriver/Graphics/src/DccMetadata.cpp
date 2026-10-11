@@ -367,6 +367,7 @@ bool LayoutFor(VkFormat format, Layout& layout) {
         case VK_FORMAT_R32G32B32A32_UINT: layout = {4, {32, 32, 32, 32}, Kind::Uint}; return true;
         case VK_FORMAT_R32G32B32A32_SINT: layout = {4, {32, 32, 32, 32}, Kind::Sint}; return true;
         case VK_FORMAT_R32G32B32A32_SFLOAT: layout = {4, {32, 32, 32, 32}, Kind::Float}; return true;
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: layout = {3, {11, 11, 10}, Kind::Float}; return true;
         default: return false;
     }
 }
@@ -376,7 +377,7 @@ std::uint64_t One(Kind kind, std::uint32_t bits) {
     switch (kind) {
         case Kind::Unorm: case Kind::Uint: return bits >= 64 ? ~0ull : (1ull << bits) - 1u;
         case Kind::Snorm: case Kind::Sint: return (1ull << (bits - 1u)) - 1u;
-        case Kind::Float: return bits == 16 ? 0x3c00u : 0x3f800000u;
+        case Kind::Float: return bits == 16 ? 0x3c00u : bits == 11 ? 0x3c0u : bits == 10 ? 0x1e0u : 0x3f800000u;
     }
     return 0;
 }
@@ -600,12 +601,15 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
 }
 
 bool FillDccClear(VkFormat format, DccKeys keys, bool alphaOnMsb, std::span<std::byte> bytes) {
-    if (keys == DccKeys::Clear0000) {
+    // The clear-register code names a color only the target's registers hold. A reader that has none
+    // (a texture sampled before it is next bound as a target) gets zeros rather than whatever the
+    // surface memory holds, which for an HDR target shows as blown-out blocks.
+    if (keys == DccKeys::Clear0000 || keys == DccKeys::ClearRegister) {
         std::fill(bytes.begin(), bytes.end(), std::byte{0});
         return true;
     }
     Layout layout{};
-    if (!IsDccClear(keys) || keys == DccKeys::ClearRegister || !LayoutFor(format, layout)) return false;
+    if (!IsDccClear(keys) || !LayoutFor(format, layout)) return false;
     const bool color = keys == DccKeys::Clear1110 || keys == DccKeys::Clear1111;
     const bool alpha = keys == DccKeys::Clear0001 || keys == DccKeys::Clear1111;
     const int alphaChannel = layout.channels == 3 ? -1 : alphaOnMsb ? static_cast<int>(layout.channels) - 1 : 0;
