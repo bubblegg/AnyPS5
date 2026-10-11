@@ -169,8 +169,8 @@ void noteAllocation(std::size_t size, std::uint64_t cycles) {
 
 // A per-thread cache of small freed blocks. The draw path makes hundreds of small allocations per
 // draw (millions a second), and malloc plus free cost it about a quarter of its time. Every block in
-// the cache is a whole malloc block of at least its class size (its size is read with _msize when it
-// is cached), so a block handed out from the cache may still be freed by anyone with free(), as the
+// the cache is a whole malloc block of at least its class size (only sized deletes are cached, see
+// keepCached), so a block handed out from the cache may still be freed by anyone with free(), as the
 // C++ runtime library does with some blocks this library allocates. Off under APS5_GUARD_NEW and
 // with APS5_NO_ALLOC_CACHE.
 struct SmallCache {
@@ -230,10 +230,12 @@ void* takeCached(std::size_t size) {
 }
 
 // Keeps a freed block in the cache of the class it fully holds; false if it does not fit there.
-bool keepCached(void* block) {
-    const std::size_t capacity = _msize(block);
-    if (capacity < SmallCache::Granule || capacity > SmallCache::Classes * SmallCache::Granule) return false;
-    const std::size_t c = capacity / SmallCache::Granule - 1;
+// The class comes from the size a sized delete names: the 64-bit Windows heap hands out blocks in
+// 16-byte units, so a block of `size` bytes holds the whole of its 16-byte class. (Asking the heap
+// with _msize cost the draw thread about a sixth of its time.)
+bool keepCached(void* block, std::size_t size) {
+    if (size > SmallCache::Classes * SmallCache::Granule) return false;
+    const std::size_t c = (size != 0 ? size - 1 : 0) / SmallCache::Granule;
     auto* cache = smallCache(true);
     if (cache == nullptr || cache->counts[c] >= SmallCache::Depth) return false;
     std::memcpy(block, &cache->heads[c], sizeof(void*));
@@ -271,7 +273,7 @@ void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
 void guardedFree(void* pointer, void* site, std::size_t deleting) noexcept {
     if (pointer == nullptr) return;
     if (!guardEnabled()) {
-        if (smallCacheEnabled() && keepCached(pointer)) return;
+        if (smallCacheEnabled() && deleting != static_cast<std::size_t>(-1) && keepCached(pointer, deleting)) return;
         std::free(pointer);
         return;
     }
