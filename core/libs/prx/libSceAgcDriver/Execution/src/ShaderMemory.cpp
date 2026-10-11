@@ -17,6 +17,20 @@
 namespace AgcDriver {
 namespace {
 
+// Calls run(first, end) for each run of set bits, a 64-bit word at a time (a page is scanned for
+// every stage of every draw; testing it bit by bit cost the draw path several percent).
+template<std::size_t Bits, typename TRun>
+void forEachRun(const std::bitset<Bits>& bits, TRun&& run) {
+    if (bits.none()) return;
+    const auto clear = ~bits;
+    for (std::size_t first = bits._Find_first(); first < Bits;) {
+        const std::size_t end = clear._Find_next(first);
+        run(first, end);
+        if (end >= Bits) return;
+        first = bits._Find_next(end);
+    }
+}
+
 struct CaptureProfile {
     std::atomic<std::uint64_t> captures{0};
     std::atomic<std::uint64_t> reads{0};
@@ -288,15 +302,9 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
             result.push_back({next->first, next->second});
             ++next;
         }
-        for (std::size_t index = 0; index < PageWords;) {
-            if (!page.read.test(index)) {
-                ++index;
-                continue;
-            }
-            const auto first = index;
-            while (index < PageWords && page.read.test(index)) ++index;
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, index - first))});
-        }
+        forEachRun(page.read, [&](std::size_t first, std::size_t end) {
+            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, end - first))});
+        });
     }
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
     return result;
@@ -306,15 +314,9 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
     for (auto& [base, page] : pages) {
         if (page.recent.none()) continue;
-        for (std::size_t index = 0; index < PageWords;) {
-            if (!page.recent.test(index)) {
-                ++index;
-                continue;
-            }
-            const auto first = index;
-            while (index < PageWords && page.recent.test(index)) ++index;
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, index - first))});
-        }
+        forEachRun(page.recent, [&](std::size_t first, std::size_t end) {
+            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, end - first))});
+        });
         page.recent.reset();
     }
     return result;
