@@ -228,6 +228,13 @@ if(WIN32)
     target_link_options(libSceAgcDriver PRIVATE "-Wl,--exclude-symbols,_Znwy:_Znay:_ZnwyRKSt9nothrow_t:_ZnayRKSt9nothrow_t:_ZdlPv:_ZdaPv:_ZdlPvy:_ZdaPvy:_ZdlPvRKSt9nothrow_t:_ZdaPvRKSt9nothrow_t")
 endif()
 
+# This library's thread_local accesses go to its own table instead of libgcc's emulated TLS
+# (Execution/src/EmulatedTls.cpp).
+if(MINGW)
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/EmulatedTls.cpp)
+    target_link_options(libSceAgcDriver PRIVATE "-Wl,--wrap=__emutls_get_address")
+endif()
+
 target_include_directories(libSceAgcDriver PRIVATE
         ${LIBS_INCLUDE_DIR}
         ${agcTextureDetileGeneratedRoot}

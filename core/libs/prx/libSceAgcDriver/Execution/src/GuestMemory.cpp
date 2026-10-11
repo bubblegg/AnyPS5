@@ -408,6 +408,7 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    std::atomic<bool> initialized{false};
     PageSpan arena;
     PageSpan image;
 
@@ -455,6 +456,9 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void PageStates::initialize() {
+    // Every page query comes through here, and call_once costs two emulated thread_local stores
+    // and a pthread_once even when it has run.
+    if (initialized.load(std::memory_order_acquire)) return;
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -478,6 +482,7 @@ void PageStates::initialize() {
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
     });
+    initialized.store(true, std::memory_order_release);
 }
 
 struct PageRun {
