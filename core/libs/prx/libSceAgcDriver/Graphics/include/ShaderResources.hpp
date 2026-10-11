@@ -444,6 +444,7 @@ private:
     mutable std::vector<std::uint32_t> ringRanges;
     mutable DescriptorCache::SetAllocation ringAllocation;
     mutable bool ringUnusable = false;
+    mutable bool ringTooLarge = false;
     std::shared_ptr<DrawBindings> prepareRingBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).

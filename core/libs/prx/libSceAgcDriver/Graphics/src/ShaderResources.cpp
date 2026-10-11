@@ -3448,14 +3448,14 @@ DrawRing* DrawRingFor(const Context& context) {
 
 // Ring draws against draws that took a set of their own, by reason, every 2^18 of them.
 struct DrawRingCounters {
-    enum Reason { Unusable, ForeignMove, DataSize, GuestSize, Written, NotDirect, PendingWrite, Full, ReasonCount };
+    enum Reason { Unusable, Large, ForeignMove, DataSize, GuestSize, Written, NotDirect, PendingWrite, Full, ReasonCount };
     std::array<std::uint64_t, ReasonCount> fallbacks{};
     std::uint64_t ring = 0, bytes = 0, sets = 0;
     void note() {
         std::uint64_t total = ring;
         for (const auto count : fallbacks) total += count;
         if (total % (std::uint64_t{1} << 18u) != 0) return;
-        std::fprintf(stderr, "[draws] draw ring: %llu draws bound through the ring (%.1f KiB each, %llu ring sets made), own sets by reason: template not served %llu, moved non-ring element %llu, data size %llu, guest size %llu, written %llu, not direct %llu, pending write %llu, ring full %llu\n", static_cast<unsigned long long>(ring), ring != 0 ? static_cast<double>(bytes) / 1024.0 / static_cast<double>(ring) : 0.0, static_cast<unsigned long long>(sets), static_cast<unsigned long long>(fallbacks[Unusable]), static_cast<unsigned long long>(fallbacks[ForeignMove]), static_cast<unsigned long long>(fallbacks[DataSize]), static_cast<unsigned long long>(fallbacks[GuestSize]), static_cast<unsigned long long>(fallbacks[Written]), static_cast<unsigned long long>(fallbacks[NotDirect]), static_cast<unsigned long long>(fallbacks[PendingWrite]), static_cast<unsigned long long>(fallbacks[Full]));
+        std::fprintf(stderr, "[draws] draw ring: %llu draws bound through the ring (%.1f KiB each, %llu ring sets made), own sets by reason: nothing for the ring %llu, an element over 16 KiB %llu, moved non-ring element %llu, data size %llu, guest size %llu, written %llu, not direct %llu, pending write %llu, ring full %llu\n", static_cast<unsigned long long>(ring), ring != 0 ? static_cast<double>(bytes) / 1024.0 / static_cast<double>(ring) : 0.0, static_cast<unsigned long long>(sets), static_cast<unsigned long long>(fallbacks[Unusable]), static_cast<unsigned long long>(fallbacks[Large]), static_cast<unsigned long long>(fallbacks[ForeignMove]), static_cast<unsigned long long>(fallbacks[DataSize]), static_cast<unsigned long long>(fallbacks[GuestSize]), static_cast<unsigned long long>(fallbacks[Written]), static_cast<unsigned long long>(fallbacks[NotDirect]), static_cast<unsigned long long>(fallbacks[PendingWrite]), static_cast<unsigned long long>(fallbacks[Full]));
         fallbacks = {};
         ring = bytes = sets = 0;
     }
@@ -3482,7 +3482,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
         counters.note();
         return std::shared_ptr<DrawBindings>{};
     };
-    if (ringUnusable) return refuse(DrawRingCounters::Unusable);
+    if (ringUnusable) return refuse(ringTooLarge ? DrawRingCounters::Large : DrawRingCounters::Unusable);
     const auto alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16);
     if (ringRanges.empty()) {
         ringRanges.assign(allocations.size(), 0u);
@@ -3490,12 +3490,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
         for (std::size_t index = 0; index < allocations.size(); ++index) {
             const auto& item = allocations[index];
             std::uint64_t range = 0;
-            if (item.guest && !item.written && item.role == ShaderRecompiler::DescriptorRole::GuestBuffers) range = GuestBufferMemory::ViewBytes(item.size, item.adjustment);
+            // A guest buffer the shader only reads (the GDS is a written one).
+            if (item.guest && !item.written) range = GuestBufferMemory::ViewBytes(item.size, item.adjustment);
             else if (!item.guest && item.buffer != nullptr && (item.role == ShaderRecompiler::DescriptorRole::ShaderData || item.role == ShaderRecompiler::DescriptorRole::FlattenedSrt)) range = item.size;
             if (range == 0) continue;
             if (range > DrawRing::MaxElement) {
-                ringUnusable = true;
-                return refuse(DrawRingCounters::Unusable);
+                ringUnusable = ringTooLarge = true;
+                return refuse(DrawRingCounters::Large);
             }
             ringRanges[index] = static_cast<std::uint32_t>(range);
             any = true;
