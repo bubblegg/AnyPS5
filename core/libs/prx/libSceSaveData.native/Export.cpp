@@ -291,6 +291,24 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
             if (result->params != nullptr) {
                 result->params[set] = load_param(entry.path().string());
             }
+            if (result->infos != nullptr) {
+                // SceSaveDataSearchInfo: blocks (32 KiB each) the save has and has free, then 32 reserved bytes.
+                struct SearchInfo {
+                    std::uint64_t blocks;
+                    std::uint64_t freeBlocks;
+                    std::uint8_t reserved[32];
+                };
+                std::uint64_t usedBytes = 0;
+                std::error_code ec;
+                for (const auto& file : std::filesystem::recursive_directory_iterator(entry.path(), ec)) {
+                    if (file.is_regular_file(ec)) usedBytes += file.file_size(ec);
+                }
+                const std::uint64_t usedBlocks = (usedBytes + 32767) / 32768;
+                SearchInfo info{};
+                info.blocks = std::max<std::uint64_t>(96, usedBlocks);
+                info.freeBlocks = info.blocks - std::min(info.blocks, usedBlocks);
+                std::memcpy(reinterpret_cast<std::uint8_t*>(result->infos) + static_cast<std::size_t>(set) * sizeof(SearchInfo), &info, sizeof(info));
+            }
             set++;
         }
     }
@@ -301,6 +319,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
 
 int APS5_VABI sceSaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameSearchResult* result) {
     const int rc = dirNameSearch(cond, result);
+    SAVEDATA_TRACE("dirNameSearch asked: title %s key %u order %u; room for %u names, params %s, infos %s; first name returned: %s", cond != nullptr && cond->title_id != nullptr ? reinterpret_cast<const char*>(cond->title_id) : "(own)", cond != nullptr ? cond->key : 0u, cond != nullptr ? cond->order : 0u, result != nullptr ? result->dir_names_num : 0u, result != nullptr && result->params != nullptr ? "yes" : "no", result != nullptr && result->infos != nullptr ? "yes" : "no", result != nullptr && result->dir_names != nullptr && result->set_num != 0 ? result->dir_names[0].data : "(none)");
     SAVEDATA_TRACE("dirNameSearch user=%d pattern=%s hit=%u set=%u -> 0x%08x", cond != nullptr ? cond->user_id : -1, cond != nullptr && cond->dir_name != nullptr ? cond->dir_name->data : "(all)", result != nullptr ? result->hit_num : 0u, result != nullptr ? result->set_num : 0u, static_cast<unsigned>(rc));
     return rc;
 }
