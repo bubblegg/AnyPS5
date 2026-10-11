@@ -11,114 +11,97 @@
 
 namespace ShaderRecompiler::Detail {
 
-// A walk's values by IrValue id: arrays a thread's evaluators take turns with, so a walk neither
-// hashes nor allocates once the arrays have grown (the hash table below cost the draw path's
-// preparing thread 4% in inserts alone, its growth included). A slot belongs to the current walk
-// when its stamp is the arrays' generation.
-struct DenseValues {
-    static constexpr std::uint32_t MaxId = 16384;
-    std::vector<const IrValue*> keys;
-    std::vector<std::uint64_t> values;
-    std::vector<std::uint32_t> stamps;
+// A walk's values, by IrValue: an open-addressing table a thread's evaluators take turns with. It
+// keeps its size from walk to walk, so a walk neither allocates nor rehashes once the table has
+// grown (starting empty and growing cost the draw path's preparing thread 4% in inserts alone);
+// a slot belongs to the current walk when its stamp is the table's generation. Indexing by
+// IrValue id instead was slower: the ids are sparse, and the arrays did not stay in the cache.
+struct ValueTable {
+    struct Slot {
+        const IrValue* key = nullptr;
+        std::uint64_t value = 0;
+        std::uint32_t stamp = 0;
+    };
+    // The first `capacity` slots are in use: a walk starts with room for twice what the table's
+    // last walk held, so a small walk stays within a few cache lines of a table a large one grew.
+    std::vector<Slot> slots;
+    std::vector<Slot> moving;
+    std::size_t capacity = 0;
+    std::size_t count = 0;
+    std::size_t lastCount = 0;
     std::uint32_t generation = 0;
+    void NextGeneration() {
+        if (++generation == 0) {
+            for (auto& slot : slots) slot.stamp = 0;
+            generation = 1;
+        }
+    }
 };
-// The calling thread's spare arrays (or new ones) with a fresh generation, and their return.
-DenseValues* AcquireDenseValues();
-void ReleaseDenseValues(DenseValues* values) noexcept;
+// The calling thread's spare table (or a new one) with a fresh generation, and its return.
+ValueTable* AcquireValueTable();
+void ReleaseValueTable(ValueTable* table) noexcept;
 
 class EvaluatedValues {
 public:
-    EvaluatedValues() : _dense(AcquireDenseValues()) {}
-    ~EvaluatedValues() { ReleaseDenseValues(_dense); }
+    EvaluatedValues() : _table(AcquireValueTable()) {}
+    ~EvaluatedValues() { ReleaseValueTable(_table); }
     EvaluatedValues(const EvaluatedValues&) = delete;
     EvaluatedValues& operator=(const EvaluatedValues&) = delete;
 
     bool Find(const IrValue* key, std::uint64_t& value) const {
-        const auto id = key->Id();
-        if (id < _dense->stamps.size() && _dense->stamps[id] == _dense->generation) {
-            if (_dense->keys[id] == key) {
-                value = _dense->values[id];
-                return true;
+        const auto& slots = _table->slots;
+        for (std::size_t index = Home(key);; index = (index + 1u) & (_table->capacity - 1u)) {
+            const auto& slot = slots[index];
+            if (slot.stamp != _table->generation) {
+                return false;
             }
-            return FindSpilled(key, value);
-        }
-        return id >= DenseValues::MaxId && FindSpilled(key, value);
-    }
-    void Insert(const IrValue* key, std::uint64_t value) {
-        const auto id = key->Id();
-        if (id < DenseValues::MaxId) {
-            if (id >= _dense->stamps.size()) {
-                const auto size = std::min<std::size_t>(DenseValues::MaxId, std::max<std::size_t>({std::size_t{256}, _dense->stamps.size() * 2u, std::size_t{id} + 1u}));
-                _dense->keys.resize(size);
-                _dense->values.resize(size);
-                _dense->stamps.resize(size);
-            }
-            if (_dense->stamps[id] != _dense->generation) {
-                _dense->stamps[id] = _dense->generation;
-                _dense->keys[id] = key;
-                _dense->values[id] = value;
-                return;
-            }
-            if (_dense->keys[id] == key) {
-                return;
-            }
-        }
-        InsertSpilled(key, value);
-    }
-
-private:
-    // Values whose id is beyond the arrays or already taken by another value of the walk.
-    bool FindSpilled(const IrValue* key, std::uint64_t& value) const {
-        if (_slots.empty()) {
-            return false;
-        }
-        for (std::size_t index = Home(key);; index = (index + 1u) & (_slots.size() - 1u)) {
-            const auto& slot = _slots[index];
             if (slot.key == key) {
                 value = slot.value;
                 return true;
             }
-            if (slot.key == nullptr) {
-                return false;
-            }
         }
     }
-    void InsertSpilled(const IrValue* key, std::uint64_t value) {
-        if ((_count + 1u) * 2u > _slots.size()) {
+    void Insert(const IrValue* key, std::uint64_t value) {
+        if ((_table->count + 1u) * 2u > _table->capacity) {
             Grow();
         }
-        for (std::size_t index = Home(key);; index = (index + 1u) & (_slots.size() - 1u)) {
-            auto& slot = _slots[index];
+        auto& slots = _table->slots;
+        for (std::size_t index = Home(key);; index = (index + 1u) & (_table->capacity - 1u)) {
+            auto& slot = slots[index];
+            if (slot.stamp != _table->generation) {
+                slot = {key, value, _table->generation};
+                ++_table->count;
+                return;
+            }
             if (slot.key == key) {
                 return;
             }
-            if (slot.key == nullptr) {
-                slot = {key, value};
-                ++_count;
-                return;
-            }
         }
     }
-    struct Slot {
-        const IrValue* key = nullptr;
-        std::uint64_t value = 0;
-    };
+
+private:
     std::size_t Home(const IrValue* key) const {
-        return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(key) >> 4u) * 0x9e3779b97f4a7c15ull >> 32u) & (_slots.size() - 1u);
+        return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(key) >> 4u) * 0x9e3779b97f4a7c15ull >> 32u) & (_table->capacity - 1u);
     }
     void Grow() {
-        std::vector<Slot> previous(_slots.empty() ? 64u : _slots.size() * 2u);
-        previous.swap(_slots);
-        _count = 0;
-        for (const auto& slot : previous) {
-            if (slot.key != nullptr) {
-                InsertSpilled(slot.key, slot.value);
+        auto& moving = _table->moving;
+        moving.clear();
+        for (std::size_t index = 0; index < _table->capacity; ++index) {
+            if (_table->slots[index].stamp == _table->generation) {
+                moving.push_back(_table->slots[index]);
             }
         }
+        _table->capacity *= 2u;
+        if (_table->slots.size() < _table->capacity) {
+            _table->slots.resize(_table->capacity);
+        }
+        _table->NextGeneration();
+        _table->count = 0;
+        for (const auto& slot : moving) {
+            Insert(slot.key, slot.value);
+        }
     }
-    DenseValues* _dense;
-    std::vector<Slot> _slots;
-    std::size_t _count = 0;
+    ValueTable* _table;
 };
 
 struct InaccessibleRead {
