@@ -63,12 +63,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
-    std::uint64_t drawKey = 0;
+    std::uint64_t drawKey = 0, shapeKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey);
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -91,7 +91,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
+    // Without an entry for the whole key, a decode of the same registers apart from the user data
+    // words (another frame's draw of the same object) saves decoding the state again.
+    if (registerKey && decode == nullptr && !verifyDrawRecipe()) decode = shapeDecode(shapeKey, queue, submission, profile);
+    const bool decodedAfresh = decode == nullptr;
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    if (registerKey && decodedAfresh) keepShapeDecode(shapeKey, decode);
     const auto& graphics = decode->state;
     const auto& pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;

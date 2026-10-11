@@ -13,10 +13,18 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shapeKey) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     std::uint64_t key = 0xcbf29ce484222325ull;
+    std::uint64_t shape = key;
+    // Mixes into both keys; mixUser only into the whole key.
     const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+        shape ^= value;
+        shape *= 0x100000001b3ull;
+    };
+    const auto mixUser = [&](std::uint64_t value) {
         key ^= value;
         key *= 0x100000001b3ull;
     };
@@ -31,6 +39,9 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     const auto unread = [&](std::uint32_t offset) {
         return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.second && offset < user.first + 32u; });
     };
+    const auto userWord = [&](std::uint32_t offset) {
+        return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.first && offset < user.second; });
+    };
     mix(deviceSerial);
     for (const auto& range : Graphics::DrawKeyRegisters) {
         const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
@@ -39,6 +50,11 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         const bool shader = range.bank == Graphics::RegisterBank::Shader;
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
             if (shader && unread(it->first)) continue;
+            if (shader && userWord(it->first)) {
+                mixUser(it->first);
+                mixUser(it->second);
+                continue;
+            }
             mix(it->first);
             mix(it->second);
         }
@@ -60,7 +76,45 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
         mix(address - it->first);
     }
+    if (shapeKey != nullptr) *shapeKey = shape;
     return key;
+}
+
+std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile) {
+    static const bool disabled = std::getenv("APS5_NO_SHAPE_DECODE") != nullptr;
+    static const bool verify = std::getenv("APS5_VERIFY_SHAPE_DECODE") != nullptr;
+    if (disabled) return nullptr;
+    std::shared_ptr<const DrawDecode> cached;
+    {
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (const auto found = drawShapeDecodes.find(shapeKey); found != drawShapeDecodes.end()) cached = found->second;
+        if (profile) ++(cached != nullptr ? drawEntryCounters.shapeDecodeHits : drawEntryCounters.shapeDecodeMisses);
+    }
+    if (cached == nullptr) return nullptr;
+    // The register state and the pixel stage read no user data words, and the programs are decoded
+    // again from this draw's registers (their user data, and the registry's current snapshots).
+    auto decode = std::make_shared<DrawDecode>();
+    decode->state = cached->state;
+    decode->pixel = cached->pixel;
+    DecodeGraphicsPrograms(*decode, queue, *submission.shaders, false, true);
+    if (verify) {
+        const auto fresh = decodeDraw(queue, submission);
+        if (!sameDecode(*decode, *fresh)) {
+            static std::atomic<std::uint64_t> reports{0};
+            if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: a decode reused by shape 0x%llx differs from a fresh decode (target 0x%llx); the fresh one is used\n", static_cast<unsigned long long>(shapeKey), static_cast<unsigned long long>(fresh->state.color.address));
+            std::lock_guard cacheLock(drawCacheMutex);
+            ++drawEntryCounters.shapeDecodeMismatches;
+            return fresh;
+        }
+    }
+    return decode;
+}
+
+void Driver::keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const DrawDecode>& decode) {
+    constexpr std::size_t MaxShapes = 1u << 15u;
+    std::lock_guard cacheLock(drawCacheMutex);
+    if (drawShapeDecodes.size() >= MaxShapes && !drawShapeDecodes.contains(shapeKey)) drawShapeDecodes.clear();
+    drawShapeDecodes[shapeKey] = decode;
 }
 
 namespace {

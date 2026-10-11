@@ -123,7 +123,12 @@ private:
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
+    // The draw's register key; with shapeKey, also the same key without the user data words.
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shapeKey = nullptr);
+    // A decode of the same shape (registers apart from the user data words) with this draw's
+    // programs and user data, or nullptr; and the store of a fresh decode under its shape.
+    std::shared_ptr<const DrawDecode> shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile);
+    void keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const DrawDecode>& decode);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
@@ -314,6 +319,9 @@ private:
     std::list<std::uint64_t> drawOrder;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    // Decodes by shape key (under drawCacheMutex): titles that give each draw its constant buffers
+    // from a per-frame ring (Unity) repeat a draw's registers every frame apart from those addresses.
+    std::unordered_map<std::uint64_t, std::shared_ptr<const DrawDecode>> drawShapeDecodes;
 
     DrawEntryCounters drawEntryCounters;
 
