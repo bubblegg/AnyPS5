@@ -27,13 +27,17 @@ std::jthread processSamplerThread;
 std::jthread workerSamplerThread;
 
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
-// writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
+// writes "module+offset self inclusive" lines to <file> for offline symbolization with nm, and the
+// most frequent whole call chains (leaf first) to <file>.stacks.
 struct Sampler {
     HANDLE target = nullptr;
     std::string path;
     std::mutex mutex;
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> counts;
     std::uint64_t samples = 0;
+    int depth = 12;
+    bool chains = false;
+    std::map<std::vector<std::uint64_t>, std::uint64_t> stacks;
 
     ~Sampler() noexcept(false) {
         if (target != nullptr && !CloseHandle(target)) throw std::system_error(GetLastError(), std::system_category(), "Closing sampler thread handle");
@@ -48,7 +52,7 @@ struct Sampler {
         if (captured) {
             // Unwinding reads the target's stack while it is suspended; frames without unwind data
             // (JIT/guest code) end the walk.
-            for (int depth = 0; depth < 12 && context.Rip != 0; ++depth) {
+            for (int frame = 0; frame < depth && context.Rip != 0; ++frame) {
                 frames.push_back(context.Rip);
                 DWORD64 imageBase = 0;
                 auto* entry = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
@@ -66,6 +70,40 @@ struct Sampler {
             if (i == 0) ++count.first;
             ++count.second;
         }
+        if (chains && !frames.empty()) ++stacks[frames];
+    }
+
+    static std::string frameName(std::uint64_t address) {
+        HMODULE module = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module)) GetModuleFileNameA(module, name, sizeof(name));
+        const char* base = std::strrchr(name, '\\');
+        char text[MAX_PATH + 32];
+        std::snprintf(text, sizeof(text), "%s+0x%llx", base ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)));
+        return text;
+    }
+
+    // Called with the mutex held: the 2000 most frequent chains as "count frame;frame;..." lines.
+    void writeStacks() {
+        std::FILE* file = std::fopen((path + ".stacks").c_str(), "w");
+        if (file == nullptr) return;
+        std::vector<std::pair<std::uint64_t, const std::vector<std::uint64_t>*>> order;
+        order.reserve(stacks.size());
+        for (const auto& [frames, count] : stacks) order.emplace_back(count, &frames);
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::map<std::uint64_t, std::string> names;
+        std::fprintf(file, "# %llu samples, %zu distinct chains\n", static_cast<unsigned long long>(samples), stacks.size());
+        for (std::size_t i = 0; i < order.size() && i < 2000; ++i) {
+            std::fprintf(file, "%llu ", static_cast<unsigned long long>(order[i].first));
+            const auto& frames = *order[i].second;
+            for (std::size_t f = 0; f < frames.size(); ++f) {
+                auto [it, inserted] = names.try_emplace(frames[f]);
+                if (inserted) it->second = frameName(frames[f]);
+                std::fprintf(file, f == 0 ? "%s" : ";%s", it->second.c_str());
+            }
+            std::fprintf(file, "\n");
+        }
+        std::fclose(file);
     }
 
     void write() {
@@ -81,6 +119,7 @@ struct Sampler {
             std::fprintf(file, "%s 0x%llx %llu %llu\n", base ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)), static_cast<unsigned long long>(count.first), static_cast<unsigned long long>(count.second));
         }
         std::fclose(file);
+        if (chains) writeStacks();
     }
 };
 
@@ -172,6 +211,9 @@ void StartWorkerSampler() {
     if (path == nullptr) return;
     auto sampler = std::make_unique<Sampler>();
     sampler->path = path;
+    // Deep enough to reach the driver from inside the Vulkan driver's compiler and from host waits.
+    sampler->depth = 96;
+    sampler->chains = true;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
     workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
