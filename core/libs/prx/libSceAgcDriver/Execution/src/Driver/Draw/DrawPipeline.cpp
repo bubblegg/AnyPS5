@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 #include <algorithm>
 #include <immintrin.h>
 #include <cstdio>
@@ -138,6 +139,10 @@ void DrawPipeline::run() {
             failed = true;
             static std::atomic<std::uint64_t> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draw] pipelined commit failed: %.200s\n", error.what());
+        } catch (const ProcessShutdown&) {
+            // The process is exiting: the commit is dropped. Rethrown later, the shutdown would
+            // reach whichever thread drains or enqueues next, which may not expect it there.
+            failed = true;
         } catch (...) {
             fatal = std::current_exception();
         }
