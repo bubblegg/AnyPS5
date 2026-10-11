@@ -1,8 +1,15 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -54,6 +61,102 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         mix(address - it->first);
     }
     return key;
+}
+
+namespace {
+
+// Profiling aid (APS5_PROFILE_DRAW): whether the draws of a frame repeat those of the frame before,
+// by the whole register key and by the key without the user data words (the "shape"), and which
+// user words differ between the n-th draws of the same shape in two frames. Read at each flip.
+struct KeyRepeats {
+    using UserWords = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    std::mutex mutex;
+    std::unordered_set<std::uint64_t> previousKeys, keys;
+    std::unordered_map<std::uint64_t, std::vector<UserWords>> previousShapes, shapes;
+    std::map<std::uint32_t, std::uint64_t> differingWords;
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> lastChange;
+    std::uint64_t draws = 0, keyRepeats = 0, shapeRepeats = 0, frames = 0, distinct = 0, sameShapeOtherKey = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+KeyRepeats& keyRepeats() {
+    static auto* repeats = new KeyRepeats();
+    return *repeats;
+}
+
+}
+
+void NoteDrawKeyRepeat(const QueueState& queue, std::uint64_t drawKey) {
+    std::uint64_t shape = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        shape ^= value;
+        shape *= 0x100000001b3ull;
+    };
+    KeyRepeats::UserWords users;
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+        const bool shader = range.bank == Graphics::RegisterBank::Shader;
+        const auto end = range.first + range.count;
+        for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
+            const auto offset = it->first;
+            const bool user = shader && ((offset >= 0x00cu && offset < 0x02cu) || (offset >= 0x08cu && offset < 0x0acu) || (offset >= 0x10cu && offset < 0x12cu));
+            if (user) {
+                users.emplace_back(offset, it->second);
+                continue;
+            }
+            mix((static_cast<std::uint64_t>(range.bank) << 32u) | offset);
+            mix(it->second);
+        }
+    }
+    auto& r = keyRepeats();
+    std::lock_guard lock(r.mutex);
+    ++r.draws;
+    if (r.previousKeys.contains(drawKey)) ++r.keyRepeats;
+    if (r.keys.insert(drawKey).second) ++r.distinct;
+    auto& occurrences = r.shapes[shape];
+    const auto index = occurrences.size();
+    if (const auto previous = r.previousShapes.find(shape); previous != r.previousShapes.end()) {
+        ++r.shapeRepeats;
+        if (!r.previousKeys.contains(drawKey) && index < previous->second.size()) {
+            ++r.sameShapeOtherKey;
+            const auto& before = previous->second[index];
+            for (const auto& [offset, value] : users) {
+                const auto old = std::find_if(before.begin(), before.end(), [&](const auto& word) { return word.first == offset; });
+                if (old != before.end() && old->second == value) continue;
+                ++r.differingWords[offset];
+                r.lastChange[offset] = {old != before.end() ? old->second : 0u, value};
+            }
+        }
+    }
+    occurrences.push_back(std::move(users));
+}
+
+void DrawKeysAtFlip() {
+    auto& r = keyRepeats();
+    std::lock_guard lock(r.mutex);
+    if (r.draws == 0) return;
+    ++r.frames;
+    r.previousKeys.swap(r.keys);
+    r.keys.clear();
+    r.previousShapes.swap(r.shapes);
+    r.shapes.clear();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - r.reported < std::chrono::seconds(10)) return;
+    r.reported = now;
+    const auto percent = [&](std::uint64_t part) { return 100.0 * static_cast<double>(part) / static_cast<double>(r.draws); };
+    std::fprintf(stderr, "[draw-key] %llu frames, %llu draws (%llu per frame, %llu distinct keys per frame): whole key seen the frame before %.1f%%, key without user words %.1f%%; same shape with another key %llu; user words that differed (shader register: draws, last old->new):",
+                 static_cast<unsigned long long>(r.frames), static_cast<unsigned long long>(r.draws), static_cast<unsigned long long>(r.draws / r.frames), static_cast<unsigned long long>(r.distinct / r.frames), percent(r.keyRepeats), percent(r.shapeRepeats), static_cast<unsigned long long>(r.sameShapeOtherKey));
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> order;
+    for (const auto& [offset, count] : r.differingWords) order.emplace_back(count, offset);
+    std::sort(order.rbegin(), order.rend());
+    for (std::size_t i = 0; i < order.size() && i < 12; ++i) {
+        const auto [old, value] = r.lastChange[order[i].second];
+        std::fprintf(stderr, " 0x%03x: %llu (%08x->%08x)", order[i].second, static_cast<unsigned long long>(order[i].first), old, value);
+    }
+    std::fprintf(stderr, "\n");
+    r.draws = r.keyRepeats = r.shapeRepeats = r.frames = r.distinct = r.sameShapeOtherKey = 0;
+    r.differingWords.clear();
+    r.lastChange.clear();
 }
 
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {

@@ -16,6 +16,8 @@
 #include <system_error>
 #include <thread>
 #include <vector>
+
+extern "C" char __ImageBase;
 #endif
 
 namespace AgcDriver {
@@ -49,6 +51,7 @@ struct Sampler {
         if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
         const bool captured = GetThreadContext(target, &context) != 0;
         std::vector<std::uint64_t> frames;
+        std::vector<std::uint64_t> stack;
         if (captured) {
             // Unwinding reads the target's stack while it is suspended; frames without unwind data
             // (JIT/guest code) end the walk.
@@ -61,16 +64,58 @@ struct Sampler {
                 DWORD64 establisher = 0;
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, entry, &context, &handler, &establisher, nullptr);
             }
+            // Most of this library has only DWARF unwind data, which ends the walk at its first
+            // frame. For call chains, the stack above that point is copied and scanned for return
+            // addresses into this library afterwards.
+            if (chains && context.Rsp != 0) stack = copyStack(context.Rsp);
         }
         ResumeThread(target);
+        if (!stack.empty()) scanReturnAddresses(stack, frames);
         std::lock_guard lock(mutex);
         ++samples;
         for (std::size_t i = 0; i < frames.size(); ++i) {
+            if (frames[i] == 0) break;
             auto& count = counts[frames[i]];
             if (i == 0) ++count.first;
             ++count.second;
         }
         if (chains && !frames.empty()) ++stacks[frames];
+    }
+
+    static std::vector<std::uint64_t> copyStack(std::uint64_t rsp) {
+        constexpr std::size_t MaxBytes = 32u << 10u;
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(rsp), &region, sizeof(region)) == 0 || region.State != MEM_COMMIT) return {};
+        const auto end = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+        const auto bytes = std::min<std::uint64_t>(end - rsp, MaxBytes) & ~std::uint64_t{7};
+        std::vector<std::uint64_t> words(bytes / 8);
+        SIZE_T read = 0;
+        if (words.empty() || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(rsp), words.data(), bytes, &read)) return {};
+        words.resize(read / 8);
+        return words;
+    }
+
+    // Appends 0 (a marker: the frames after it are guessed) and every stack word that points into
+    // this library's code just after a call instruction, nearest first.
+    static void scanReturnAddresses(const std::vector<std::uint64_t>& stack, std::vector<std::uint64_t>& frames) {
+        static const auto [begin, end] = [] {
+            const auto base = reinterpret_cast<std::uint64_t>(&__ImageBase);
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+            return std::pair<std::uint64_t, std::uint64_t>{base + nt->OptionalHeader.BaseOfCode, base + nt->OptionalHeader.BaseOfCode + nt->OptionalHeader.SizeOfCode};
+        }();
+        const auto calls = [](std::uint64_t address) {
+            const auto* p = reinterpret_cast<const unsigned char*>(address);
+            const auto indirect = [&](int at) { return p[-at] == 0xff && (p[-at + 1] & 0x38u) == 0x10u; };
+            return p[-5] == 0xe8 || indirect(2) || indirect(3) || indirect(6) || indirect(7);
+        };
+        frames.push_back(0);
+        std::size_t found = 0;
+        for (const auto word : stack) {
+            if (word < begin + 8 || word >= end || !calls(word)) continue;
+            frames.push_back(word);
+            if (++found >= 48) break;
+        }
     }
 
     static std::string frameName(std::uint64_t address) {
@@ -98,7 +143,7 @@ struct Sampler {
             const auto& frames = *order[i].second;
             for (std::size_t f = 0; f < frames.size(); ++f) {
                 auto [it, inserted] = names.try_emplace(frames[f]);
-                if (inserted) it->second = frameName(frames[f]);
+                if (inserted) it->second = frames[f] == 0 ? "~" : frameName(frames[f]);
                 std::fprintf(file, f == 0 ? "%s" : ";%s", it->second.c_str());
             }
             std::fprintf(file, "\n");
