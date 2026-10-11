@@ -316,6 +316,32 @@ bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
     return uncompressed;
 }
 
+// Whether the bytes at a key range still read as DCC keys. A title frees a target's metadata before
+// the driver has finished with the target; its allocator then keeps list pointers in the first bytes
+// of the block or hands it to something else, and keys stored there corrupt the title's heap. Every
+// key byte is one of six codes, so the head of the range and a sample of the rest are checked.
+bool LooksLikeKeys(std::uint64_t metaAddress, std::size_t count) {
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count)) return false;
+    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    const auto code = [](std::uint8_t key) { return key == 0x00 || key == 0x20 || key == 0x40 || key == 0x80 || key == 0xc0 || key == 0xff; };
+    const auto head = std::min<std::size_t>(count, 64);
+    for (std::size_t i = 0; i < head; ++i) {
+        if (!code(keys[i])) return false;
+    }
+    for (std::size_t i = head; i < count; i += 61) {
+        if (!code(keys[i])) return false;
+    }
+    return true;
+}
+
+bool KeysStillOwned(std::uint64_t metaAddress, std::size_t count) {
+    static const bool unchecked = std::getenv("APS5_UNCHECKED_DCC_STORES") != nullptr;
+    if (unchecked || LooksLikeKeys(metaAddress, count)) return true;
+    static std::atomic<unsigned> reports{0};
+    if (reports.fetch_add(1) < 12) std::fprintf(stderr, "[gpu] DCC metadata 0x%llx (0x%zx keys) no longer holds keys: the title reused the memory, so nothing is stored there\n", static_cast<unsigned long long>(metaAddress), count);
+    return false;
+}
+
 bool CpuKeysOnly() {
     static const bool cpuKeys = std::getenv("APS5_CPU_DCC_KEYS") != nullptr;
     return cpuKeys;
@@ -571,6 +597,7 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, 
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
     TraceGuestFill("driver marks DCC keys, caller", metaAddress, count, static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<std::uintptr_t>(TraceModuleBase())));
+    if (!KeysStillOwned(metaAddress, count)) return;
     // The bytes are trusted only when no recorded work writes them (lock-free, with or without
     // GuestMemory::GpuMutex); otherwise the store runs and waits through the flush hook. A pending
     // GPU store of the driver's own is no reason to skip: a title kernel recorded into the same
@@ -587,6 +614,7 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
     TraceGuestFill("driver marks DCC keys, caller", metaAddress, count, static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<std::uintptr_t>(TraceModuleBase())));
+    if (!KeysStillOwned(metaAddress, count)) return;
     auto* recorder = CpuKeysOnly() || !GuestMemory::GpuMutex().HeldByThisThread() ? nullptr : Recorder::Active();
     // The bytes are scanned only when no recorded work writes them: a pending clear kernel's keys are
     // not in memory yet, so the bytes could read as uncompressed while the kernel will store a clear
