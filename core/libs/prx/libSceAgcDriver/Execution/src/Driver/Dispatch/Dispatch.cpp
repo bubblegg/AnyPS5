@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -75,7 +76,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
-        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        // Depth clears of a plane are applied when it is next bound: draws still in the pipeline must
+        // bind it first, so a dispatch that clears HTILE empties the pipeline before noting the clear.
+        const auto htileClear = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads);
+        const bool htileFill = userData.size() >= 8 && userData[6] == 1 && Graphics::DepthHtileAt(userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u));
+        if (DrawPipeline::Active() && (htileClear != 0 || htileFill)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (htileClear != 0) Graphics::NoteHtileDepthClear(htileClear);
         Graphics::ReportHtileDispatch(address, userData, compute.numThreads);
         // The first buffer a compute shader is given, as its user data describes it (records times stride).
         if (userData.size() >= 4) Graphics::TraceGuestFill("title dispatch, first buffer", userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u), static_cast<std::size_t>((userData[1] >> 16u) & 0x3fffu) * userData[2], static_cast<std::uint32_t>(address >> 8u));
@@ -94,6 +100,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
+        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             return;
