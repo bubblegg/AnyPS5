@@ -4,71 +4,15 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
 
-// A walk's values by IrValue id: arrays a thread's evaluators take turns with, so a walk neither
-// hashes nor allocates once the arrays have grown (the hash table below cost the draw path's
-// preparing thread 4% in inserts alone, its growth included). A slot belongs to the current walk
-// when its stamp is the arrays' generation.
-struct DenseValues {
-    static constexpr std::uint32_t MaxId = 16384;
-    std::vector<const IrValue*> keys;
-    std::vector<std::uint64_t> values;
-    std::vector<std::uint32_t> stamps;
-    std::uint32_t generation = 0;
-};
-// The calling thread's spare arrays (or new ones) with a fresh generation, and their return.
-DenseValues* AcquireDenseValues();
-void ReleaseDenseValues(DenseValues* values) noexcept;
-
 class EvaluatedValues {
 public:
-    EvaluatedValues() : _dense(AcquireDenseValues()) {}
-    ~EvaluatedValues() { ReleaseDenseValues(_dense); }
-    EvaluatedValues(const EvaluatedValues&) = delete;
-    EvaluatedValues& operator=(const EvaluatedValues&) = delete;
-
     bool Find(const IrValue* key, std::uint64_t& value) const {
-        const auto id = key->Id();
-        if (id < _dense->stamps.size() && _dense->stamps[id] == _dense->generation) {
-            if (_dense->keys[id] == key) {
-                value = _dense->values[id];
-                return true;
-            }
-            return FindSpilled(key, value);
-        }
-        return id >= DenseValues::MaxId && FindSpilled(key, value);
-    }
-    void Insert(const IrValue* key, std::uint64_t value) {
-        const auto id = key->Id();
-        if (id < DenseValues::MaxId) {
-            if (id >= _dense->stamps.size()) {
-                const auto size = std::min<std::size_t>(DenseValues::MaxId, std::max<std::size_t>({std::size_t{256}, _dense->stamps.size() * 2u, std::size_t{id} + 1u}));
-                _dense->keys.resize(size);
-                _dense->values.resize(size);
-                _dense->stamps.resize(size);
-            }
-            if (_dense->stamps[id] != _dense->generation) {
-                _dense->stamps[id] = _dense->generation;
-                _dense->keys[id] = key;
-                _dense->values[id] = value;
-                return;
-            }
-            if (_dense->keys[id] == key) {
-                return;
-            }
-        }
-        InsertSpilled(key, value);
-    }
-
-private:
-    // Values whose id is beyond the arrays or already taken by another value of the walk.
-    bool FindSpilled(const IrValue* key, std::uint64_t& value) const {
         if (_slots.empty()) {
             return false;
         }
@@ -83,7 +27,7 @@ private:
             }
         }
     }
-    void InsertSpilled(const IrValue* key, std::uint64_t value) {
+    void Insert(const IrValue* key, std::uint64_t value) {
         if ((_count + 1u) * 2u > _slots.size()) {
             Grow();
         }
@@ -99,6 +43,8 @@ private:
             }
         }
     }
+
+private:
     struct Slot {
         const IrValue* key = nullptr;
         std::uint64_t value = 0;
@@ -112,11 +58,10 @@ private:
         _count = 0;
         for (const auto& slot : previous) {
             if (slot.key != nullptr) {
-                InsertSpilled(slot.key, slot.value);
+                Insert(slot.key, slot.value);
             }
         }
     }
-    DenseValues* _dense;
     std::vector<Slot> _slots;
     std::size_t _count = 0;
 };
