@@ -17,34 +17,36 @@ namespace ShaderRecompiler::Detail {
 
 namespace {
 
-std::vector<std::unique_ptr<DenseValues>>& spareDenseValues() {
-    thread_local std::vector<std::unique_ptr<DenseValues>> spare;
+std::vector<std::unique_ptr<ValueTable>>& spareValueTables() {
+    thread_local std::vector<std::unique_ptr<ValueTable>> spare;
     return spare;
 }
 
 }
 
-DenseValues* AcquireDenseValues() {
-    auto& spare = spareDenseValues();
-    DenseValues* values = nullptr;
+ValueTable* AcquireValueTable() {
+    auto& spare = spareValueTables();
+    ValueTable* table = nullptr;
     if (spare.empty()) {
-        values = new DenseValues();
+        table = new ValueTable();
     } else {
-        values = spare.back().release();
+        table = spare.back().release();
         spare.pop_back();
     }
-    if (++values->generation == 0) {
-        std::fill(values->stamps.begin(), values->stamps.end(), 0u);
-        values->generation = 1;
-    }
-    return values;
+    table->capacity = 64;
+    while (table->capacity < 2u * (table->lastCount + 1u)) table->capacity *= 2u;
+    if (table->slots.size() < table->capacity) table->slots.resize(table->capacity);
+    table->count = 0;
+    table->NextGeneration();
+    return table;
 }
 
-void ReleaseDenseValues(DenseValues* values) noexcept {
+void ReleaseValueTable(ValueTable* table) noexcept {
+    table->lastCount = table->count;
     try {
-        spareDenseValues().emplace_back(values);
+        spareValueTables().emplace_back(table);
     } catch (...) {
-        delete values;
+        delete table;
     }
 }
 
