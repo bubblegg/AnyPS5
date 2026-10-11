@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -141,6 +142,12 @@ public:
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
         view.armed = false;
+        if (quietPages) {
+            auto& page = *view.page;
+            const auto now = GetTickCount64();
+            page.quietMs = page.quietMs != 0 && now < page.quietUntil + 2000 ? std::min<std::uint32_t>(page.quietMs * 2, 60000) : 500;
+            page.quietUntil = now + page.quietMs;
+        }
         return true;
     }
 
@@ -246,6 +253,10 @@ public:
                     }
                     for (auto at = cursor; at < stop; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
                 }
+                if (clear && !pinned && quietPages && GetTickCount64() < view.page->quietUntil) {
+                    cursor = stop;
+                    continue;
+                }
                 if (clear && !pinned) {
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
@@ -276,6 +287,9 @@ public:
     }
 
 private:
+    // APS5_REARM_WRITTEN_PAGES=1 protects a written page again at once, as before.
+    const bool quietPages = std::getenv("APS5_REARM_WRITTEN_PAGES") == nullptr;
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
@@ -296,6 +310,11 @@ private:
         std::uint64_t generation = 1;
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
+        // A page the guest keeps writing is left writable and reported as written until quietUntil
+        // (GetTickCount64): every fault it would take is dispatched on the writing thread's stack,
+        // over the 128 bytes guest code keeps live below its stack pointer.
+        std::uint64_t quietUntil = 0;
+        std::uint32_t quietMs = 0;
     };
     struct Section {
         HANDLE handle;
