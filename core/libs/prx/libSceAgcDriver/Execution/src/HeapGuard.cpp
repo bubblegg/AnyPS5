@@ -170,80 +170,131 @@ void noteAllocation(std::size_t size, std::uint64_t cycles) {
 
 // A per-thread cache of small freed blocks. The draw path makes hundreds of small allocations per
 // draw (millions a second), and malloc plus free cost it about a quarter of its time. Every block in
-// the cache is a whole malloc block of at least its class size (its size is read with _msize when it
-// is cached), so a block handed out from the cache may still be freed by anyone with free(), as the
-// C++ runtime library does with some blocks this library allocates. Off under APS5_GUARD_NEW and
-// with APS5_NO_ALLOC_CACHE.
+// the cache is a whole malloc block that holds its class size, so a block handed out from the cache
+// may still be freed by anyone with free(), as the C++ runtime library does with some blocks this
+// library allocates. Off under APS5_GUARD_NEW and with APS5_NO_ALLOC_CACHE.
 //
 // With pipelined draws one thread allocates what another frees, so a thread's own cache would stay
 // empty on one side and full on the other. Each class therefore keeps two magazines of blocks per
 // thread; a thread with two full ones hands one to a depot shared by all threads, and a thread
 // with two empty ones takes a full one from it.
+//
+// A magazine is an array of block addresses, not a list threaded through the blocks: a block that
+// comes back from another thread is cold in this thread's cache, and following a link inside it
+// stalled the taker on every allocation (8% of the preparing thread). The next block to be handed
+// out is prefetched instead.
+//
+// The class of a freed block is the largest it fully holds. Its size comes from _msize, which reads
+// the heap's header of the block (another cold line, 9% of the preparing thread), or, with
+// APS5_SIZED_DELETE=1, from the size a sized delete names: the block holds at least that. The
+// second is not the default until APS5_VERIFY_SIZED_DELETE=1 has shown that no delete in this
+// library names more than its block holds (it compares the two and reports to stderr).
 struct Magazine {
-    void* head;
+    static constexpr std::uint32_t Blocks = 62;
+    Magazine* next;
     std::uint32_t count;
+    void* blocks[Blocks];
 };
 
 struct SmallCache {
-    static constexpr std::size_t Classes = 32;
-    static constexpr std::size_t Granule = 16;
-    static constexpr std::uint32_t MagazineBlocks = 64;
+    static constexpr std::size_t Classes = 64;
+    static constexpr std::size_t Granule = 8;
+    static constexpr std::size_t MaxBytes = Classes * Granule;
     static constexpr std::uint32_t DepotMagazines = 64;
-    Magazine current[Classes];
-    Magazine spare[Classes];
+    static constexpr std::uint32_t EmptyMagazines = 1024;
+    Magazine* current[Classes];
+    Magazine* spare[Classes];
 };
 
-// A magazine in the depot is its first block: word 0 links the magazine's blocks, word 1 the next
-// magazine (the smallest class holds two words).
 struct Depot {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
-    void* magazines = nullptr;
+    Magazine* full = nullptr;
     std::uint32_t count = 0;
 };
 
 Depot depots[SmallCache::Classes];
+// Empty magazines, of any class.
+Depot emptyMagazines;
 
-void freeBlocks(void* head) {
-    while (head != nullptr) {
-        void* block = head;
-        std::memcpy(&head, block, sizeof(void*));
-        std::free(block);
-    }
+void lockDepot(Depot& depot) {
+    while (depot.lock.test_and_set(std::memory_order_acquire)) _mm_pause();
 }
 
-// Takes a full magazine's blocks; they are freed when the depot holds enough of the class.
-void depotPut(std::size_t c, void* head) {
+Magazine* takeEmptyMagazine() {
+    Magazine* magazine = nullptr;
+    if (emptyMagazines.count != 0) {
+        lockDepot(emptyMagazines);
+        magazine = emptyMagazines.full;
+        if (magazine != nullptr) {
+            emptyMagazines.full = magazine->next;
+            --emptyMagazines.count;
+        }
+        emptyMagazines.lock.clear(std::memory_order_release);
+    }
+    if (magazine == nullptr) magazine = static_cast<Magazine*>(std::malloc(sizeof(Magazine)));
+    if (magazine != nullptr) {
+        magazine->next = nullptr;
+        magazine->count = 0;
+    }
+    return magazine;
+}
+
+void putEmptyMagazine(Magazine* magazine) {
+    lockDepot(emptyMagazines);
+    const bool kept = emptyMagazines.count < SmallCache::EmptyMagazines;
+    if (kept) {
+        magazine->next = emptyMagazines.full;
+        emptyMagazines.full = magazine;
+        ++emptyMagazines.count;
+    }
+    emptyMagazines.lock.clear(std::memory_order_release);
+    if (!kept) std::free(magazine);
+}
+
+void freeBlocks(Magazine* magazine) {
+    for (std::uint32_t i = 0; i < magazine->count; ++i) std::free(magazine->blocks[i]);
+    magazine->count = 0;
+}
+
+// Takes a full magazine; its blocks are freed when the depot holds enough of the class.
+void depotPut(std::size_t c, Magazine* magazine) {
     auto& depot = depots[c];
-    while (depot.lock.test_and_set(std::memory_order_acquire)) _mm_pause();
+    lockDepot(depot);
     const bool kept = depot.count < SmallCache::DepotMagazines;
     if (kept) {
-        std::memcpy(static_cast<unsigned char*>(head) + sizeof(void*), &depot.magazines, sizeof(void*));
-        depot.magazines = head;
+        magazine->next = depot.full;
+        depot.full = magazine;
         ++depot.count;
     }
     depot.lock.clear(std::memory_order_release);
-    if (!kept) freeBlocks(head);
+    if (!kept) {
+        freeBlocks(magazine);
+        putEmptyMagazine(magazine);
+    }
 }
 
-void* depotTake(std::size_t c) {
+Magazine* depotTake(std::size_t c) {
     auto& depot = depots[c];
     if (depot.count == 0) return nullptr;
-    while (depot.lock.test_and_set(std::memory_order_acquire)) _mm_pause();
-    void* head = depot.magazines;
-    if (head != nullptr) {
-        std::memcpy(&depot.magazines, static_cast<unsigned char*>(head) + sizeof(void*), sizeof(void*));
+    lockDepot(depot);
+    Magazine* magazine = depot.full;
+    if (magazine != nullptr) {
+        depot.full = magazine->next;
         --depot.count;
     }
     depot.lock.clear(std::memory_order_release);
-    return head;
+    return magazine;
 }
 
 void WINAPI flushSmallCache(void* data) {
     auto* cache = static_cast<SmallCache*>(data);
     if (cache == nullptr) return;
     for (std::size_t c = 0; c < SmallCache::Classes; ++c) {
-        freeBlocks(cache->current[c].head);
-        freeBlocks(cache->spare[c].head);
+        for (Magazine* magazine : {cache->current[c], cache->spare[c]}) {
+            if (magazine == nullptr) continue;
+            freeBlocks(magazine);
+            std::free(magazine);
+        }
     }
     std::free(cache);
 }
@@ -273,45 +324,91 @@ SmallCache* smallCache(bool create) {
 }
 
 void* takeCached(std::size_t size) {
-    if (size > SmallCache::Classes * SmallCache::Granule) return nullptr;
+    if (size > SmallCache::MaxBytes) return nullptr;
     auto* cache = smallCache(false);
     if (cache == nullptr) return nullptr;
     const std::size_t c = (size != 0 ? size - 1 : 0) / SmallCache::Granule;
-    auto& current = cache->current[c];
-    if (current.head == nullptr) {
-        if (cache->spare[c].head != nullptr) {
-            std::swap(current, cache->spare[c]);
+    Magazine* magazine = cache->current[c];
+    if (magazine == nullptr || magazine->count == 0) {
+        if (Magazine* spare = cache->spare[c]; spare != nullptr && spare->count != 0) {
+            cache->spare[c] = magazine;
+            cache->current[c] = magazine = spare;
         } else {
-            current.head = depotTake(c);
-            if (current.head == nullptr) return nullptr;
-            current.count = SmallCache::MagazineBlocks;
+            Magazine* full = depotTake(c);
+            if (full == nullptr) return nullptr;
+            if (magazine != nullptr) putEmptyMagazine(magazine);
+            cache->current[c] = magazine = full;
         }
     }
-    void* block = current.head;
-    std::memcpy(&current.head, block, sizeof(void*));
-    --current.count;
+    void* block = magazine->blocks[--magazine->count];
+    if (magazine->count != 0) __builtin_prefetch(magazine->blocks[magazine->count - 1], 1);
     return block;
 }
 
-// Keeps a freed block in the cache of the class it fully holds; false if it does not fit there.
-bool keepCached(void* block) {
-    const std::size_t capacity = _msize(block);
-    if (capacity < SmallCache::Granule || capacity > SmallCache::Classes * SmallCache::Granule) return false;
+bool sizedDelete() {
+    static const bool enabled = std::getenv("APS5_SIZED_DELETE") != nullptr && std::getenv("APS5_VERIFY_SIZED_DELETE") == nullptr;
+    return enabled;
+}
+
+// APS5_VERIFY_SIZED_DELETE=1: every sized delete's size against its block's, and what classing by
+// the delete's size would do, every 2^22 deletes.
+struct SizedDeleteCheck {
+    std::atomic<std::uint64_t> sized{0}, unsized{0}, violations{0}, exact{0}, lower{0}, uncached{0};
+};
+
+bool verifySizedDelete() {
+    static const bool enabled = std::getenv("APS5_VERIFY_SIZED_DELETE") != nullptr;
+    return enabled;
+}
+
+void checkSizedDelete(void* block, std::size_t capacity, std::size_t deleting, void* site) {
+    static auto* check = new (std::calloc(1, sizeof(SizedDeleteCheck))) SizedDeleteCheck();
+    if (deleting == static_cast<std::size_t>(-1)) {
+        check->unsized.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const auto count = check->sized.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (deleting > capacity) {
+            if (check->violations.fetch_add(1, std::memory_order_relaxed) < 40) std::fprintf(stderr, "[alloc] sized delete names more than its block holds: %llu bytes deleted at libSceAgcDriver.prx+0x%llx, the block %p holds %llu\n", static_cast<unsigned long long>(deleting), offsetOf(site), block, static_cast<unsigned long long>(capacity));
+        } else if (deleting < SmallCache::Granule || deleting > SmallCache::MaxBytes) {
+            if (capacity >= SmallCache::Granule && capacity <= SmallCache::MaxBytes) check->uncached.fetch_add(1, std::memory_order_relaxed);
+        } else if (deleting / SmallCache::Granule == capacity / SmallCache::Granule) {
+            check->exact.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            check->lower.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((count & ((std::uint64_t{1} << 22u) - 1u)) == 0) std::fprintf(stderr, "[alloc] sized deletes so far: %llu sized, %llu unsized; %llu named more than the block holds; of the sized, by the class the delete's size gives: %llu the block's own, %llu a smaller one, %llu none where the block has one\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(check->unsized.load()), static_cast<unsigned long long>(check->violations.load()), static_cast<unsigned long long>(check->exact.load()), static_cast<unsigned long long>(check->lower.load()), static_cast<unsigned long long>(check->uncached.load()));
+    }
+}
+
+// Keeps a freed block in the cache of the class it fully holds; false if it has none or the cache
+// has no room. `deleting` is the size a sized delete named, or -1.
+bool keepCached(void* block, std::size_t deleting, void* site) {
+    std::size_t capacity = 0;
+    if (deleting != static_cast<std::size_t>(-1) && sizedDelete()) {
+        capacity = deleting;
+    } else {
+        capacity = _msize(block);
+        if (verifySizedDelete()) checkSizedDelete(block, capacity, deleting, site);
+    }
+    if (capacity < SmallCache::Granule || capacity > SmallCache::MaxBytes) return false;
     const std::size_t c = capacity / SmallCache::Granule - 1;
     auto* cache = smallCache(true);
     if (cache == nullptr) return false;
-    auto& current = cache->current[c];
-    if (current.count >= SmallCache::MagazineBlocks) {
-        auto& spare = cache->spare[c];
-        if (spare.count >= SmallCache::MagazineBlocks) {
-            depotPut(c, spare.head);
-            spare = {};
+    Magazine* magazine = cache->current[c];
+    if (magazine == nullptr || magazine->count == Magazine::Blocks) {
+        Magazine* spare = cache->spare[c];
+        if (spare != nullptr && spare->count == 0) {
+            cache->spare[c] = magazine;
+            cache->current[c] = magazine = spare;
+        } else {
+            Magazine* empty = takeEmptyMagazine();
+            if (empty == nullptr) return false;
+            if (spare != nullptr) depotPut(c, spare);
+            cache->spare[c] = magazine;
+            cache->current[c] = magazine = empty;
         }
-        std::swap(current, spare);
     }
-    std::memcpy(block, &current.head, sizeof(void*));
-    current.head = block;
-    ++current.count;
+    magazine->blocks[magazine->count++] = block;
     return true;
 }
 
@@ -324,7 +421,7 @@ void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
             return cached;
         }
         // A miss allocates the whole class, so the block is reused for any size of its class.
-        if (size <= SmallCache::Classes * SmallCache::Granule) size = std::max<std::size_t>((size + SmallCache::Granule - 1) / SmallCache::Granule * SmallCache::Granule, SmallCache::Granule);
+        if (size <= SmallCache::MaxBytes) size = std::max<std::size_t>((size + SmallCache::Granule - 1) / SmallCache::Granule * SmallCache::Granule, SmallCache::Granule);
     }
     auto* block = static_cast<unsigned char*>(std::malloc(guard ? size + TailBytes : size != 0 ? size : 1));
     if (allocProfiled()) noteAllocation(size, __rdtsc() - started);
@@ -344,7 +441,7 @@ void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
 void guardedFree(void* pointer, void* site, std::size_t deleting) noexcept {
     if (pointer == nullptr) return;
     if (!guardEnabled()) {
-        if (smallCacheEnabled() && keepCached(pointer)) return;
+        if (smallCacheEnabled() && keepCached(pointer, deleting, site)) return;
         std::free(pointer);
         return;
     }
