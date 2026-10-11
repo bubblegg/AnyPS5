@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include <x86intrin.h>
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -121,10 +122,16 @@ void DrawPipeline::helperLoop() {
     }
 }
 
+std::atomic<std::uint64_t>& DrawPipeline::FullWaitCycles() {
+    static std::atomic<std::uint64_t> cycles{0};
+    return cycles;
+}
+
 void DrawPipeline::push(Item item, std::unique_lock<std::mutex>& lock) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     rethrowFailure();
     if (items.size() >= Depth()) {
+        const auto waitStart = __rdtsc();
         const auto start = std::chrono::steady_clock::now();
         // The committer makes room within one commit, tens of microseconds: the full queue is
         // polled for up to APS5_PIPELINE_FULL_SPIN_US (default 200) before this thread sleeps, as
@@ -143,6 +150,7 @@ void DrawPipeline::push(Item item, std::unique_lock<std::mutex>& lock) {
         idle.wait(lock, [&] { return items.size() < Depth(); });
         --idleWaiters;
         fullWaitNs += elapsedNs(start);
+        FullWaitCycles().fetch_add(__rdtsc() - waitStart, std::memory_order_relaxed);
         rethrowFailure();
     }
     depthSum += items.size();

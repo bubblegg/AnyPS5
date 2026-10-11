@@ -26,6 +26,9 @@ public:
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
 
     static DrawPipeline& Queue0();
+    // Processor cycles the enqueuing thread spent waiting for room in a full queue, for the
+    // [perf] line (Driver::draw): they are not part of what a draw costs to prepare.
+    static std::atomic<std::uint64_t>& FullWaitCycles();
     static std::size_t Depth();
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();

@@ -1,4 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <x86intrin.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -39,7 +43,72 @@ struct DrawTail {
     std::shared_ptr<DrawPipeline::PendingDraw> pending;
 };
 
+namespace {
+
+// What a draw costs each of the two threads of the pipelined path, printed every 10 s as a
+// [perf] line whatever the profiling switches say: a frame rate read off the screen moves by a
+// tenth from run to run, and these averages over a hundred thousand draws do not. Two timestamp
+// reads per draw and thread; each thread writes its own line of counters.
+struct DrawPerf {
+    struct alignas(64) Side {
+        std::atomic<std::uint64_t> cycles{0};
+        std::atomic<std::uint64_t> draws{0};
+    };
+    Side prepared;
+    Side committed;
+    alignas(64) std::uint64_t lastTsc = 0;
+    long long lastQpc = 0;
+    std::uint64_t lastPresents = 0;
+    std::uint64_t lastWaited = 0;
+    std::uint32_t untilCheck = 0;
+};
+
+DrawPerf& drawPerf() {
+    static DrawPerf perf;
+    return perf;
+}
+
+struct PreparedScope {
+    std::uint64_t start = __rdtsc();
+    std::uint64_t waitedBefore = DrawPipeline::FullWaitCycles().load(std::memory_order_relaxed);
+    ~PreparedScope() {
+        auto& perf = drawPerf();
+        const auto now = __rdtsc();
+        const auto waited = DrawPipeline::FullWaitCycles().load(std::memory_order_relaxed) - waitedBefore;
+        perf.prepared.cycles.fetch_add(now - start - std::min(waited, now - start), std::memory_order_relaxed);
+        perf.prepared.draws.fetch_add(1, std::memory_order_relaxed);
+        if (++perf.untilCheck < 4096) return;
+        perf.untilCheck = 0;
+        LARGE_INTEGER qpc{}, frequency{};
+        QueryPerformanceCounter(&qpc);
+        QueryPerformanceFrequency(&frequency);
+        if (perf.lastQpc == 0) {
+            perf.lastQpc = qpc.QuadPart;
+            perf.lastTsc = now;
+            return;
+        }
+        const double seconds = static_cast<double>(qpc.QuadPart - perf.lastQpc) / static_cast<double>(frequency.QuadPart);
+        if (seconds < 10.0) return;
+        const double cyclesPerUs = static_cast<double>(now - perf.lastTsc) / (seconds * 1e6);
+        const auto preparedDraws = perf.prepared.draws.exchange(0, std::memory_order_relaxed);
+        const auto preparedCycles = perf.prepared.cycles.exchange(0, std::memory_order_relaxed);
+        const auto committedDraws = perf.committed.draws.exchange(0, std::memory_order_relaxed);
+        const auto committedCycles = perf.committed.cycles.exchange(0, std::memory_order_relaxed);
+        const auto waitedNow = DrawPipeline::FullWaitCycles().load(std::memory_order_relaxed);
+        const auto presents = VulkanDevice::PresentCounts().presents;
+        const auto shown = presents - perf.lastPresents;
+        std::fprintf(stderr, "[perf] %.1f s: %llu draws prepared in %.1f us each (and %.1f us each waiting for room in the queue), %llu committed in %.1f us each; %llu presents (%.1f a second, %.0f draws each)\n", seconds, static_cast<unsigned long long>(preparedDraws), preparedDraws != 0 ? static_cast<double>(preparedCycles) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, preparedDraws != 0 ? static_cast<double>(waitedNow - perf.lastWaited) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, static_cast<unsigned long long>(committedDraws), committedDraws != 0 ? static_cast<double>(committedCycles) / cyclesPerUs / static_cast<double>(committedDraws) : 0.0, static_cast<unsigned long long>(shown), static_cast<double>(shown) / seconds, shown != 0 ? static_cast<double>(preparedDraws) / static_cast<double>(shown) : 0.0);
+        perf.lastQpc = qpc.QuadPart;
+        perf.lastTsc = now;
+        perf.lastPresents = presents;
+        perf.lastWaited = waitedNow;
+    }
+};
+
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+    const PreparedScope prepared;
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
@@ -522,7 +591,10 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry)] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+            const auto commitStart = __rdtsc();
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+            drawPerf().committed.cycles.fetch_add(__rdtsc() - commitStart, std::memory_order_relaxed);
+            drawPerf().committed.draws.fetch_add(1, std::memory_order_relaxed);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         if (t.helper) {
