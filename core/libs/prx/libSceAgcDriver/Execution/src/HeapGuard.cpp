@@ -19,6 +19,7 @@
 #include <cstring>
 #include <malloc.h>
 #include <new>
+#include <utility>
 #include <windows.h>
 #include <x86intrin.h>
 
@@ -173,23 +174,76 @@ void noteAllocation(std::size_t size, std::uint64_t cycles) {
 // is cached), so a block handed out from the cache may still be freed by anyone with free(), as the
 // C++ runtime library does with some blocks this library allocates. Off under APS5_GUARD_NEW and
 // with APS5_NO_ALLOC_CACHE.
+//
+// With pipelined draws one thread allocates what another frees, so a thread's own cache would stay
+// empty on one side and full on the other. Each class therefore keeps two magazines of blocks per
+// thread; a thread with two full ones hands one to a depot shared by all threads, and a thread
+// with two empty ones takes a full one from it.
+struct Magazine {
+    void* head;
+    std::uint32_t count;
+};
+
 struct SmallCache {
     static constexpr std::size_t Classes = 32;
     static constexpr std::size_t Granule = 16;
-    static constexpr std::uint32_t Depth = 256;
-    void* heads[Classes];
-    std::uint32_t counts[Classes];
+    static constexpr std::uint32_t MagazineBlocks = 64;
+    static constexpr std::uint32_t DepotMagazines = 64;
+    Magazine current[Classes];
+    Magazine spare[Classes];
 };
+
+// A magazine in the depot is its first block: word 0 links the magazine's blocks, word 1 the next
+// magazine (the smallest class holds two words).
+struct Depot {
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
+    void* magazines = nullptr;
+    std::uint32_t count = 0;
+};
+
+Depot depots[SmallCache::Classes];
+
+void freeBlocks(void* head) {
+    while (head != nullptr) {
+        void* block = head;
+        std::memcpy(&head, block, sizeof(void*));
+        std::free(block);
+    }
+}
+
+// Takes a full magazine's blocks; they are freed when the depot holds enough of the class.
+void depotPut(std::size_t c, void* head) {
+    auto& depot = depots[c];
+    while (depot.lock.test_and_set(std::memory_order_acquire)) _mm_pause();
+    const bool kept = depot.count < SmallCache::DepotMagazines;
+    if (kept) {
+        std::memcpy(static_cast<unsigned char*>(head) + sizeof(void*), &depot.magazines, sizeof(void*));
+        depot.magazines = head;
+        ++depot.count;
+    }
+    depot.lock.clear(std::memory_order_release);
+    if (!kept) freeBlocks(head);
+}
+
+void* depotTake(std::size_t c) {
+    auto& depot = depots[c];
+    if (depot.count == 0) return nullptr;
+    while (depot.lock.test_and_set(std::memory_order_acquire)) _mm_pause();
+    void* head = depot.magazines;
+    if (head != nullptr) {
+        std::memcpy(&depot.magazines, static_cast<unsigned char*>(head) + sizeof(void*), sizeof(void*));
+        --depot.count;
+    }
+    depot.lock.clear(std::memory_order_release);
+    return head;
+}
 
 void WINAPI flushSmallCache(void* data) {
     auto* cache = static_cast<SmallCache*>(data);
     if (cache == nullptr) return;
     for (std::size_t c = 0; c < SmallCache::Classes; ++c) {
-        while (cache->heads[c] != nullptr) {
-            void* block = cache->heads[c];
-            std::memcpy(&cache->heads[c], block, sizeof(void*));
-            std::free(block);
-        }
+        freeBlocks(cache->current[c].head);
+        freeBlocks(cache->spare[c].head);
     }
     std::free(cache);
 }
@@ -221,11 +275,21 @@ SmallCache* smallCache(bool create) {
 void* takeCached(std::size_t size) {
     if (size > SmallCache::Classes * SmallCache::Granule) return nullptr;
     auto* cache = smallCache(false);
+    if (cache == nullptr) return nullptr;
     const std::size_t c = (size != 0 ? size - 1 : 0) / SmallCache::Granule;
-    if (cache == nullptr || cache->heads[c] == nullptr) return nullptr;
-    void* block = cache->heads[c];
-    std::memcpy(&cache->heads[c], block, sizeof(void*));
-    --cache->counts[c];
+    auto& current = cache->current[c];
+    if (current.head == nullptr) {
+        if (cache->spare[c].head != nullptr) {
+            std::swap(current, cache->spare[c]);
+        } else {
+            current.head = depotTake(c);
+            if (current.head == nullptr) return nullptr;
+            current.count = SmallCache::MagazineBlocks;
+        }
+    }
+    void* block = current.head;
+    std::memcpy(&current.head, block, sizeof(void*));
+    --current.count;
     return block;
 }
 
@@ -235,10 +299,19 @@ bool keepCached(void* block) {
     if (capacity < SmallCache::Granule || capacity > SmallCache::Classes * SmallCache::Granule) return false;
     const std::size_t c = capacity / SmallCache::Granule - 1;
     auto* cache = smallCache(true);
-    if (cache == nullptr || cache->counts[c] >= SmallCache::Depth) return false;
-    std::memcpy(block, &cache->heads[c], sizeof(void*));
-    cache->heads[c] = block;
-    ++cache->counts[c];
+    if (cache == nullptr) return false;
+    auto& current = cache->current[c];
+    if (current.count >= SmallCache::MagazineBlocks) {
+        auto& spare = cache->spare[c];
+        if (spare.count >= SmallCache::MagazineBlocks) {
+            depotPut(c, spare.head);
+            spare = {};
+        }
+        std::swap(current, spare);
+    }
+    std::memcpy(block, &current.head, sizeof(void*));
+    current.head = block;
+    ++current.count;
     return true;
 }
 

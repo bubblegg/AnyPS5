@@ -576,8 +576,11 @@ struct SpecializedModuleEntry {
     std::shared_ptr<const SpecializedModule> module;
 };
 
+// `done` is set once `ready` has run: every result of a draw comes through these entries, and a
+// call_once costs a pthread_once and two emulated thread_local stores even after it has run.
 struct PreparedModuleEntry {
     std::once_flag ready;
+    std::atomic<bool> done{false};
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
     DescriptorBindingPlan bindings;
@@ -585,6 +588,7 @@ struct PreparedModuleEntry {
 
 struct PreparedBindingPlan {
     std::once_flag ready;
+    std::atomic<bool> done{false};
     std::exception_ptr failure;
     DescriptorBindingPlan bindings;
     std::shared_mutex mutex;
@@ -630,13 +634,16 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
         const auto found = plans.find(key);
         plan = found != plans.end() ? found->second : plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
     }
-    std::call_once(plan->ready, [&] {
-        try {
-            plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports);
-        } catch (...) {
-            plan->failure = std::current_exception();
-        }
-    });
+    if (!plan->done.load(std::memory_order_acquire)) {
+        std::call_once(plan->ready, [&] {
+            try {
+                plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports);
+            } catch (...) {
+                plan->failure = std::current_exception();
+            }
+        });
+        plan->done.store(true, std::memory_order_release);
+    }
     if (plan->failure) std::rethrow_exception(plan->failure);
     return plan;
 }
@@ -771,13 +778,16 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             entry->bindings = std::move(selected);
             entry->module = module;
         };
-        std::call_once(entry->ready, [&] {
-            try {
-                prepare();
-            } catch (...) {
-                entry->failure = std::current_exception();
-            }
-        });
+        if (!entry->done.load(std::memory_order_acquire)) {
+            std::call_once(entry->ready, [&] {
+                try {
+                    prepare();
+                } catch (...) {
+                    entry->failure = std::current_exception();
+                }
+            });
+            entry->done.store(true, std::memory_order_release);
+        }
         if (entry->failure) std::rethrow_exception(entry->failure);
         const auto& module = entry->module;
         result.specializationId = module->specializationId;

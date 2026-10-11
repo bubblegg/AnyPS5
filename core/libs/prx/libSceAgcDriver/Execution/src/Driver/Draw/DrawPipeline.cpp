@@ -126,6 +126,19 @@ void DrawPipeline::push(Item item, std::unique_lock<std::mutex>& lock) {
     rethrowFailure();
     if (items.size() >= Depth()) {
         const auto start = std::chrono::steady_clock::now();
+        // The committer makes room within one commit, tens of microseconds: the full queue is
+        // polled for up to APS5_PIPELINE_FULL_SPIN_US (default 200) before this thread sleeps, as
+        // the committer polls an empty one. Sleeping and waking cost more than the wait itself.
+        static const auto fullSpin = std::chrono::microseconds([] {
+            const char* text = std::getenv("APS5_PIPELINE_FULL_SPIN_US");
+            return text != nullptr ? std::strtoll(text, nullptr, 10) : 200ll;
+        }());
+        if (fullSpin.count() > 0) {
+            lock.unlock();
+            const auto until = start + fullSpin;
+            while (outstanding.load(std::memory_order_acquire) >= Depth() && std::chrono::steady_clock::now() < until) _mm_pause();
+            lock.lock();
+        }
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() < Depth(); });
         --idleWaiters;
