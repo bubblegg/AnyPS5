@@ -172,7 +172,7 @@ function(add_shader_recompiler target runtimeTarget)
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/*.cmake"
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CMakeLists.txt"
     )
-    set(shaderCacheKeySources "${PROJECT_SOURCE_DIR}/core/libs/prx/libc/include/HostThreadLocal.hpp")
+    set(shaderCacheKeySources "${PROJECT_SOURCE_DIR}/core/libs/prx/libc/include/HostThreadLocal.hpp" "${PROJECT_SOURCE_DIR}/core/libs/prx/libc/include/HostMutex.hpp")
     foreach(source IN LISTS shaderCacheKeySources)
         if(NOT EXISTS "${source}")
             message(FATAL_ERROR "Shader disk cache key source does not exist: ${source}")

@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -270,7 +271,7 @@ struct EmissionFailure {
 };
 
 struct SourceEntry {
-    std::mutex mutex;
+    HostMutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
@@ -318,7 +319,7 @@ bool FailureMemo() {
 }
 
 std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) {
-    static std::shared_mutex mutex;
+    static HostMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
     static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
     struct SourceKeyStorage {};
@@ -591,7 +592,7 @@ struct PreparedBindingPlan {
     std::atomic<bool> done{false};
     std::exception_ptr failure;
     DescriptorBindingPlan bindings;
-    std::shared_mutex mutex;
+    HostMutex mutex;
     std::map<std::vector<std::uint32_t>, std::shared_ptr<PreparedModuleEntry>> modules;
 };
 
@@ -622,7 +623,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
-    static std::shared_mutex mutex;
+    static HostMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
     {
@@ -654,7 +655,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     key.clear();
     key.push_back(artifact.variantId);
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
-    static std::shared_mutex mutex;
+    static HostMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
     std::shared_ptr<SpecializedModuleEntry> entry;
     {
