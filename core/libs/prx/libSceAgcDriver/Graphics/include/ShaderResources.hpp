@@ -126,8 +126,14 @@ public:
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // A set of the draw ring (see prepareRingBindings): the offsets its bind passes. Empty
+        // for a set of its own, which binds with BindSet's zero offsets.
+        std::vector<std::uint32_t> dynamicOffsets;
         ~DrawBindings();
     };
+    // Binds `set` (this object's or a DrawBindings one of the same layout) with the dynamic offsets
+    // the layout needs: `offsets`, or zeros when empty.
+    void BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set, std::span<const std::uint32_t> offsets) const;
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
@@ -427,6 +433,18 @@ private:
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
+    // The draw ring (ShaderResources.cpp, DrawRing). `ringLayout`: the set's buffer bindings are
+    // dynamic, so a draw whose read-only buffers moved copies them into the ring and binds
+    // `ringAllocation`'s set, written once with those elements pointing at the ring, with offsets.
+    // `dynamicOrder` names the allocation of each dynamic descriptor in bind order; `ringRanges`
+    // the descriptor range of each allocation the ring serves (0: bound as the template has it).
+    bool ringLayout = false;
+    std::vector<std::size_t> dynamicOrder;
+    std::vector<std::uint32_t> zeroOffsets;
+    mutable std::vector<std::uint32_t> ringRanges;
+    mutable DescriptorCache::SetAllocation ringAllocation;
+    mutable bool ringUnusable = false;
+    std::shared_ptr<DrawBindings> prepareRingBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;

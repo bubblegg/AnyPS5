@@ -1731,8 +1731,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
-        const auto set = drawBindings->allocation.set;
-        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+        resources.BindSet(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), drawBindings->allocation.set, drawBindings->dynamicOffsets);
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }

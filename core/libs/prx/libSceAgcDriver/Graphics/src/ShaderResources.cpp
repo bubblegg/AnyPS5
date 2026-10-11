@@ -1394,6 +1394,16 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             Require(storageBuffers <= context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers, "pipeline descriptors exceed device limits");
             updateAfterBind = true;
         }
+        // A draw's read-only buffers move every frame in some titles; with dynamic buffer bindings
+        // such a draw binds one prepared set with offsets into the draw ring instead of a set of
+        // its own (prepareRingBindings). APS5_NO_DRAW_RING=1 keeps plain bindings.
+        static const bool noDrawRing = std::getenv("APS5_NO_DRAW_RING") != nullptr;
+        ringLayout = drawBuild && !noDrawRing && !updateAfterBind && !usesBda && context.descriptorCache != nullptr && storageBuffers != 0 && storageBuffers <= context.limits.maxDescriptorSetStorageBuffersDynamic;
+        if (ringLayout) {
+            for (auto& binding : bindings) {
+                if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) binding.layout.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+            }
+        }
         timing.bindingsMs = phase(BuildPhase::Bindings);
         // For every build, locked ones included: their stage B then takes the fast path too, and the
         // collects cost the same wherever they run.
@@ -1420,7 +1430,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
             std::vector<VkDescriptorPoolSize> sizes;
-            if (storageBuffers != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
+            if (storageBuffers != 0) sizes.push_back({ringLayout ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
             if (plannedSampledImages != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, plannedSampledImages});
             if (plannedStorageImages != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, plannedStorageImages});
             if (!samplers.empty()) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, static_cast<std::uint32_t>(samplers.size())});
@@ -1483,7 +1493,7 @@ void ShaderResources::buildComplete() {
             std::size_t imageCount = 0;
             for (const auto& binding : bindings) {
                 bufferCount += binding.allocations.size();
-                if (binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) imageCount += binding.layout.descriptorCount;
+                if (binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) imageCount += binding.layout.descriptorCount;
             }
             auto& buffers = descriptorBuffers;
             auto& images = descriptorImages;
@@ -1504,6 +1514,7 @@ void ShaderResources::buildComplete() {
                 write.descriptorType = binding.layout.descriptorType;
                 switch (binding.layout.descriptorType) {
                     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
                         write.pBufferInfo = buffers.data() + buffers.size();
                         for (const auto index : binding.allocations) {
                             buffers.push_back(descriptor(allocations[index]));
@@ -1535,6 +1546,19 @@ void ShaderResources::buildComplete() {
                 writes.push_back(write);
             }
             context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            if (ringLayout) {
+                // Dynamic offsets go by binding number, then array element.
+                std::vector<const Binding*> ordered;
+                for (const auto& binding : bindings) {
+                    if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) ordered.push_back(&binding);
+                }
+                std::sort(ordered.begin(), ordered.end(), [](const Binding* a, const Binding* b) { return a->layout.binding < b->layout.binding; });
+                for (const auto* binding : ordered) {
+                    Require(binding->allocations.size() == binding->layout.descriptorCount, "buffer allocations disagree with the binding count");
+                    dynamicOrder.insert(dynamicOrder.end(), binding->allocations.begin(), binding->allocations.end());
+                }
+                zeroOffsets.assign(dynamicOrder.size(), 0u);
+            }
         }
         for (const auto& allocation : allocations) {
             if (allocation.adjustment == 0) continue;
@@ -2635,6 +2659,7 @@ namespace {
 std::uint32_t SetDescriptorLimit(const VkPhysicalDeviceLimits& limits, VkDescriptorType type) {
     switch (type) {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return limits.maxDescriptorSetStorageBuffers;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return limits.maxDescriptorSetStorageBuffersDynamic;
         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: return limits.maxDescriptorSetSampledImages;
         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return limits.maxDescriptorSetStorageImages;
         case VK_DESCRIPTOR_TYPE_SAMPLER: return limits.maxDescriptorSetSamplers;
@@ -2644,8 +2669,8 @@ std::uint32_t SetDescriptorLimit(const VkPhysicalDeviceLimits& limits, VkDescrip
 
 // What one chain pool holds; a set needing more of any type gets a dedicated pool.
 constexpr std::uint32_t ChainPoolSets = 1024;
-constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
-constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+constexpr std::array<VkDescriptorPoolSize, 5> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+constexpr std::array<VkDescriptorPoolSize, 5> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 }
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind) {
@@ -3310,6 +3335,8 @@ ShaderResources::~ShaderResources() {
 void ShaderResources::release() noexcept {
     // A set from the cache's pool chain goes back to it; a dedicated pool dies with its set.
     if (cacheAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(cacheAllocation);
+    if (ringAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(ringAllocation);
+    ringAllocation = {};
     if (pool) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (_layout && ownsLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, _layout, nullptr);
     cacheAllocation = {};
@@ -3374,8 +3401,252 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+namespace {
+
+// The draw ring: one host-visible buffer that recorded draws copy their read-only buffers into, a
+// draw after the other, and read through dynamic offsets. A batch that used the ring holds the
+// ring from where it started (a DrawRingHold among the recorder's kept objects, released when the
+// batch completed), so nothing a pending batch reads is written over; a draw that finds no room
+// takes the path with a set and buffers of its own.
+struct DrawRing {
+    static constexpr std::uint64_t Bytes = std::uint64_t{64} << 20u;
+    // A larger element keeps its own snapshot buffer, which is reused while its memory is unchanged.
+    static constexpr std::uint64_t MaxElement = 16384;
+    std::unique_ptr<Buffer> buffer;
+    std::mutex mutex;
+    std::uint64_t head = 0;
+    std::uint64_t tail = 0;
+    std::vector<std::uint64_t> live;
+    const Recorder* heldBy = nullptr;
+    std::uint64_t heldSerial = 0;
+};
+
+struct DrawRingHold {
+    DrawRing* ring;
+    std::uint64_t start;
+    ~DrawRingHold() {
+        std::lock_guard lock(ring->mutex);
+        const auto found = std::find(ring->live.begin(), ring->live.end(), start);
+        if (found != ring->live.end()) ring->live.erase(found);
+        ring->tail = ring->live.empty() ? ring->head : ring->live.front();
+    }
+};
+
+// The device's ring, made on first use and never destroyed (as the shared resource cache).
+DrawRing* DrawRingFor(const Context& context) {
+    static std::mutex mutex;
+    static std::vector<std::pair<VkDevice, DrawRing*>> rings;
+    std::lock_guard lock(mutex);
+    for (const auto& [device, ring] : rings) {
+        if (device == context.device) return ring;
+    }
+    auto* ring = new DrawRing();
+    ring->buffer = std::make_unique<Buffer>(context, static_cast<std::size_t>(DrawRing::Bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    rings.emplace_back(context.device, ring);
+    return ring;
+}
+
+// Ring draws against draws that took a set of their own, by reason, every 2^18 of them.
+struct DrawRingCounters {
+    enum Reason { Unusable, ForeignMove, DataSize, GuestSize, Written, NotDirect, PendingWrite, Full, ReasonCount };
+    std::array<std::uint64_t, ReasonCount> fallbacks{};
+    std::uint64_t ring = 0, bytes = 0, sets = 0;
+    void note() {
+        std::uint64_t total = ring;
+        for (const auto count : fallbacks) total += count;
+        if (total % (std::uint64_t{1} << 18u) != 0) return;
+        std::fprintf(stderr, "[draws] draw ring: %llu draws bound through the ring (%.1f KiB each, %llu ring sets made), own sets by reason: template not served %llu, moved non-ring element %llu, data size %llu, guest size %llu, written %llu, not direct %llu, pending write %llu, ring full %llu\n", static_cast<unsigned long long>(ring), ring != 0 ? static_cast<double>(bytes) / 1024.0 / static_cast<double>(ring) : 0.0, static_cast<unsigned long long>(sets), static_cast<unsigned long long>(fallbacks[Unusable]), static_cast<unsigned long long>(fallbacks[ForeignMove]), static_cast<unsigned long long>(fallbacks[DataSize]), static_cast<unsigned long long>(fallbacks[GuestSize]), static_cast<unsigned long long>(fallbacks[Written]), static_cast<unsigned long long>(fallbacks[NotDirect]), static_cast<unsigned long long>(fallbacks[PendingWrite]), static_cast<unsigned long long>(fallbacks[Full]));
+        fallbacks = {};
+        ring = bytes = sets = 0;
+    }
+};
+
+DrawRingCounters& RingCounters() {
+    static DrawRingCounters counters;
+    return counters;
+}
+
+}
+
+void ShaderResources::BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set, std::span<const std::uint32_t> offsets) const {
+    if (offsets.empty()) offsets = zeroOffsets;
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &set, static_cast<std::uint32_t>(offsets.size()), offsets.empty() ? nullptr : offsets.data());
+}
+
+// Runs under the GPU mutex, like every recorded draw. Null when this draw must take a set of its
+// own (PrepareDrawBindings goes on to make one).
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    auto& counters = RingCounters();
+    const auto refuse = [&](DrawRingCounters::Reason reason) {
+        ++counters.fallbacks[reason];
+        counters.note();
+        return std::shared_ptr<DrawBindings>{};
+    };
+    if (ringUnusable) return refuse(DrawRingCounters::Unusable);
+    const auto alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 16);
+    if (ringRanges.empty()) {
+        ringRanges.assign(allocations.size(), 0u);
+        bool any = false;
+        for (std::size_t index = 0; index < allocations.size(); ++index) {
+            const auto& item = allocations[index];
+            std::uint64_t range = 0;
+            if (item.guest && !item.written && item.role == ShaderRecompiler::DescriptorRole::GuestBuffers) range = GuestBufferMemory::ViewBytes(item.size, item.adjustment);
+            else if (!item.guest && item.buffer != nullptr && (item.role == ShaderRecompiler::DescriptorRole::ShaderData || item.role == ShaderRecompiler::DescriptorRole::FlattenedSrt)) range = item.size;
+            if (range == 0) continue;
+            if (range > DrawRing::MaxElement) {
+                ringUnusable = true;
+                return refuse(DrawRingCounters::Unusable);
+            }
+            ringRanges[index] = static_cast<std::uint32_t>(range);
+            any = true;
+        }
+        if (!any) {
+            ringUnusable = true;
+            return refuse(DrawRingCounters::Unusable);
+        }
+    }
+    struct Copy {
+        std::size_t allocation;
+        const void* source;
+        std::uint64_t collect;
+    };
+    std::array<Copy, 64> copies;
+    std::size_t copyCount = 0;
+    std::uint64_t total = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    bool readsKnown = false;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const auto range = ringRanges[index];
+        if (range == 0) {
+            if (override != moved.end()) return refuse(DrawRingCounters::ForeignMove);
+            continue;
+        }
+        if (copyCount == copies.size()) return refuse(DrawRingCounters::Unusable);
+        if (!item.guest) {
+            const void* source = nullptr;
+            if (override != moved.end()) {
+                if (override->words.empty() || override->size != item.size || override->words.size() * sizeof(std::uint32_t) < item.size) return refuse(DrawRingCounters::DataSize);
+                source = override->words.data();
+            } else if (!item.dataWords.empty()) {
+                if (item.dataWords.size() * sizeof(std::uint32_t) < item.size) return refuse(DrawRingCounters::DataSize);
+                source = item.dataWords.data();
+            } else {
+                if (item.buffer->Bytes().size() < item.size) return refuse(DrawRingCounters::DataSize);
+                source = item.buffer->Bytes().data();
+            }
+            copies[copyCount++] = {index, source, 0};
+        } else {
+            std::uint64_t address = item.address;
+            if (override != moved.end()) {
+                if (!override->words.empty() || GuestBufferMemory::ViewBytes(override->size, item.adjustment) != range) return refuse(DrawRingCounters::GuestSize);
+                address = override->address;
+            } else {
+                // The checks a draw of its own makes before it reads a buffer the template binds in place.
+                if (guestMemory.WritesOverlap(item.address, item.size)) return refuse(DrawRingCounters::Written);
+                if (!readsKnown) {
+                    reads = guestMemory.InPlaceReads();
+                    readsKnown = true;
+                }
+                const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& span) { return item.address >= span.first && item.address < span.second && item.size <= span.second - item.address; });
+                if (!direct) return refuse(DrawRingCounters::NotDirect);
+                if (recorder.PendingWriteOverlaps(item.address, item.size)) return refuse(DrawRingCounters::PendingWrite);
+            }
+            const auto begin = address - item.adjustment;
+            copies[copyCount++] = {index, reinterpret_cast<const void*>(begin), begin};
+        }
+        total += (range + alignment - 1) / alignment * alignment;
+    }
+    if (copyCount == 0) return refuse(DrawRingCounters::Unusable);
+    auto* ring = DrawRingFor(context);
+    std::uint64_t position = 0;
+    {
+        std::unique_lock lock(ring->mutex);
+        if (ring->heldBy != &recorder || ring->heldSerial != recorder.Submissions() || ring->live.empty()) {
+            // The hold is kept by the batch that is open now; Keep opens one if none is, and may
+            // release older batches' holds, so it runs without the ring's lock.
+            lock.unlock();
+            auto hold = std::make_shared<DrawRingHold>();
+            hold->ring = ring;
+            lock.lock();
+            ring->head = (ring->head + alignment - 1) / alignment * alignment;
+            hold->start = ring->head;
+            ring->live.push_back(ring->head);
+            lock.unlock();
+            recorder.Keep(std::move(hold));
+            lock.lock();
+            ring->heldBy = &recorder;
+            ring->heldSerial = recorder.Submissions();
+        }
+        auto start = ring->head;
+        if (start % DrawRing::Bytes + total > DrawRing::Bytes) start += DrawRing::Bytes - start % DrawRing::Bytes;
+        if (start + total - ring->tail > DrawRing::Bytes) {
+            lock.unlock();
+            return refuse(DrawRingCounters::Full);
+        }
+        ring->head = start + total;
+        position = start % DrawRing::Bytes;
+    }
+    if (ringAllocation.set == VK_NULL_HANDLE) {
+        std::map<VkDescriptorType, std::uint32_t> counts;
+        for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
+        std::vector<VkDescriptorPoolSize> sizes;
+        for (const auto& [type, count] : counts) sizes.push_back({type, count});
+        ringAllocation = context.descriptorCache->Allocate(_layout, sizes);
+        Require(ringAllocation.set != VK_NULL_HANDLE, "draw ring descriptor allocation failed");
+        auto buffers = descriptorBuffers;
+        auto writes = descriptorWrites;
+        for (std::size_t index = 0; index < bindings.size(); ++index) {
+            const auto& binding = bindings[index];
+            auto& write = writes[index];
+            write.dstSet = ringAllocation.set;
+            if (binding.allocations.empty()) continue;
+            const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+            write.pBufferInfo = buffers.data() + offset;
+            for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                const auto range = ringRanges[binding.allocations[element]];
+                if (range != 0) buffers[offset + element] = {ring->buffer->Handle(), 0, range};
+            }
+        }
+        context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        ++counters.sets;
+    }
+    auto result = std::make_shared<DrawBindings>();
+    result->allocation.set = ringAllocation.set;
+    result->dynamicOffsets.assign(dynamicOrder.size(), 0u);
+    auto* bytes = ring->buffer->Bytes().data();
+    std::array<std::uint32_t, 64> placed;
+    for (std::size_t copy = 0; copy < copyCount; ++copy) {
+        const auto& entry = copies[copy];
+        const auto& item = allocations[entry.allocation];
+        const auto range = ringRanges[entry.allocation];
+        if (item.guest) static_cast<void>(GuestMemory::CollectWrites(entry.collect, range));
+        std::memcpy(bytes + position, entry.source, range);
+        if (!item.guest) {
+            for (const auto& patch : dataPatches) {
+                if (patch.allocation == entry.allocation && patch.byte < range) bytes[position + patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+        }
+        placed[copy] = static_cast<std::uint32_t>(position);
+        position += (range + alignment - 1) / alignment * alignment;
+    }
+    for (std::size_t slot = 0; slot < dynamicOrder.size(); ++slot) {
+        for (std::size_t copy = 0; copy < copyCount; ++copy) {
+            if (copies[copy].allocation == dynamicOrder[slot]) result->dynamicOffsets[slot] = placed[copy];
+        }
+    }
+    ++counters.ring;
+    counters.bytes += total;
+    counters.note();
+    return result;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
+    if (ringLayout) {
+        if (auto ring = prepareRingBindings(recorder, moved)) return ring;
+    }
     const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
@@ -3451,7 +3722,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     if (_set == VK_NULL_HANDLE) return;
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
+    BindSet(commands, bindPoint, layout, _set, {});
 }
 
 namespace {
