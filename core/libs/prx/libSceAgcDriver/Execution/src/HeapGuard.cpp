@@ -287,9 +287,13 @@ Magazine* depotTake(std::size_t c) {
     return magazine;
 }
 
+DWORD smallCacheFastSlot();
+
 void WINAPI flushSmallCache(void* data) {
     auto* cache = static_cast<SmallCache*>(data);
     if (cache == nullptr) return;
+    // Later deletes on the ending thread must not find the cache that is freed here.
+    if (smallCacheFastSlot() < 64) TlsSetValue(smallCacheFastSlot(), nullptr);
     for (std::size_t c = 0; c < SmallCache::Classes; ++c) {
         for (Magazine* magazine : {cache->current[c], cache->spare[c]}) {
             if (magazine == nullptr) continue;
@@ -310,7 +314,20 @@ DWORD smallCacheSlot() {
     return slot;
 }
 
+// The cache is also kept in a plain TLS slot, read straight from the thread environment block:
+// FlsGetValue on every allocation and delete was 2% of the preparing thread. The FLS slot stays
+// for its callback, which frees the cache when the thread ends.
+DWORD smallCacheFastSlot() {
+    static const DWORD slot = TlsAlloc();
+    return slot;
+}
+
 SmallCache* smallCache(bool create) {
+    const DWORD fast = smallCacheFastSlot();
+    if (fast < 64) {
+        auto* cache = static_cast<SmallCache*>(reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(NtCurrentTeb()) + 0x1480)[fast]);
+        if (cache != nullptr || !create) return cache;
+    }
     const DWORD slot = smallCacheSlot();
     if (slot == FLS_OUT_OF_INDEXES) return nullptr;
     auto* cache = static_cast<SmallCache*>(FlsGetValue(slot));
@@ -320,6 +337,7 @@ SmallCache* smallCache(bool create) {
             std::free(cache);
             cache = nullptr;
         }
+        if (cache != nullptr && fast < 64) TlsSetValue(fast, cache);
     }
     return cache;
 }
