@@ -14,6 +14,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -274,11 +275,29 @@ private:
         return memory.kind == ResourceKind::ScalarBuffer && memory.dataBits == 32u && memory.dataDwords == 1u ? &memory : nullptr;
     }
 
-    bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
+    static bool AccessesMemory(IrOpcode op) {
+        return BufferAccessOf(op) != BufferAccess::None || AddressOpcodeInfoOf(op).access != AddressAccess::None || ImageOpcodeInfoOf(op).access != ImageAccess::None;
+    }
+
+    void IndexMemoryUsers() {
         for (const auto& block : m_program.Blocks()) {
             for (const IrValue* inst : block->Instructions()) {
-                const auto op = inst->Opcode();
-                if ((BufferAccessOf(op) == BufferAccess::None && AddressOpcodeInfoOf(op).access == AddressAccess::None && ImageOpcodeInfoOf(op).access == ImageAccess::None) || inst == &owner) {
+                if (AccessesMemory(inst->Opcode())) {
+                    m_memoryUsers[inst->Flags<MemoryFlags>().index].push_back(inst);
+                }
+            }
+        }
+        m_memoryUsersIndexed = true;
+    }
+
+    bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
+        if (m_memoryUsersIndexed) {
+            const auto users = m_memoryUsers.find(index);
+            return users == m_memoryUsers.end() || std::ranges::all_of(users->second, [&](const IrValue* user) { return user == &owner; });
+        }
+        for (const auto& block : m_program.Blocks()) {
+            for (const IrValue* inst : block->Instructions()) {
+                if (!AccessesMemory(inst->Opcode()) || inst == &owner) {
                     continue;
                 }
                 if (inst->Flags<MemoryFlags>().index == index) {
@@ -498,6 +517,10 @@ private:
             if (ResolveInvariantPhi(m_program.Resources(), value) == nullptr && std::ranges::find(phis, value) == phis.end()) {
                 phis.push_back(value);
             }
+            return;
+        }
+        if (depth != 0u && value->Opcode() == IrOpcode::ReadFirstLane && value->ArgumentCount() == 2u) {
+            CollectDescriptorPhis(value->Argument(0), phis, depth - 1u);
             return;
         }
         if (depth == 0u || !Detail::IsRuntimeUniformOp(value->Opcode())) {
@@ -765,7 +788,9 @@ private:
         std::vector<std::vector<IrValue*>> arms;
         std::map<std::vector<IrValue*>, IrValue*> selectors;
         std::vector<std::pair<IrBlock*, IrValue*>> phis;
+        std::vector<std::tuple<IrBlock*, IrValue*, IrValue*>> lanes;
         std::unordered_map<IrValue*, IrValue*> resolved;
+        std::unordered_map<const IrBlock*, std::size_t> order;
     };
 
     IrValue* WebSelector(std::vector<IrValue*> tuple, DescriptorWeb& web, IrValue& position) {
@@ -785,6 +810,10 @@ private:
             return known->second;
         }
         const auto phi = std::ranges::find_if(tuple, [](const IrValue* value) { return value->IsPhi(); });
+        const auto lane = std::ranges::find_if(tuple, [](const IrValue* value) { return value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::ReadFirstLane; });
+        if (phi == tuple.end() && lane != tuple.end()) {
+            return LaneSelector(tuple, **lane, web, position);
+        }
         if (phi == tuple.end()) {
             for (IrValue* value : tuple) {
                 if (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr) {
@@ -803,7 +832,27 @@ private:
             web.arms.push_back(std::move(tuple));
             return &m_builder.Constant(static_cast<std::uint32_t>(web.arms.size() - 1u));
         }
-        IrBlock* block = (*phi)->Parent();
+        if (web.order.empty()) {
+            const auto& order = m_program.BlockOrder();
+            for (std::size_t index = 0; index < order.size(); index++) {
+                web.order.emplace(order[index], index);
+            }
+        }
+        IrBlock* block = nullptr;
+        std::size_t latest = 0;
+        for (const IrValue* value : tuple) {
+            if (!value->IsPhi()) {
+                continue;
+            }
+            const auto found = web.order.find(value->Parent());
+            if (found == web.order.end()) {
+                return nullptr;
+            }
+            if (block == nullptr || found->second > latest) {
+                block = value->Parent();
+                latest = found->second;
+            }
+        }
         if (block == nullptr || web.selectors.size() == DescriptorWeb::maxStates) {
             return nullptr;
         }
@@ -812,7 +861,7 @@ private:
             return nullptr;
         }
         for (const IrValue* value : tuple) {
-            if (value->IsPhi() && (value->Parent() != block || value->PhiBlockCount() != predecessors.size())) {
+            if (value->IsPhi() && value->Parent() == block && value->PhiBlockCount() != predecessors.size()) {
                 return nullptr;
             }
         }
@@ -822,7 +871,7 @@ private:
         for (IrBlock* predecessor : predecessors) {
             std::vector<IrValue*> incoming;
             for (IrValue* value : tuple) {
-                IrValue* edge = value->IsPhi() ? PhiIncoming(*value, predecessor) : value;
+                IrValue* edge = value->IsPhi() && value->Parent() == block ? PhiIncoming(*value, predecessor) : value;
                 if (edge == nullptr) {
                     return nullptr;
                 }
@@ -835,6 +884,64 @@ private:
             selector.AddPhiOperand(predecessor, edgeSelector);
         }
         return &selector;
+    }
+
+    IrValue* LaneSelector(const std::vector<IrValue*>& tuple, IrValue& first, DescriptorWeb& web, IrValue& position) {
+        IrBlock* block = first.Parent();
+        const auto op = first.Opcode();
+        const bool select = op == IrOpcode::SelectU32;
+        if (block == nullptr || first.ArgumentCount() != (select ? 3u : 2u) || web.selectors.size() == DescriptorWeb::maxStates) {
+            return nullptr;
+        }
+        IrValue* shared = first.Argument(select ? 0u : 1u);
+        std::vector<IrValue*> left;
+        std::vector<IrValue*> right;
+        for (IrValue* value : tuple) {
+            if (value->Opcode() == op && value->Parent() == block && value->ArgumentCount() == first.ArgumentCount() && EquivalentValue(m_program.Resources(), value->Argument(select ? 0u : 1u), shared)) {
+                left.push_back(value->Argument(select ? 1u : 0u));
+                if (select) {
+                    right.push_back(value->Argument(2u));
+                }
+            } else if (value->HasImmediate() || (select && !value->IsPhi() && value->Opcode() != IrOpcode::ReadFirstLane)) {
+                left.push_back(value);
+                if (select) {
+                    right.push_back(value);
+                }
+            } else {
+                return nullptr;
+            }
+        }
+        auto& instructions = block->Instructions();
+        auto latest = instructions.end();
+        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
+            if (std::ranges::find(tuple, *it) != tuple.end()) {
+                latest = it;
+            }
+        }
+        if (latest == instructions.end()) {
+            return nullptr;
+        }
+        IrValue* before = std::next(latest) == instructions.end() ? nullptr : *std::next(latest);
+        IrValue* leftSelector = WebSelector(std::move(left), web, position);
+        if (leftSelector == nullptr) {
+            return nullptr;
+        }
+        IrValue& node = m_program.CreateValue(op, IrType::U32, first.Flags<std::uint64_t>());
+        if (select) {
+            IrValue* rightSelector = WebSelector(std::move(right), web, position);
+            if (rightSelector == nullptr) {
+                return nullptr;
+            }
+            node.AddArgument(shared);
+            node.AddArgument(leftSelector);
+            node.AddArgument(rightSelector);
+        } else {
+            node.AddArgument(leftSelector);
+            node.AddArgument(shared);
+        }
+        web.selectors.emplace(tuple, &node);
+        web.lanes.emplace_back(block, before, &node);
+        return &node;
     }
 
     void SplitDescriptorWeb(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount) {
@@ -853,14 +960,29 @@ private:
             for (const auto& [block, phi] : web.phis) {
                 block->InsertInstructionBefore(nullptr, phi);
             }
+            for (const auto& [block, before, node] : web.lanes) {
+                if (before == nullptr) {
+                    block->AppendInstruction(node);
+                } else {
+                    block->InsertInstructionBefore(before, node);
+                }
+            }
         } else {
             for (const auto& [block, phi] : web.phis) {
                 for (std::size_t index = 0; index < phi->ArgumentCount(); index++) {
                     phi->ReplaceArgument(index, nullptr);
                 }
             }
+            for (const auto& [block, before, node] : web.lanes) {
+                for (std::size_t index = 0; index < node->ArgumentCount(); index++) {
+                    node->ReplaceArgument(index, nullptr);
+                }
+            }
             for (const auto& [block, phi] : web.phis) {
                 phi->Invalidate();
+            }
+            for (const auto& [block, before, node] : web.lanes) {
+                node->Invalidate();
             }
         }
         if (selector == nullptr || web.arms.empty()) {
@@ -898,6 +1020,7 @@ private:
         if (!enabled) {
             return;
         }
+        IndexMemoryUsers();
         for (auto& block : m_program.Blocks()) {
             for (IrValue* inst : block->Instructions()) {
                 const auto imageInfo = ImageOpcodeInfoOf(inst->Opcode());
@@ -920,6 +1043,8 @@ private:
                 }
             }
         }
+        m_memoryUsersIndexed = false;
+        m_memoryUsers.clear();
     }
 
     void GetHandle(IrValue* value, IrOpcode expected, std::uint32_t width, IrValue*& handle, std::uint32_t& source, bool sampler = false, bool sampleAdjust = false) {
@@ -1062,11 +1187,12 @@ private:
         image.fmaskCompatible = image.fmaskCompatible && op == IrOpcode::ImageRead && memory.dataBits == 32u;
         image.depthBitsCompatible = image.depthBitsCompatible && memory.dataBits == 32u;
         image.constantSwizzleCompatible = image.constantSwizzleCompatible && (op == IrOpcode::ImageSampleRaw || op == IrOpcode::ImageGatherRaw);
-        const bool flatVolumeLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
+        const bool flatVolumeLoad = op == IrOpcode::ImageRead && memory.imageSampleFlags == 0u;
         const bool flatVolumeSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
-        image.flatVolumeCompatible = image.flatVolumeCompatible && (flatVolumeLoad || flatVolumeSample) && !memory.imagePacked && memory.imageByElements == 0u;
+        const bool flatVolumeQuery = op == IrOpcode::ImageQueryDimensions;
+        image.flatVolumeCompatible = image.flatVolumeCompatible && (flatVolumeLoad || flatVolumeSample || flatVolumeQuery) && !memory.imagePacked && memory.imageByElements == 0u;
         const bool flatLineLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
-        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
+        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && (memory.imageSampleFlags == RdnaImageSampleFlagLevelZero || memory.imageSampleFlags == 0u);
         image.flatLineCompatible = image.flatLineCompatible && (flatLineLoad || flatLineSample) && !memory.imagePacked && memory.imageByElements == 0u;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
@@ -1263,6 +1389,8 @@ private:
     // APS5_TRACE_BDA: address accesses seen by Collect (the first bdaTraceLimit are printed).
     unsigned m_bdaTraces = 0;
     std::vector<IndirectImagePlan> m_indirectImages;
+    std::unordered_map<std::uint32_t, std::vector<const IrValue*>> m_memoryUsers;
+    bool m_memoryUsersIndexed = false;
     struct EdgeSelectorEntry {
         IrBlock* block = nullptr;
         std::vector<bool> edges;

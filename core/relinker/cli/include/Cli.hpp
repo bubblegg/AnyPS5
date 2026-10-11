@@ -13,6 +13,7 @@ struct Args {
     bool skipSyscallCheck = false;
     bool skipSceModule = false;
     bool toIntel = false;
+    bool toRosetta = false;
     bool writeRegistry = false;
     bool toWindows = false;
     bool toMacos = false;
@@ -23,9 +24,10 @@ struct Args {
     std::uint32_t unusedFilterLevel = 0;
     std::string inputPath;
     std::string outputPath;
+    std::string sceModulePath;
     std::string runPath = "$ORIGIN/libs";
     std::set<std::string> excludedSceModules;
-    std::vector<std::string> guestModuleDirectories;
+    std::vector<std::string> moduleDirectories;
 };
 
 Args ParseArgs(int argc, char* argv[]);

@@ -31,6 +31,11 @@ void NoteDepthClearDraw();
 // At each flip: reports now and then how the title cleared depth, and under APS5_CLEAR_DEPTH_ON_FLIP
 // clears the depth plane of every surface of the device (a debug aid for ghosting).
 void DepthSurfacesAtFlip(const Context& context);
+bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture);
+void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
+VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
+std::uint64_t HtileMetadataBytes(VkExtent2D extent);
+bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
 
 }

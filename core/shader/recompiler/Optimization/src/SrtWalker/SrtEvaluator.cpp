@@ -143,7 +143,8 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         const auto stride = (static_cast<std::uint32_t>(high) >> 16u) & 0x3fffu;
         const auto size = stride == 0u ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(records)) : static_cast<std::uint64_t>(stride) * static_cast<std::uint32_t>(records);
         if (aligned > size || size - aligned < sizeof(std::uint32_t)) {
-            return false;
+            result = 0;
+            return true;
         }
         address = ((base & ~std::uint64_t {3}) + byteOffset) & ~std::uint64_t {3};
     } else {
@@ -151,6 +152,11 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         if (!AddSignedAddress(base & ~std::uint64_t {3}, relative, address)) {
             return false;
         }
+    }
+    if (_nullRoots != nullptr && base == 0 && !LoadedFromMemory(*handle)) {
+        ++*_nullRoots;
+        result = 0;
+        return true;
     }
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle)) {
         *_inaccessible = {&inst, address};
@@ -192,6 +198,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::ReadFirstLane: {
             Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1));
             active.ReportInaccessibleReads(_inaccessible);
+            active.ReportNullRootReads(_nullRoots);
             return active.EvaluateWide(inst.Argument(0), result);
         }
         case IrOpcode::BitCastU32F32:
@@ -253,6 +260,12 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::IMul64:
             if (binary()) {
                 result = a * b;
+                return true;
+            }
+            return false;
+        case IrOpcode::SMin32:
+            if (binary()) {
+                result = static_cast<std::uint32_t>(std::min(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)), std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b))));
                 return true;
             }
             return false;

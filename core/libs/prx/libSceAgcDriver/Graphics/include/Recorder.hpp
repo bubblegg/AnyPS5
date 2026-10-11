@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,16 +60,13 @@ public:
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
-    // A recorded draw's render pass (Draw.cpp) is left open after the draw: the next draw of the
-    // same attachments (`key`: the views and the extent) continues it when nothing was recorded in
-    // between and the earlier draw allowed it (`continuable`: it wrote nothing but its
-    // attachments, so no barrier is owed inside the pass), and anything else recorded first ends
-    // it (vkCmdEndRenderPass, one trailing barrier for the pass, the end of the draw class range
-    // `timing`): Commands(), RecordStore and Submit end it; CommandsInRenderPass hands a
-    // continuing draw the command buffer without ending it.
-    bool ContinuesRenderPass(std::uint64_t key) const;
-    VkCommandBuffer CommandsInRenderPass();
-    void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool continuable, std::function<void(VkCommandBuffer)> afterPass = {});
+    struct DrawPassStart {
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        bool continued = false;
+        bool barrier = true;
+    };
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -87,6 +86,9 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    void KeepBytes(const void* owner, std::size_t bytes);
+    std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
+    void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
@@ -95,7 +97,7 @@ public:
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
@@ -381,6 +383,7 @@ public:
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
+    VkDevice Device() const { return context.device; }
     // Whether the calling thread runs inside a batch's completion action (finish()): a store made
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
     static bool InCompletion();
@@ -513,6 +516,7 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
+        std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
@@ -607,14 +611,14 @@ private:
             };
             std::vector<Image> images;
         } tracker;
-        // The render pass a recorded draw left open (see ContinuesRenderPass).
         struct RenderPass {
             bool open = false;
-            bool continuable = false;
+            bool fenced = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
+        PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -714,7 +718,7 @@ private:
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
-    void endOpenRenderPass();
+    void endOpenRenderPass(bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
@@ -804,6 +808,7 @@ private:
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
 };
 
 }

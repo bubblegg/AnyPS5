@@ -24,6 +24,7 @@ class Recorder;
 class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
+class PlaceholderImages;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -142,6 +143,7 @@ struct Context {
     bool samplerFilterMinmax = false;
     bool nonSeamlessCubeMap = false;
     bool conservativeRasterization = false;
+    bool meshWave32 = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
     // The device's list of recorded dispatches whose copied written buffers await a CPU write-back
     // (VulkanDevice's State::copiedWriters; the draw counterpart is DrawCopiedWriters): an indirect
@@ -158,13 +160,16 @@ struct Context {
     bool sampleRateShading = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
+    const PlaceholderImages* placeholderImages = nullptr;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool graphicsPipelineLibrary = false;
+    bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
+    bool singlePassStorage = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

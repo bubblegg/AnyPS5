@@ -17,6 +17,7 @@ int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate);
 int APS5_VABI sceVideoOutSetWindowModeMargins(int handle, int top, int bottom);
 int APS5_VABI sceVideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status);
 int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status);
+int APS5_VABI sceVideoOutGetOutputStatusWithVrr(int handle, void* status);
 int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatus* status);
 int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status);
 int APS5_VABI sceVideoOutIsFlipPending(int handle);
@@ -25,6 +26,8 @@ int APS5_VABI sceVideoOutLatencyControlWaitBeforeInput(int handle);
 int APS5_VABI sceVideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point);
 int APS5_VABI sceVideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 int APS5_VABI sceVideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
+int APS5_VABI sceVideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2);
+int APS5_VABI sceVideoOutVrrUnpegFromFixedRate(int handle);
 
 }
 

@@ -20,6 +20,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <span>
 
 // The batch buffer and its job records are private to this library: the guest only reserves the
 // memory and reads the "used bytes" field of AjmBatchInfo. Sideband results written back to guest
@@ -422,14 +423,30 @@ bool consumedFirstRun(Instance& instance) {
     return true;
 }
 
-std::vector<std::uint8_t> JoinInputs(const JobHeader& job, const AjmBuffer* inputs) {
-    std::vector<std::uint8_t> input;
-    for (std::uint32_t index = 0; index < job.inputCount; ++index) {
-        const auto* data = static_cast<const std::uint8_t*>(inputs[index].ptr);
-        input.insert(input.end(), data, data + inputs[index].size);
+class JobInput {
+public:
+    JobInput(const JobHeader& job, const AjmBuffer* inputs) {
+        if (job.inputCount == 1) {
+            bytes = {static_cast<const std::uint8_t*>(inputs[0].ptr), static_cast<std::size_t>(inputs[0].size)};
+            return;
+        }
+        for (std::uint32_t index = 0; index < job.inputCount; ++index) {
+            const auto* data = static_cast<const std::uint8_t*>(inputs[index].ptr);
+            joined.insert(joined.end(), data, data + inputs[index].size);
+        }
+        bytes = joined;
     }
-    return input;
-}
+    JobInput(const JobInput&) = delete;
+    JobInput& operator=(const JobInput&) = delete;
+    std::size_t size() const { return bytes.size(); }
+    bool empty() const { return bytes.empty(); }
+    const std::uint8_t* data() const { return bytes.data(); }
+    std::uint8_t operator[](std::size_t index) const { return bytes[index]; }
+
+private:
+    std::vector<std::uint8_t> joined;
+    std::span<const std::uint8_t> bytes;
+};
 
 struct PcmOutputs {
     const AjmBuffer* buffers;
@@ -606,7 +623,7 @@ void WriteRunSideband(const JobHeader& job, const Instance& instance, std::int32
 }
 
 void RunAt9(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* outputs) {
-    const auto input = JoinInputs(job, inputs);
+    const JobInput input(job, inputs);
     PcmOutputs pcmOutputs(outputs, job.outputCount);
 
     const auto channels = static_cast<std::size_t>(instance.info.channels);
@@ -673,7 +690,7 @@ void RunAt9(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, c
         std::fprintf(stderr, "[ajm] instance %u run flags 0x%llx: %zu input bytes in %u buffers, %zu output bytes in %u buffers, sideband %llu bytes; superframe %d (%d frames), %d channels, %d samples/frame, %d Hz, config %02x %02x %02x %02x -> result 0x%x, decoder status 0x%x, %u frames, consumed %zu, produced %zu, total samples %llu, gapless total %u skip %u skipped %u, input",
                      job.instance, static_cast<unsigned long long>(job.flags), input.size(), job.inputCount, pcmOutputs.capacity, job.outputCount, static_cast<unsigned long long>(job.sidebandSize), instance.info.superframeSize, instance.info.framesInSuperframe, instance.info.channels, instance.info.frameSamples, instance.info.samplingRate,
                      instance.info.configData[0], instance.info.configData[1], instance.info.configData[2], instance.info.configData[3], static_cast<unsigned>(result), static_cast<unsigned>(decodeStatus), frames, consumed, pcmOutputs.produced, static_cast<unsigned long long>(instance.totalDecodedSamples), instance.gapless.totalSamples, instance.gapless.skipSamples, instance.gapless.skippedSamples);
-        for (std::size_t i = 0; i < input.size() && i < 16; ++i) std::fprintf(stderr, " %02x", input[i]);
+        for (std::size_t i = 0; i < consumed && i < 16; ++i) std::fprintf(stderr, " %02x", input[i]);
         std::fprintf(stderr, "\n");
     }
     WriteRunSideband(job, instance, result, consumed, pcmOutputs.produced, frames, CurrentFormat(instance));
@@ -845,7 +862,7 @@ void OpenMp3(Instance& instance) {
 }
 
 void RunMp3(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* outputs) {
-    const auto input = JoinInputs(job, inputs);
+    const JobInput input(job, inputs);
     PcmOutputs pcmOutputs(outputs, job.outputCount);
     const auto encoding = PcmEncoding(instance);
     if (encoding > 2) throw std::runtime_error("AJM MP3: PCM encoding " + std::to_string(encoding) + " is not implemented");
@@ -955,7 +972,7 @@ std::size_t OpusPacketSamples(const std::uint8_t* packet, std::size_t size) {
 }
 
 void RunOpus(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* outputs) {
-    const auto input = JoinInputs(job, inputs);
+    const JobInput input(job, inputs);
     PcmOutputs pcmOutputs(outputs, job.outputCount);
     const auto encoding = PcmEncoding(instance);
     if (encoding > 2) throw std::runtime_error("AJM Opus: PCM encoding " + std::to_string(encoding) + " is not implemented");
@@ -983,6 +1000,7 @@ void RunOpus(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, 
         instance.opusPending.erase(instance.opusPending.begin(), instance.opusPending.begin() + static_cast<std::ptrdiff_t>(bytes));
     }
     while (consumed < input.size() && instance.opusPending.empty()) {
+        if (frames != 0 && pcmOutputs.Room() < frameBytes) break;
         if (input.size() - consumed < 2) {
             result |= AJM_RESULT_PARTIAL_INPUT;
             break;
@@ -1340,12 +1358,21 @@ int APS5_VABI sceAjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t i
     return Append(info, header, nullptr, nullptr);
 }
 
+int APS5_VABI sceAjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_t instance, float ratio_start, float ratio_change_per_sample, uint32_t flags, void* result) {
+    if (ratio_change_per_sample != 0.0f) throw std::runtime_error("sceAjmBatchJobSetResampleParametersEx: a ratio change per sample is unsupported");
+    return sceAjmBatchJobSetResampleParameters(info, instance, ratio_start, flags, result);
+}
+
 int APS5_VABI sceAjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instance, void* result) {
     return Append(info, MakeHeader(JobKind::GetResampleInfo, instance, result, sizeof(SidebandResult) + sizeof(SidebandResampleInfo)), nullptr, nullptr);
 }
 
 int APS5_VABI sceAjmBatchJobDecode(AjmBatchInfo* info, uint32_t instance, const void* bitstream_input, size_t bitstream_input_size, void* pcm_output, size_t pcm_output_size, void* result) {
     return sceAjmBatchJobRun(info, instance, SIDEBAND_STREAM, bitstream_input, bitstream_input_size, pcm_output, pcm_output_size, result, sizeof(SidebandResult) + sizeof(SidebandStream));
+}
+
+int APS5_VABI sceAjmBatchJobDecodeSplit(AjmBatchInfo* info, uint32_t instance, const AjmBuffer* input_buffers, size_t input_buffers_num, const AjmBuffer* output_buffers, size_t output_buffers_num, void* result) {
+    return sceAjmBatchJobRunSplit(info, instance, SIDEBAND_STREAM, input_buffers, input_buffers_num, output_buffers, output_buffers_num, result, sizeof(SidebandResult) + sizeof(SidebandStream));
 }
 
 int APS5_VABI sceAjmBatchJobDecodeSingle(AjmBatchInfo* info, uint32_t instance, const void* bitstream_input, size_t bitstream_input_size, void* pcm_output, size_t pcm_output_size, void* result) {

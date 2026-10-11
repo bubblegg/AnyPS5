@@ -33,9 +33,15 @@ std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
 std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
 int APS5_VABI sceKernelLseek(int, std::int64_t, int);
 std::int64_t APS5_VABI sceKernelReadv(int, const GuestIovec*, int);
+std::int64_t APS5_VABI readv_nid_postfix(int, const GuestIovec*, int);
+std::int64_t APS5_VABI writev_nid_postfix(int, const GuestIovec*, int);
+int* APS5_VABI __error_nid_postfix();
 std::int64_t APS5_VABI sceKernelWritev(int, const GuestIovec*, int);
 std::int64_t APS5_VABI sceKernelPreadv(int, const GuestIovec*, int, std::int64_t);
 std::int64_t APS5_VABI sceKernelPwritev(int, const GuestIovec*, int, std::int64_t);
+std::int64_t APS5_VABI preadv_nid_postfix(int, const GuestIovec*, int, std::int64_t);
+std::int64_t APS5_VABI pwritev_nid_postfix(int, const GuestIovec*, int, std::int64_t);
+int* APS5_VABI __error_nid_postfix();
 std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
 std::int64_t APS5_VABI sceKernelPwrite(int, const void*, std::size_t, std::int64_t);
 int APS5_VABI sceKernelFtruncate(int, std::int64_t);
@@ -78,6 +84,14 @@ int main() {
     Require(sceKernelReadv(file, reads, 2) == 3);
     Require(std::memcmp(first, "789", 3) == 0);
     Require(sceKernelReadv(file, reads, 2) == 0);
+    Require(sceKernelLseek(file, 0, 0) == 0);
+    Require(readv_nid_postfix(file, reads, 2) == 7);
+    Require(std::memcmp(first, "012", 3) == 0 && std::memcmp(second, "3456", 4) == 0);
+    Require(sceKernelLseek(file, 0, 1) == 7);
+    Require(readv_nid_postfix(file, reads, 2) == 3);
+    Require(readv_nid_postfix(file, reads, 2) == 0);
+    Require(readv_nid_postfix(file, reads, -1) == -1 && *__error_nid_postfix() == 22);
+    Require(writev_nid_postfix(file, nullptr, 1) == -1 && *__error_nid_postfix() == 14);
 
     Require(sceKernelPreadv(file, reads, 2, 1) == 7);
     Require(std::memcmp(first, "123", 3) == 0 && std::memcmp(second, "4567", 4) == 0);
@@ -94,6 +108,11 @@ int main() {
     Require(sceKernelLseek(file, 8, 0) == 8);
     Require(sceKernelWritev(file, writes, 2) == 5);
     Require(sceKernelLseek(file, 0, 1) == 13);
+    Require(Contents(path) == "01ABCDE7ABCDE");
+    GuestIovec swapped[2] = {{cde, 3}, {ab, 2}};
+    Require(sceKernelLseek(file, 8, 0) == 8 && writev_nid_postfix(file, swapped, 2) == 5);
+    Require(sceKernelLseek(file, 0, 1) == 13 && Contents(path) == "01ABCDE7CDEAB");
+    Require(sceKernelLseek(file, 8, 0) == 8 && writev_nid_postfix(file, writes, 2) == 5);
     Require(Contents(path) == "01ABCDE7ABCDE");
 
     GuestIovec gapped[3] = {{first, 2}, {nullptr, 0}, {second, 3}};
@@ -122,6 +141,30 @@ int main() {
     Require(sceKernelPreadv(file, reads, 2, -1) == ErrorEinval);
     Require(sceKernelPwritev(file, writes, 2, -1) == ErrorEinval);
     Require(Contents(path) == "01ABCDE7ABCDE");
+
+    Require(sceKernelLseek(file, 4, 0) == 4);
+    Require(preadv_nid_postfix(file, reads, 2, 1) == 7);
+    Require(std::memcmp(first, "1AB", 3) == 0 && std::memcmp(second, "CDE7", 4) == 0);
+    Require(sceKernelLseek(file, 0, 1) == 4);
+    Require(preadv_nid_postfix(file, reads, 2, 13) == 0);
+    Require(preadv_nid_postfix(file, reads, 2, -1) == -1 && *__error_nid_postfix() == 22);
+    Require(preadv_nid_postfix(file, reads, -1, 0) == -1 && *__error_nid_postfix() == 22);
+    Require(preadv_nid_postfix(file, nullptr, 1, 0) == -1 && *__error_nid_postfix() == 14);
+    Require(pwritev_nid_postfix(file, writes, 2, 8) == 5);
+    Require(sceKernelLseek(file, 0, 1) == 4);
+    Require(Contents(path) == "01ABCDE7ABCDE");
+    char x[] = "X";
+    char y[] = "Y";
+    GuestIovec marks[2] = {{x, 1}, {y, 1}};
+    Require(pwritev_nid_postfix(file, marks, 2, 0) == 2);
+    Require(Contents(path) == "XYABCDE7ABCDE");
+    char zero[] = "0";
+    char one[] = "1";
+    GuestIovec restore[2] = {{zero, 1}, {one, 1}};
+    Require(pwritev_nid_postfix(file, restore, 2, 0) == 2);
+    Require(sceKernelLseek(file, 0, 1) == 4);
+    Require(pwritev_nid_postfix(file, writes, 2, -1) == -1 && *__error_nid_postfix() == 22);
+    Require(pwritev_nid_postfix(file, nullptr, 1, 0) == -1 && *__error_nid_postfix() == 14);
 
     char byte = 0;
     Require(sceKernelPread(file, &byte, 1, 2) == 1 && byte == 'A');

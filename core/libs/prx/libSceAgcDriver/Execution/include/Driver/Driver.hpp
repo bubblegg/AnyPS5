@@ -63,6 +63,7 @@ public:
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
+    DrawEntryCounters DrawCacheCounters();
 
 private:
     friend class SampledReadScope;
@@ -77,6 +78,10 @@ private:
     static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget);
     static void readRegisterLists(Submission& submission);
     void waitForFlipRoom(const Submission& submission);
+    void holdFlipBehindWorker(const Submission& submission);
+    bool awaitsTitle(std::uint64_t awaited) const;
+    void noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited);
+    void releaseFlipHold();
     void reserveOutputs(Submission& submission);
     void executeRewindTail(const Submission& stalled);
     void enqueue(Submission submission);
@@ -109,6 +114,7 @@ private:
     static std::size_t drawCacheEntries();
     void accountDrawVariant(const DispatchVariant& variant, bool added);
     void insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode);
+    void eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& expected);
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
@@ -338,6 +344,9 @@ private:
     std::atomic<std::uint32_t> orderHolders{0};
     std::atomic<std::uint32_t> runningWorkers{0};
     std::atomic<std::uint64_t> queue0Awaited{0};
+    std::atomic<std::uint32_t> flipsAhead{0};
+    std::atomic<std::uint32_t> flipHolders{0};
+    std::atomic<bool> queue0AwaitsTitle{false};
 
     std::atomic<std::uint64_t> evidenceReads{0};
     std::atomic<std::uint64_t> evidenceValidations{0};

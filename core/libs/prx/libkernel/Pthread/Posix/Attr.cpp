@@ -10,6 +10,7 @@ int APS5_VABI scePthreadAttrInit(PthreadAttr* attr);
 int APS5_VABI scePthreadAttrDestroy(PthreadAttr* attr);
 int APS5_VABI scePthreadAttrSetstacksize(PthreadAttr* attr, std::size_t stacksize);
 int APS5_VABI scePthreadAttrSetstack(PthreadAttr* attr, void* addr, std::size_t size);
+int APS5_VABI scePthreadAttrSetsolosched(PthreadAttr* attr, int solosched);
 }
 
 static bool Valid(const PthreadAttr* attr) {
@@ -31,6 +32,7 @@ int APS5_VABI pthread_attr_get_np_nid_postfix(Pthread thread, PthreadAttr* attr)
     p->_detachstate = thread->_detached ? 1 : 0;
     p->_schedpriority = thread->priority.load(std::memory_order_relaxed);
     p->_affinity = thread->affinity.load(std::memory_order_relaxed);
+    p->_affinityExplicit = true;
     return 0;
 }
 
@@ -116,9 +118,9 @@ int APS5_VABI pthread_attr_setstack_nid_postfix(PthreadAttr* attr, void* stack_a
     return PosixThread::ToErrno(scePthreadAttrSetstack(attr, stack_addr, stack_size));
 }
 
-int APS5_VABI pthread_attr_setsolosched_np_nid_postfix() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI pthread_attr_setsolosched_np_nid_postfix(PthreadAttr* attr, int solosched) {
+    if (!Valid(attr)) return PosixThread::GUEST_EINVAL;
+    return PosixThread::ToErrno(scePthreadAttrSetsolosched(attr, solosched));
 }
 
 }

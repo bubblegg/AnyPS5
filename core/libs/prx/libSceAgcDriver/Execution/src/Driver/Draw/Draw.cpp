@@ -81,6 +81,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             ++drawEntryCounters.absent;
         }
     }
+    if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        eraseDrawEntry(drawKey, entry);
+        ++drawEntryCounters.absent;
+        entry = nullptr;
+        decode = nullptr;
+    }
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
@@ -123,7 +130,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
-        memory.insert(memory.end(), program.memory.begin(), program.memory.end());
+        for (const auto& region : program.memory) {
+            if (!region.bytes.empty()) memory.push_back(region);
+        }
         linked.push_back({roles[i], program.binary, program.userDataBase, program.firstUserSgpr, program.userData});
     }
     timing.Mark("prepare");
@@ -187,6 +196,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
+        pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
         pushOffsets[i] = pushCursorBytes;
         if (drawHit) {
 
@@ -204,7 +214,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         } else if (i == 0) {
             fold(result, drawParameters);
         }
-        require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
+        const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
+        require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }

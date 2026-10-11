@@ -1,4 +1,5 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -511,12 +512,28 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
 #endif
         }
     });
+    if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(addr, len);
     return true;
 }
 
+#if defined(__linux__)
+bool ArenaAvailable() { return GuestArena::GuestArenaAvailable_nid_postfix(); }
+
+void* ArenaCommit(void* addr, size_t len, int prot) {
+    return mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+}
+
+void ArenaForget(void* addr, size_t len) {
+    if (GuestArena::GuestArenaContains_nid_postfix(addr, len)) GuestArena::GuestArenaRelease_nid_postfix(addr, len);
+}
+#endif
+
 void Unmap(void* addr, size_t len) {
 #if defined(__linux__)
-    if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+    if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
+        GuestArena::GuestArenaReset_nid_postfix(addr, len);
+    else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+    ArenaForget(addr, len);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(addr, len);
 #else
     if (KernelArena::Get().Contains(addr, len)) munmap(addr, len);
@@ -565,6 +582,14 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
         }
 #endif
 #if defined(__linux__)
+        if (ArenaAvailable() && !GuestArena::GuestArenaContains_nid_postfix(addr, len))
+            throw std::invalid_argument("fixed mapping is outside the guest address space arena");
+        if (ArenaAvailable()) {
+            GuestArena::GuestArenaMarkUsed_nid_postfix(addr, len);
+            if (void* placed = ArenaCommit(addr, len, prot); placed != MAP_FAILED) return placed;
+            GuestArena::GuestArenaRelease_nid_postfix(addr, len);
+            throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
+        }
         const int placement = (flags & GuestMapNoOverwrite) != 0 ? MAP_FIXED_NOREPLACE : MAP_FIXED;
 #else
         const int placement = MAP_FIXED;
@@ -578,6 +603,13 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
     if (addr) {
 #if defined(__linux__)
+        if (ArenaAvailable()) {
+            void* placed = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(
+                reinterpret_cast<std::uintptr_t>(addr), len, alignment);
+            if (void* committed = ArenaCommit(placed, len, prot); committed != MAP_FAILED) return committed;
+            ArenaForget(placed, len);
+            throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
+        }
         return MapAtOrAbove(reinterpret_cast<std::uintptr_t>(addr), len, prot, alignment);
 #else
         return mmap_aligned(len, prot, alignment, reinterpret_cast<std::uintptr_t>(addr));
@@ -585,6 +617,14 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
 #ifdef _WIN32
     return mmap_aligned(len, prot, alignment);
+#endif
+#if defined(__linux__)
+    if (ArenaAvailable()) {
+        void* placed = GuestArena::GuestArenaAllocate_nid_postfix(len, alignment);
+        if (void* committed = ArenaCommit(placed, len, prot); committed != MAP_FAILED) return committed;
+        ArenaForget(placed, len);
+        throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
+    }
 #endif
     if (len > std::numeric_limits<size_t>::max() - alignment) {
         throw std::overflow_error("Aligned mapping size overflow");
@@ -724,6 +764,11 @@ bool FixedNoOverwriteConflict(const GuestAllocations::Mutation& mutation, void* 
     return mutation.Overlaps(addr, len) && !Reserved(addr, len);
 }
 
+int PlaceHintInReservation(void* addr, size_t len, int flags) {
+    if (addr == nullptr || (flags & GuestMapFixedFlag) != 0 || !Reserved(addr, len)) return flags;
+    return flags | GuestMapFixedFlag;
+}
+
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
@@ -731,6 +776,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         return SCE_KERNEL_ERROR_EINVAL;
     }
     GuestAllocations::Mutation mutation;
+    flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
         EraseReservations(*addr, len);
@@ -744,6 +790,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     try {
         AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), LinuxProtFromSce(prot));
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
+        if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(mapped, len);
     } catch (...) {
         EraseMappings(reinterpret_cast<std::uintptr_t>(mapped), reinterpret_cast<std::uintptr_t>(mapped) + len);
         Unmap(mapped, len);
@@ -760,6 +807,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
+    flags = PlaceHintInReservation(*addr, len, flags);
     if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
         EraseReservations(*addr, len);
@@ -770,6 +818,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
+        if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(mapped, len);
     } catch (...) {
         Unmap(mapped, len);
         throw;
@@ -810,6 +859,20 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     const auto bytes = static_cast<std::size_t>(end - first);
     const auto* pointer = reinterpret_cast<const void*>(first);
     const auto nativeProtection = LinuxProtFromSce(prot);
+    std::uintptr_t stackStart = 0;
+    std::uintptr_t stackEnd = 0;
+    if ((prot & GuestProtGpuReadWrite) == 0 && GuestThreadStack(address, &stackStart, &stackEnd) && address >= stackStart && address + len <= stackEnd) {
+        constexpr std::uintptr_t hostPageMask = 0xfff;
+        const auto inside = std::max(first, (stackStart + hostPageMask) & ~hostPageMask);
+        const auto insideEnd = std::min(end, stackEnd & ~hostPageMask);
+        if (inside >= insideEnd) return 0;
+        auto* insidePointer = reinterpret_cast<void*>(inside);
+        const auto insideBytes = static_cast<std::size_t>(insideEnd - inside);
+        if (mprotect(insidePointer, insideBytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
+        NoteGuestStackProtection(inside, insideBytes, (prot & 3) == 3);
+        RecordProtection(insidePointer, insideBytes, prot);
+        return 0;
+    }
     GuestAllocations::Mutation mutation;
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION memory{};
@@ -880,7 +943,7 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     }
     if (fixed) mutation.RequireAvailable(*addr, len);
     constexpr int GuestMapNoCoalesce = 0x400000;
-    void* mapped = MapAligned(fixed ? *addr : nullptr, len, PROT_NONE, fixed ? GuestMapFixedFlag | (flags & GuestMapNoCoalesce) : 0, alignment);
+    void* mapped = MapAligned(*addr, len, PROT_NONE, fixed ? GuestMapFixedFlag | (flags & GuestMapNoCoalesce) : 0, alignment);
     try {
         mutation.Add(mapped, len, false, false, false);
     } catch (...) {
