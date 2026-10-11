@@ -1,5 +1,6 @@
 #include <bit>
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
@@ -118,9 +119,19 @@ public:
     }
 
     void WaitForFlipRoom() override {
+        // How many flips a title may have submitted and not yet seen presented before its next
+        // submission waits. The console's queue holds 16, but there the GPU renders a frame as it is
+        // submitted; here the frames wait to be executed, and a title that releases a render target a
+        // few frames after its last use (Unity) frees memory the driver still writes when it gets to
+        // those frames (DCC keys, write-backs). APS5_FLIP_LEAD sets it (1-16); the default is 2.
+        static const std::size_t lead = [] {
+            const char* text = std::getenv("APS5_FLIP_LEAD");
+            const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 2ull;
+            return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1, VIDEO_OUT_FLIP_QUEUE_CAPACITY));
+        }();
         std::unique_lock queueLock(queue->mutex);
         const bool room = queue->changed.wait_for(queueLock, std::chrono::seconds(60), [&] {
-            return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY;
+            return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < lead;
         });
         if (queue->failure) std::rethrow_exception(queue->failure);
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
