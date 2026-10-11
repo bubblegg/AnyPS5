@@ -256,7 +256,7 @@ void Driver::execute(const Submission& submission) {
                 const auto localDevice = device.Load();
 
                 if (localDevice != nullptr) localDevice->DepthSurfacesAtFlip();
-                static const bool profileDrawKeys = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                static const bool profileDrawKeys = std::getenv("APS5_PROFILE_DRAW_KEYS") != nullptr;
                 if (profileDrawKeys) DrawKeysAtFlip();
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);

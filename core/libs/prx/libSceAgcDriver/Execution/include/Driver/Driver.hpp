@@ -41,7 +41,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-// Profiling aid (APS5_PROFILE_DRAW): notes a draw's register key, and at each flip reports now and
+// Profiling aid (APS5_PROFILE_DRAW_KEYS): notes a draw's register key, and at each flip reports now and
 // then how many draw keys repeat from one frame to the next (DrawRegisterKey.cpp).
 void NoteDrawKeyRepeat(const QueueState& queue, std::uint64_t drawKey);
 void DrawKeysAtFlip();

@@ -10,6 +10,7 @@
 //  - a quarantined block's fill was written before it left the quarantine (a use after free).
 // The block's address is malloc's own, so the C++ runtime library may free it as usual; a block
 // without the signature (allocated elsewhere, or overrun past the whole tail) is freed unchecked.
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +18,8 @@
 #include <cstring>
 #include <malloc.h>
 #include <new>
+#include <windows.h>
+#include <x86intrin.h>
 
 extern "C" char __ImageBase;
 
@@ -115,9 +118,59 @@ void quarantineBlock(unsigned char* block, std::size_t size) {
     if (!kept) releaseQuarantined(block);
 }
 
+// Profiling aid: APS5_PROFILE_ALLOC=1 counts this library's allocations by size (powers of two) and
+// the cycles malloc took, and prints them every 2^21 allocations.
+bool allocProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_ALLOC") != nullptr;
+    return enabled;
+}
+
+struct AllocProfile {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> cycles{0};
+    std::atomic<std::uint64_t> bytes{0};
+    std::array<std::atomic<std::uint64_t>, 24> bySize{};
+    std::array<std::atomic<std::uint64_t>, 24> cyclesBySize{};
+    std::atomic<long long> startedAt{0};
+};
+
+AllocProfile& allocProfile() {
+    static auto* profile = static_cast<AllocProfile*>(std::calloc(1, sizeof(AllocProfile)));
+    return *profile;
+}
+
+void noteAllocation(std::size_t size, std::uint64_t cycles) {
+    auto& p = allocProfile();
+    std::size_t bucket = 0;
+    while (bucket + 1 < p.bySize.size() && (std::size_t{1} << (bucket + 4)) < size) ++bucket;
+    p.bySize[bucket].fetch_add(1, std::memory_order_relaxed);
+    p.cyclesBySize[bucket].fetch_add(cycles, std::memory_order_relaxed);
+    p.cycles.fetch_add(cycles, std::memory_order_relaxed);
+    p.bytes.fetch_add(size, std::memory_order_relaxed);
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    long long expected = 0;
+    p.startedAt.compare_exchange_strong(expected, now.QuadPart);
+    const auto count = p.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((count & ((std::uint64_t{1} << 21u) - 1u)) != 0) return;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const double seconds = static_cast<double>(now.QuadPart - p.startedAt.exchange(now.QuadPart)) / static_cast<double>(frequency.QuadPart);
+    const auto total = p.cycles.exchange(0);
+    std::fprintf(stderr, "[alloc] %llu allocations by this library in %.1f s (%.0f per s), %.1f MiB, malloc %.0f cycles each on average; by size (<= bytes: count, mean cycles):", static_cast<unsigned long long>(std::uint64_t{1} << 21u), seconds, static_cast<double>(std::uint64_t{1} << 21u) / seconds, static_cast<double>(p.bytes.exchange(0)) / 1048576.0, static_cast<double>(total) / static_cast<double>(std::uint64_t{1} << 21u));
+    for (std::size_t i = 0; i < p.bySize.size(); ++i) {
+        const auto n = p.bySize[i].exchange(0);
+        const auto c = p.cyclesBySize[i].exchange(0);
+        if (n != 0) std::fprintf(stderr, " %llu: %llu, %.0f", static_cast<unsigned long long>(std::uint64_t{1} << (i + 4)), static_cast<unsigned long long>(n), static_cast<double>(c) / static_cast<double>(n));
+    }
+    std::fprintf(stderr, "\n");
+}
+
 void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
     const bool guard = guardEnabled();
+    const auto started = allocProfiled() ? __rdtsc() : 0ull;
     auto* block = static_cast<unsigned char*>(std::malloc(guard ? size + TailBytes : size != 0 ? size : 1));
+    if (allocProfiled()) noteAllocation(size, __rdtsc() - started);
     if (block == nullptr) {
         if (nothrow) return nullptr;
         throw std::bad_alloc();

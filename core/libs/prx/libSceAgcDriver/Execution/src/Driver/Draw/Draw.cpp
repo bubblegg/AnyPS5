@@ -81,7 +81,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             ++drawEntryCounters.absent;
         }
     }
-    if (profile && registerKey) NoteDrawKeyRepeat(queue, drawKey);
+    static const bool profileKeys = std::getenv("APS5_PROFILE_DRAW_KEYS") != nullptr;
+    if (profileKeys && registerKey) NoteDrawKeyRepeat(queue, drawKey);
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         std::lock_guard cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);

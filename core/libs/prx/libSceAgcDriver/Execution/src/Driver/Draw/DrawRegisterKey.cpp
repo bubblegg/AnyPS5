@@ -119,7 +119,7 @@ void Driver::keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const
 
 namespace {
 
-// Profiling aid (APS5_PROFILE_DRAW): whether the draws of a frame repeat those of the frame before,
+// Profiling aid (APS5_PROFILE_DRAW_KEYS): whether the draws of a frame repeat those of the frame before,
 // by the whole register key and by the key without the user data words (the "shape"), and which
 // user words differ between the n-th draws of the same shape in two frames. Read at each flip.
 struct KeyRepeats {
