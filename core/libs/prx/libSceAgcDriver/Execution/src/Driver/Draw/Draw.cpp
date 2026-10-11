@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -9,6 +10,34 @@
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+// The rest of a draw after its decode, run on the queue worker or on a helper thread.
+struct DrawTail {
+    QueueState* queue = nullptr;
+    std::uint32_t queueId = 0;
+    std::uint32_t packetOpcode = 0;
+    std::span<const std::uint32_t> packet;
+    const Submission* submission = nullptr;
+    std::string* rejected = nullptr;
+    Pm4::DrawParameters drawParameters;
+    bool pipelined = false;
+    bool traceIndirect = false;
+    std::unique_lock<GuestMemory::GpuMutexType>* gpuLock = nullptr;
+    std::shared_ptr<VulkanDevice> localDevice;
+    bool useDrawEntries = false;
+    bool registerKey = false;
+    std::uint64_t drawKey = 0;
+    std::uint64_t shapeKey = 0;
+    std::shared_ptr<DrawEntry> entry;
+    std::shared_ptr<const DrawDecode> decode;
+    std::vector<DrawProgram> programs;
+    std::array<double, DrawDriverPhaseCount>* phaseMs = nullptr;
+    std::chrono::steady_clock::time_point* phaseLap = nullptr;
+    std::uint64_t* captures = nullptr;
+    bool helper = false;
+    bool published = false;
+    std::shared_ptr<DrawPipeline::PendingDraw> pending;
+};
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -116,6 +145,92 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
     const std::vector<Role>& roles = decode->roles;
     phaseTiming.Phase(DrawRowDecode);
+
+    DrawTail tail;
+    tail.queue = &queue;
+    tail.queueId = submission.queue;
+    tail.packetOpcode = (packet[0] >> 8u) & 0xffu;
+    tail.packet = packet;
+    tail.submission = &submission;
+    tail.rejected = &rejected;
+    tail.drawParameters = drawParameters;
+    tail.pipelined = pipelined;
+    tail.traceIndirect = traceIndirect;
+    tail.gpuLock = &gpuLock;
+    tail.localDevice = std::move(localDevice);
+    tail.useDrawEntries = useDrawEntries;
+    tail.registerKey = registerKey;
+    tail.drawKey = drawKey;
+    tail.shapeKey = shapeKey;
+    tail.entry = std::move(entry);
+    tail.decode = std::move(decode);
+    tail.programs = std::move(programs);
+    tail.phaseMs = &phaseMs;
+    tail.phaseLap = &phaseLap;
+    tail.captures = &captures;
+    // APS5_PARALLEL_DRAWS=<n>: the rest of the draw (lookup, capture, recompile) runs on one of n
+    // helper threads while this worker goes on with the next packets; the draw's place in the commit
+    // order is taken here. The rest reads no registers: the helper is given an empty register set.
+    if (DrawPipeline::Helpers() != 0 && pipelined && !tail.drawParameters.indirect && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && deferredLabels().labels.empty()) {
+        auto shared = std::make_shared<DrawTail>(std::move(tail));
+        shared->helper = true;
+        shared->pending = std::make_shared<DrawPipeline::PendingDraw>();
+        auto& pipeline = DrawPipeline::Queue0();
+        const auto seq = pipeline.EnqueuePending(shared->pending);
+        const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        pipeline.RunOnHelper([this, shared, seq, epoch] { runDrawTailOnHelper(*shared, seq, epoch); });
+        phaseTiming.Phase(DrawRowLockWait);
+        return drawn();
+    }
+    return drawTail(tail);
+}
+
+DrawVerdict Driver::drawTail(DrawTail& t) {
+    PerformanceTimer timing("Driver.DrawTail");
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& phaseMs = *t.phaseMs;
+    auto& phaseLap = *t.phaseLap;
+    auto& captures = *t.captures;
+    DrawPhaseTiming phaseTiming{profile, phaseMs, phaseLap};
+    const auto drawn = [&] {
+        phaseTiming.Phase(DrawRowVectors);
+        if (!profile || t.helper) return DrawVerdict::Drawn;
+        auto& pending = pendingDrawPhases();
+        pending.phases = true;
+        pending.captures = captures;
+        pending.ms = phaseMs;
+        pending.tailAt = phaseLap;
+        return DrawVerdict::Drawn;
+    };
+    using Stage = ShaderRecompiler::ShaderStage;
+    using Role = ShaderRecompiler::ProgramRole;
+    static const std::uint64_t dumpTarget = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SHADERS"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    auto& queue = *t.queue;
+    const auto& submission = *t.submission;
+    auto& rejected = *t.rejected;
+    auto& drawParameters = t.drawParameters;
+    const bool pipelined = t.pipelined;
+    const bool traceIndirect = t.traceIndirect;
+    auto& gpuLock = *t.gpuLock;
+    auto& localDevice = t.localDevice;
+    const bool useDrawEntries = t.useDrawEntries;
+    const bool registerKey = t.registerKey;
+    auto& drawKey = t.drawKey;
+    const auto shapeKey = t.shapeKey;
+    auto& entry = t.entry;
+    auto& decode = t.decode;
+    auto& programs = t.programs;
+    const auto& graphics = decode->state;
+    const auto& pixel = decode->pixel;
+    const std::vector<Role>& roles = decode->roles;
+    const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
+        if (!graphics.stages.mesh) return;
+        auto& words = programs.front().userData;
+        require(programs.front().firstUserSgpr == 0 && words.size() >= ShaderRecompiler::MeshIndexBufferUserWord + 4, "mesh program lacks the hidden user words");
+        const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters);
+        std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
+    };
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
         if (location == 0x280u) return std::nullopt;
@@ -242,7 +357,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     if (pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
-    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    if (!t.helper && recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, t.packet, submission, rejected);
 
     bool rectListBuilt = false;
 
@@ -388,11 +503,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return DrawVerdict::Rejected;
         }
     }
-    if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
+    if (t.helper || (pipelined && !drawParameters.indirect && deferredLabels().labels.empty())) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
-        const auto commitPacket = (packet[0] >> 8u) & 0xffu;
+        const auto commitPacket = t.packetOpcode;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry)] {
             DrawPipeline::FollowEpoch(epoch);
@@ -400,7 +515,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+        if (t.helper) {
+            DrawPipeline::Queue0().Publish(t.pending, [held] { (*held)(); }, std::move(writes));
+            t.published = true;
+        } else {
+            DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+        }
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -424,6 +544,43 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
+
+void Driver::runDrawTailOnHelper(DrawTail& tail, std::uint64_t seq, std::uint64_t epoch) {
+    DrawPipeline::Active() = true;
+    DrawPipeline::CurrentSeq() = seq;
+    DrawPipeline::FollowEpoch(epoch);
+    GuestMemory::SetCurrentPacket(tail.packetOpcode, tail.queueId);
+    thread_local Submission* scratchSlot = nullptr;
+    auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+    scratch.queue = tail.queueId;
+    thread_local QueueState* queueSlot = nullptr;
+    tail.queue = &ShaderRecompiler::ThreadOwned(queueSlot);
+    tail.submission = &scratch;
+    std::string rejected;
+    tail.rejected = &rejected;
+    std::array<double, DrawDriverPhaseCount> phaseMs{};
+    auto phaseLap = std::chrono::steady_clock::now();
+    std::uint64_t captures = 0;
+    tail.phaseMs = &phaseMs;
+    tail.phaseLap = &phaseLap;
+    tail.captures = &captures;
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    tail.gpuLock = &gpuLock;
+    // The draw is published whatever happens, so the commits after it are not held up; a draw that
+    // cannot run is skipped and reported once per reason, as on the worker.
+    try {
+        drawTail(tail);
+        if (!rejected.empty()) reportSkip("draw", rejected + " [prepared on a helper]");
+    } catch (const ProcessShutdown&) {
+    } catch (const std::exception& error) {
+        reportSkip("draw", std::string(error.what()) + " [prepared on a helper]");
+    } catch (...) {
+    }
+    if (gpuLock.owns_lock()) gpuLock.unlock();
+    if (!tail.published) DrawPipeline::Queue0().Publish(tail.pending, {}, {});
+    DrawPipeline::CurrentSeq() = 0;
+}
+
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
