@@ -10,6 +10,7 @@
 //  - a quarantined block's fill was written before it left the quarantine (a use after free).
 // The block's address is malloc's own, so the C++ runtime library may free it as usual; a block
 // without the signature (allocated elsewhere, or overrun past the whole tail) is freed unchecked.
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -166,9 +167,92 @@ void noteAllocation(std::size_t size, std::uint64_t cycles) {
     std::fprintf(stderr, "\n");
 }
 
+// A per-thread cache of small freed blocks. The draw path makes hundreds of small allocations per
+// draw (millions a second), and malloc plus free cost it about a quarter of its time. Every block in
+// the cache is a whole malloc block of at least its class size (its size is read with _msize when it
+// is cached), so a block handed out from the cache may still be freed by anyone with free(), as the
+// C++ runtime library does with some blocks this library allocates. Off under APS5_GUARD_NEW and
+// with APS5_NO_ALLOC_CACHE.
+struct SmallCache {
+    static constexpr std::size_t Classes = 32;
+    static constexpr std::size_t Granule = 16;
+    static constexpr std::uint32_t Depth = 256;
+    void* heads[Classes];
+    std::uint32_t counts[Classes];
+};
+
+void WINAPI flushSmallCache(void* data) {
+    auto* cache = static_cast<SmallCache*>(data);
+    if (cache == nullptr) return;
+    for (std::size_t c = 0; c < SmallCache::Classes; ++c) {
+        while (cache->heads[c] != nullptr) {
+            void* block = cache->heads[c];
+            std::memcpy(&cache->heads[c], block, sizeof(void*));
+            std::free(block);
+        }
+    }
+    std::free(cache);
+}
+
+bool smallCacheEnabled() {
+    static const bool enabled = !guardEnabled() && std::getenv("APS5_NO_ALLOC_CACHE") == nullptr;
+    return enabled;
+}
+
+DWORD smallCacheSlot() {
+    static const DWORD slot = FlsAlloc(&flushSmallCache);
+    return slot;
+}
+
+SmallCache* smallCache(bool create) {
+    const DWORD slot = smallCacheSlot();
+    if (slot == FLS_OUT_OF_INDEXES) return nullptr;
+    auto* cache = static_cast<SmallCache*>(FlsGetValue(slot));
+    if (cache == nullptr && create) {
+        cache = static_cast<SmallCache*>(std::calloc(1, sizeof(SmallCache)));
+        if (cache != nullptr && !FlsSetValue(slot, cache)) {
+            std::free(cache);
+            cache = nullptr;
+        }
+    }
+    return cache;
+}
+
+void* takeCached(std::size_t size) {
+    if (size > SmallCache::Classes * SmallCache::Granule) return nullptr;
+    auto* cache = smallCache(false);
+    const std::size_t c = (size != 0 ? size - 1 : 0) / SmallCache::Granule;
+    if (cache == nullptr || cache->heads[c] == nullptr) return nullptr;
+    void* block = cache->heads[c];
+    std::memcpy(&cache->heads[c], block, sizeof(void*));
+    --cache->counts[c];
+    return block;
+}
+
+// Keeps a freed block in the cache of the class it fully holds; false if it does not fit there.
+bool keepCached(void* block) {
+    const std::size_t capacity = _msize(block);
+    if (capacity < SmallCache::Granule || capacity > SmallCache::Classes * SmallCache::Granule) return false;
+    const std::size_t c = capacity / SmallCache::Granule - 1;
+    auto* cache = smallCache(true);
+    if (cache == nullptr || cache->counts[c] >= SmallCache::Depth) return false;
+    std::memcpy(block, &cache->heads[c], sizeof(void*));
+    cache->heads[c] = block;
+    ++cache->counts[c];
+    return true;
+}
+
 void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
     const bool guard = guardEnabled();
     const auto started = allocProfiled() ? __rdtsc() : 0ull;
+    if (smallCacheEnabled()) {
+        if (void* cached = takeCached(size)) {
+            if (allocProfiled()) noteAllocation(size, __rdtsc() - started);
+            return cached;
+        }
+        // A miss allocates the whole class, so the block is reused for any size of its class.
+        if (size <= SmallCache::Classes * SmallCache::Granule) size = std::max<std::size_t>((size + SmallCache::Granule - 1) / SmallCache::Granule * SmallCache::Granule, SmallCache::Granule);
+    }
     auto* block = static_cast<unsigned char*>(std::malloc(guard ? size + TailBytes : size != 0 ? size : 1));
     if (allocProfiled()) noteAllocation(size, __rdtsc() - started);
     if (block == nullptr) {
@@ -187,6 +271,7 @@ void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
 void guardedFree(void* pointer, void* site, std::size_t deleting) noexcept {
     if (pointer == nullptr) return;
     if (!guardEnabled()) {
+        if (smallCacheEnabled() && keepCached(pointer)) return;
         std::free(pointer);
         return;
     }
