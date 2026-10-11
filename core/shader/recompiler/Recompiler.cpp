@@ -670,7 +670,10 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     return entry->module;
 }
 
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+// `recycled`, when given, is a result nobody else holds any more: its bindings, push constants and
+// vertex attributes are taken over and overwritten, which saves the dozens of small allocations a
+// result of the same shader would make for them.
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, RecompileResult* recycled = nullptr) {
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -704,6 +707,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (request.context.pixel) {
         for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
+    }
+    if (recycled != nullptr) {
+        result.vertexAttributes = std::move(recycled->vertexAttributes);
+        result.vertexAttributes.clear();
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
@@ -780,6 +787,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.spirv = artifact.spirv;
     }
     BindingAllocationResult bindings;
+    if (recycled != nullptr) {
+        bindings.bindings = std::move(recycled->bindings);
+        bindings.pushConstants = std::move(recycled->pushConstants);
+    }
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
@@ -957,6 +968,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     const auto hash = snapshotHash(request, snapshot);
     std::uint64_t index = 0;
     auto& counters = resultMemoCounters();
+    std::shared_ptr<const RecompileResult> recycled;
     {
         std::lock_guard lock(source.mutex);
         index = (variant->artifact.variantId * 0x9e3779b97f4a7c15ull) ^ hash;
@@ -968,9 +980,22 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             reportResultMemo();
             return found->second->result;
         }
+        // A full memo gives up its oldest entry now instead of after the insert below. If nobody
+        // else holds that result (copies are only handed out under this mutex), its storage serves
+        // the new one: draws whose buffers move every frame miss every time, and each miss built
+        // and freed a whole result.
+        if (source.memo.size() >= ResultMemoEntries) {
+            auto& last = source.memo.back();
+            const auto lastIndex = source.memoIndex.find((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
+            if (lastIndex != source.memoIndex.end() && lastIndex->second == std::prev(source.memo.end())) source.memoIndex.erase(lastIndex);
+            if (last.result.use_count() == 1) recycled = std::move(last.result);
+            source.memo.pop_back();
+            counters.evictions.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, const_cast<RecompileResult*>(recycled.get())));
+    recycled.reset();
     result->cacheHit = cacheHit;
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);

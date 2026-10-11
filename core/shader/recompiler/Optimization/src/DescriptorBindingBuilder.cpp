@@ -98,8 +98,9 @@ DescriptorImageShape ImageShapeForResource(const ImageResource& image) {
     fail("DescriptorBindingBuilder::Populate image resource dimension has no descriptor image shape");
 }
 
-std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
-    std::vector<std::uint32_t> result;
+// Both fill `result` in place, so a reused binding keeps its storage.
+void GuestBuffersDescriptor(std::vector<std::uint32_t>& result, const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
+    result.clear();
     result.reserve(resources.size() * 4u);
     for (const std::uint32_t r : resources) {
         if (r >= snapshot.buffers.size()) {
@@ -113,11 +114,10 @@ std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_
             result.push_back(value.dwords[dword]);
         }
     }
-    return result;
 }
 
-std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
-    std::vector<std::uint32_t> result;
+void GuestSamplersDescriptor(std::vector<std::uint32_t>& result, const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
+    result.clear();
     std::uint32_t dwordCount = 0;
     for (std::size_t i = 0; i < resources.size(); i++) {
         const std::uint32_t r = resources[i];
@@ -137,7 +137,6 @@ std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32
             result.push_back(value.dwords[dword]);
         }
     }
-    return result;
 }
 
 constexpr std::uint32_t ForceUnnormalizedBit = 1u << 15u;
@@ -477,15 +476,19 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
     const auto& layout = compiled.layout;
     const bool needsShaderData = layout.UsesPushData() || plan.storageData;
     auto shaderData = needsShaderData ? ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads, plan.imageMetadata) : std::vector<std::uint32_t>{};
-    std::vector<DescriptorBinding> bindings;
-    bindings.reserve(plan.bindings.size());
+    // Written in place: the allocation may come with the bindings of an earlier result of the same
+    // plan (a recycled memo entry), and assigning over those reuses every vector they hold.
+    auto& bindings = allocation.bindings;
+    bindings.resize(plan.bindings.size());
     std::size_t writtenHere = 0;
     std::size_t readOnlyHere = 0;
+    std::size_t next = 0;
     for (const auto& entry : plan.bindings) {
-        auto physical = entry.descriptor;
+        auto& physical = bindings[next++];
+        physical = entry.descriptor;
         switch (physical.role) {
         case DescriptorRole::GuestBuffers:
-            physical.guestDescriptor = GuestBuffersDescriptor(entry.resources, snapshot);
+            GuestBuffersDescriptor(physical.guestDescriptor, entry.resources, snapshot);
             writtenHere += entry.writtenBuffers;
             readOnlyHere += entry.readOnlyBuffers;
             break;
@@ -500,7 +503,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             }
             break;
         case DescriptorRole::GuestSamplers:
-            physical.guestDescriptor = GuestSamplersDescriptor(entry.resources, snapshot);
+            GuestSamplersDescriptor(physical.guestDescriptor, entry.resources, snapshot);
             for (const auto element : entry.samplerFilterElements) {
                 auto& filter = physical.guestDescriptor.at(element * 4u + 2u);
                 filter = PointFilteredSamplerWord(physical.guestDescriptor.at(element * 4u), filter);
@@ -526,8 +529,6 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 fail("DescriptorBindingBuilder::Populate guest descriptor size is not a multiple of the binding count");
             }
         }
-
-        bindings.push_back(std::move(physical));
     }
 
     if (bufferWrittenTraceEnabled()) {
@@ -537,7 +538,6 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         const auto readOnly = bufferWrittenCounts.readOnly.fetch_add(readOnlyHere) + readOnlyHere;
         std::fprintf(stderr, "[bindings] guest buffer elements: %zu written, %zu read-only (total so far: %llu / %llu)\n", writtenHere, readOnlyHere, written, readOnly);
     }
-    allocation.bindings = std::move(bindings);
     allocation.pushConstants.clear();
     if (layout.UsesPushData()) {
         allocation.pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
