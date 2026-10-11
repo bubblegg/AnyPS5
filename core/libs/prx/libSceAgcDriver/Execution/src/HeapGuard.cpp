@@ -185,10 +185,11 @@ void noteAllocation(std::size_t size, std::uint64_t cycles) {
 // out is prefetched instead.
 //
 // The class of a freed block is the largest it fully holds. Its size comes from _msize, which reads
-// the heap's header of the block (another cold line, 9% of the preparing thread), or, with
-// APS5_SIZED_DELETE=1, from the size a sized delete names: the block holds at least that. The
-// second is not the default until APS5_VERIFY_SIZED_DELETE=1 has shown that no delete in this
-// library names more than its block holds (it compares the two and reports to stderr).
+// the heap's header of the block (another cold line, 9% of the preparing thread), or from the size
+// a sized delete names: the block holds at least that. APS5_VERIFY_SIZED_DELETE=1 compares the two
+// and reports a delete that names more than its block holds (none in 335 million deletes of a play
+// session on 2026-10-12; its shared counters slow the run down by a quarter). APS5_NO_SIZED_DELETE=1
+// asks _msize for every block again.
 struct Magazine {
     static constexpr std::uint32_t Blocks = 62;
     Magazine* next;
@@ -346,7 +347,7 @@ void* takeCached(std::size_t size) {
 }
 
 bool sizedDelete() {
-    static const bool enabled = std::getenv("APS5_SIZED_DELETE") != nullptr && std::getenv("APS5_VERIFY_SIZED_DELETE") == nullptr;
+    static const bool enabled = std::getenv("APS5_NO_SIZED_DELETE") == nullptr && std::getenv("APS5_VERIFY_SIZED_DELETE") == nullptr;
     return enabled;
 }
 
@@ -384,7 +385,10 @@ void checkSizedDelete(void* block, std::size_t capacity, std::size_t deleting, v
 // has no room. `deleting` is the size a sized delete named, or -1.
 bool keepCached(void* block, std::size_t deleting, void* site) {
     std::size_t capacity = 0;
-    if (deleting != static_cast<std::size_t>(-1) && sizedDelete()) {
+    // A size that is no whole number of granules says too little: the block may hold the granule
+    // it ends in (one of this library's does), so the heap is asked. Over the largest class it
+    // says enough: the block has no class.
+    if (deleting != static_cast<std::size_t>(-1) && sizedDelete() && (deleting > SmallCache::MaxBytes || (deleting >= SmallCache::Granule && deleting % SmallCache::Granule == 0))) {
         capacity = deleting;
     } else {
         capacity = _msize(block);
