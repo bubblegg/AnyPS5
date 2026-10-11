@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -91,12 +92,26 @@ std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, co
         if (profile) ++(cached != nullptr ? drawEntryCounters.shapeDecodeHits : drawEntryCounters.shapeDecodeMisses);
     }
     if (cached == nullptr) return nullptr;
-    // The register state and the pixel stage read no user data words, and the programs are decoded
-    // again from this draw's registers (their user data, and the registry's current snapshots).
-    auto decode = std::make_shared<DrawDecode>();
-    decode->state = cached->state;
-    decode->pixel = cached->pixel;
-    DecodeGraphicsPrograms(*decode, queue, *submission.shaders, false, true);
+    // The register state and the pixel stage read no user data words. The programs are those of the
+    // shape too (the key holds their snapshots, offsets and merged-stage pointers), so only their user
+    // data words are read again; a raw program rewritten since is decoded afresh.
+    std::shared_ptr<DrawDecode> decode;
+    if (DecodeProgramsCurrent(*cached, *submission.shaders)) {
+        decode = std::make_shared<DrawDecode>(*cached);
+        for (auto& program : decode->programs) {
+            if (program.userData.empty()) continue;
+            const auto found = queue.shader.find(program.userDataBase - 1);
+            const auto resources = found == queue.shader.end() ? 0u : found->second;
+            const auto count = std::min<std::size_t>(((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u), program.userData.size());
+            const auto first = program.userData.size() - count;
+            for (std::size_t i = 0; i < count; ++i) program.userData[first + i] = readUserData(queue.shader, program.userDataBase + static_cast<std::uint32_t>(i));
+        }
+    } else {
+        decode = std::make_shared<DrawDecode>();
+        decode->state = cached->state;
+        decode->pixel = cached->pixel;
+        DecodeGraphicsPrograms(*decode, queue, *submission.shaders, false, true);
+    }
     if (verify) {
         const auto fresh = decodeDraw(queue, submission);
         if (!sameDecode(*decode, *fresh)) {
