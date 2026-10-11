@@ -691,8 +691,26 @@ DccKeyProofCounts KeyProofCounts() {
 void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std::span<std::byte> bytes) {
     // Named for the [hooksync] attribution: the read goes through the flush hook.
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
-    if (keys == DccKeys::Uncompressed) GuestMemory::ReadCommitted(resource.baseAddress, bytes);
-    else FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, bytes);
+    if (keys != DccKeys::Uncompressed) {
+        FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, bytes);
+        return;
+    }
+    GuestMemory::ReadCommitted(resource.baseAddress, bytes);
+    // Mixed keys: part of the surface is fast-cleared and part holds texels. The cleared parts hold
+    // whatever was in memory (an HDR target shows it as blocks of noise), so each 256 bytes whose key
+    // is a clear code get that clear color and the rest stay as stored. The keys are taken in
+    // surface-memory order, one per 256 bytes. APS5_NO_MIXED_DCC_CLEAR=1 reads everything as stored.
+    static const bool mixedClear = std::getenv("APS5_NO_MIXED_DCC_CLEAR") == nullptr;
+    const auto count = bytes.size() / KeyBytes;
+    if (!mixedClear || resource.dccAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(resource.dccAddress), count)) return;
+    const auto* stored = reinterpret_cast<const std::uint8_t*>(resource.dccAddress);
+    if (AllKeysEqual(stored, count, 0xffu)) return;
+    const auto format = ResolveTextureFormat(resource.format);
+    for (std::size_t key = 0; key < count; ++key) {
+        const auto code = ByteKeys(stored[key]);
+        if (!IsDccClear(code)) continue;
+        FillDccClear(format, code, resource.dccAlphaOnMsb, bytes.subspan(key * KeyBytes, KeyBytes));
+    }
 }
 
 namespace {
