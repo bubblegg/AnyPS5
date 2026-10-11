@@ -87,7 +87,7 @@ std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, co
     std::shared_ptr<const DrawDecode> cached;
     {
         std::lock_guard cacheLock(drawCacheMutex);
-        if (const auto found = drawShapeDecodes.find(shapeKey); found != drawShapeDecodes.end()) cached = found->second;
+        if (const auto found = drawShapes.find(shapeKey); found != drawShapes.end()) cached = found->second.decode;
         if (profile) ++(cached != nullptr ? drawEntryCounters.shapeDecodeHits : drawEntryCounters.shapeDecodeMisses);
     }
     if (cached == nullptr) return nullptr;
@@ -113,8 +113,23 @@ std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, co
 void Driver::keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const DrawDecode>& decode) {
     constexpr std::size_t MaxShapes = 1u << 15u;
     std::lock_guard cacheLock(drawCacheMutex);
-    if (drawShapeDecodes.size() >= MaxShapes && !drawShapeDecodes.contains(shapeKey)) drawShapeDecodes.clear();
-    drawShapeDecodes[shapeKey] = decode;
+    if (drawShapes.size() >= MaxShapes && !drawShapes.contains(shapeKey)) drawShapes.clear();
+    drawShapes[shapeKey].decode = decode;
+}
+
+bool Driver::keepDrawEntry(std::uint64_t shapeKey, bool drawHit) {
+    static const bool always = std::getenv("APS5_ALWAYS_INSERT_DRAWS") != nullptr;
+    constexpr std::uint32_t Learning = 16, ProbeEvery = 64, HitShare = 8;
+    std::lock_guard cacheLock(drawCacheMutex);
+    const auto found = drawShapes.find(shapeKey);
+    if (found == drawShapes.end()) return true;
+    auto& record = found->second;
+    if (record.draws >= (1u << 30u)) record.draws = record.entryHits = 0;
+    ++record.draws;
+    if (drawHit) ++record.entryHits;
+    if (always || drawHit || record.draws <= Learning || record.entryHits * HitShare >= record.draws || record.draws % ProbeEvery == 0) return true;
+    ++drawEntryCounters.insertsSkipped;
+    return false;
 }
 
 namespace {

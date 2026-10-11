@@ -227,7 +227,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
-    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
+    // Titles that move a draw's constant buffers every frame (Unity) never find most entries again;
+    // building them, and their recipes, is skipped for such shapes.
+    const bool insertEntry = useDrawEntries && (!registerKey || keepDrawEntry(shapeKey, drawHit));
+    cacheDrawStages(insertEntry, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {

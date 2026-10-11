@@ -129,6 +129,9 @@ private:
     // programs and user data, or nullptr; and the store of a fresh decode under its shape.
     std::shared_ptr<const DrawDecode> shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile);
     void keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const DrawDecode>& decode);
+    // Whether a draw that missed the cache should insert an entry (and build a recipe): not for a
+    // shape whose draws rarely find their entry again, apart from an occasional probe.
+    bool keepDrawEntry(std::uint64_t shapeKey, bool drawHit);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
     std::shared_ptr<DrawDecode> decodeDraw(const QueueState& queue, const Submission& submission);
@@ -321,7 +324,11 @@ private:
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     // Decodes by shape key (under drawCacheMutex): titles that give each draw its constant buffers
     // from a per-frame ring (Unity) repeat a draw's registers every frame apart from those addresses.
-    std::unordered_map<std::uint64_t, std::shared_ptr<const DrawDecode>> drawShapeDecodes;
+    struct ShapeRecord {
+        std::shared_ptr<const DrawDecode> decode;
+        std::uint32_t draws = 0, entryHits = 0;
+    };
+    std::unordered_map<std::uint64_t, ShapeRecord> drawShapes;
 
     DrawEntryCounters drawEntryCounters;
 
