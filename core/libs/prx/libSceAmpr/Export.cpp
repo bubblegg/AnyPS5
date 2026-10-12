@@ -218,38 +218,16 @@ static int RecordWriteAddressFromCounterPair(Apr::CommandBufferObject* buffer, v
     return AppendCommand(buffer, Apr::Opcode::WriteAddressFromCounterPair, Apr::WriteAddressFromCounterCommand{{}, reinterpret_cast<std::uint64_t>(address), counter, counter + 1u});
 }
 
-struct Xtime {
-    std::int64_t sec;
-    std::int64_t nsec;
-};
-
 static constexpr int ThrdSuccess = 0;
 static constexpr int ThrdError = 4;
-static constexpr int GuestClockRealtime = 0;
-static constexpr std::int64_t NanosPerSecond = 1000000000;
-static constexpr std::int64_t LongestSleepSeconds = 86400;
 
 static std::atomic_flag sharedPtrSpinLock;
 
 extern "C" {
 int APS5_VABI pthread_join_nid_postfix(Pthread thread, void** value);
 int APS5_VABI wcsrtombs_s_nid_postfix(std::size_t* result, char* destination, std::size_t capacity, const std::uint16_t** source, std::size_t limit, void* state);
-}
-
-static KernelTimespec XtimeDeadline(const Xtime& time) {
-    constexpr auto largest = std::numeric_limits<std::int64_t>::max();
-    constexpr auto smallest = std::numeric_limits<std::int64_t>::min();
-    const auto carry = time.nsec / NanosPerSecond;
-    auto nanos = time.nsec % NanosPerSecond;
-    auto seconds = time.sec;
-    if ((carry > 0 && seconds > largest - carry) || (carry < 0 && seconds < smallest - carry)) throw std::overflow_error("_Thrd_sleep: xtime seconds overflow");
-    seconds += carry;
-    if (nanos < 0) {
-        if (seconds == smallest) throw std::overflow_error("_Thrd_sleep: xtime seconds overflow");
-        nanos += NanosPerSecond;
-        --seconds;
-    }
-    return {seconds, nanos};
+int APS5_VABI _Cnd_init_nid_postfix(void** handle);
+int SignalCondition_nid_no_patch(void** handle);
 }
 
 extern "C" {
@@ -895,18 +873,16 @@ int APS5_VABI _ZNSt7num_getIcSt19istreambuf_iteratorIcSt11char_traitsIcEEE2idE_n
     return 0;
 }
 
-int APS5_VABI _Cnd_signal_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI _Cnd_signal_nid_postfix(void** handle) {
+    return SignalCondition_nid_no_patch(handle);
 }
 
 void APS5_VABI _Unlock_shared_ptr_spin_lock_nid_postfix(void) {
     sharedPtrSpinLock.clear(std::memory_order_release);
 }
 
-int APS5_VABI _Cnd_init_with_name_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI _Cnd_init_with_name_nid_postfix(void** handle, const char*) {
+    return _Cnd_init_nid_postfix(handle);
 }
 
 int APS5_VABI _ZTVN10__cxxabiv120__function_type_infoE_nid_postfix(void) {
@@ -943,22 +919,6 @@ void APS5_VABI _Lock_shared_ptr_spin_lock_nid_postfix(void) {
     while (sharedPtrSpinLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
 }
 
-int APS5_VABI _Thrd_sleep_nid_postfix(const Xtime* target, Xtime*) {
-    if (!target) APS5_INVALID_ARG_EX;
-    const auto deadline = XtimeDeadline(*target);
-    for (;;) {
-        KernelTimespec now{};
-        if (clock_gettime_nid_postfix(GuestClockRealtime, &now) != 0) throw std::runtime_error("_Thrd_sleep: reading the realtime clock failed");
-        if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) return 0;
-        KernelTimespec remaining{deadline.tv_sec - now.tv_sec, deadline.tv_nsec - now.tv_nsec};
-        if (remaining.tv_nsec < 0) {
-            remaining.tv_nsec += NanosPerSecond;
-            --remaining.tv_sec;
-        }
-        remaining.tv_sec = std::min(remaining.tv_sec, LongestSleepSeconds);
-        if (nanosleep_nid_postfix(&remaining, nullptr) != 0) throw std::runtime_error("_Thrd_sleep: nanosleep failed");
-    }
-}
 
 int APS5_VABI wcstombs_s_nid_postfix(std::size_t* result, char* destination, std::size_t capacity, const std::uint16_t* source, std::size_t limit) {
     std::array<std::uint64_t, 16> state{};
@@ -1028,5 +988,10 @@ int APS5_VABI sceAmprAsctimeS(char* buffer, std::size_t size, const GuestTm* tim
 APS5_EXPORT("qlWiRfOJx1A", sceAmprFpclassifyd);
 int APS5_VABI sceAmprFpclassifyd(double value) {
     return SonyFpclassifyd(value);
+}
+
+int APS5_VABI sceAmprAmmGetUsageStatsData() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 }

@@ -83,6 +83,9 @@ public:
             split(cursor + done, pageBytes);
             void* page = reinterpret_cast<void*>(cursor + done);
             if (!map(section, GetCurrentProcess(), page, offset + done, pageBytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map shared guest page");
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(page, &memory, sizeof(memory)) != sizeof(memory)) fail("query shared guest page");
+            if (memory.State == MEM_RESERVE && !VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
             DWORD previous;
             if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
             const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done);
@@ -242,7 +245,7 @@ public:
             const auto found = views.find(base);
             if (found != views.end()) {
                 auto& view = found->second;
-                const auto stop = std::min(end, base + pageBytes);
+                const auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
                 if (pinned || view.seen != view.page->generation) {
@@ -266,8 +269,8 @@ public:
                         if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
                         other.armed = true;
                     }
-                    view.seen = view.page->generation;
-                    rememberClean(base, base + pageBytes);
+                    if (cursor == base && stop == base + pageBytes) view.seen = view.page->generation;
+                    rememberClean(cursor, stop);
                 }
                 cursor = stop;
             } else {

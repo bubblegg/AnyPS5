@@ -8,9 +8,11 @@
 #include <fstream>
 #include <iterator>
 #include <initializer_list>
+#include <limits>
 #include <chrono>
 #include <atomic>
 #include <thread>
+#include <stdexcept>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -55,6 +57,7 @@ int APS5_VABI _Getmbcurmax_nid_postfix();
 int APS5_VABI ___mb_cur_max_nid_postfix();
 void APS5_VABI flockfile_nid_postfix(FileStream*);
 void APS5_VABI funlockfile_nid_postfix(FileStream*);
+int APS5_VABI ftrylockfile_nid_postfix(FileStream*);
 }
 static void Require(bool value) { if (!value) std::abort(); }
 static int APS5_VABI WriteFormatted(FileStream* stream, const char* format, ...) {
@@ -119,7 +122,7 @@ static void CheckUnlockedStreams() {
     Require(std::ungetc('Q', stream.GetHandle()) == 'Q');
     Require(getc_unlocked_nid_postfix(&stream) == 'Q' && !(guest.flags & 0x20));
     std::rewind(stream.GetHandle());
-    stream.SetEncodingError();
+    stream.SetError();
     Require(putc_unlocked_nid_postfix('R', &stream) == 'R' && (guest.flags & 0x40));
     clearerr_nid_postfix(&stream);
     Require(!(guest.flags & 0x40));
@@ -132,6 +135,57 @@ static void CheckUnlockedStreams() {
     readOnly.Close();
     Require(CheckFileBytes(filename, "A", "rb", false));
     Require(std::filesystem::remove(filename));
+}
+
+static void CheckTryLock() {
+    FileStream stream(std::tmpfile());
+    const auto tryFromOtherThread = [&] {
+        int result = 0;
+        std::thread other([&] {
+            result = ftrylockfile_nid_postfix(&stream);
+            if (result == 0) funlockfile_nid_postfix(&stream);
+        });
+        other.join();
+        return result;
+    };
+    Require(ftrylockfile_nid_postfix(&stream) == 0);
+    Require(ftrylockfile_nid_postfix(&stream) == 0);
+    Require(tryFromOtherThread() == -1);
+    funlockfile_nid_postfix(&stream);
+    Require(tryFromOtherThread() == -1);
+    std::atomic<bool> written = false;
+    std::thread writer([&] {
+        Require(fputc_nid_postfix('B', &stream) == 'B');
+        written = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Require(!written && fputc_nid_postfix('A', &stream) == 'A');
+    funlockfile_nid_postfix(&stream);
+    writer.join();
+    Require(written && tryFromOtherThread() == 0);
+    std::atomic<bool> held = false, release = false;
+    std::thread owner([&] {
+        flockfile_nid_postfix(&stream);
+        held = true;
+        while (!release) std::this_thread::yield();
+        funlockfile_nid_postfix(&stream);
+    });
+    while (!held) std::this_thread::yield();
+    const int contended = ftrylockfile_nid_postfix(&stream);
+    release = true;
+    owner.join();
+    Require(contended == -1 && ftrylockfile_nid_postfix(&stream) == 0);
+    funlockfile_nid_postfix(&stream);
+    Require(tryFromOtherThread() == 0);
+    Require(fseeko_nid_postfix(&stream, 0, SEEK_SET) == 0);
+    Require(fgetc_nid_postfix(&stream) == 'A' && fgetc_nid_postfix(&stream) == 'B');
+    stream.Close();
+    bool threw = false;
+    try { ftrylockfile_nid_postfix(&stream); } catch (const std::runtime_error&) { threw = true; }
+    Require(threw);
+    threw = false;
+    try { ftrylockfile_nid_postfix(nullptr); } catch (const std::invalid_argument&) { threw = true; }
+    Require(threw);
 }
 
 static void CheckUnlockedStreamLock(bool write) {
@@ -176,6 +230,27 @@ static void CheckUnlockedStreamLock(bool write) {
     stream.Close();
 }
 
+static void CheckFgetsSize() {
+    FileStream stream(std::tmpfile());
+    Require(fwrite_nid_postfix("line\n", 1, 5, &stream) == 5);
+    rewind_nid_postfix(&stream);
+    for (const int size : {0, -1, std::numeric_limits<int>::min()}) {
+        char buffer[8];
+        std::memset(buffer, '!', sizeof(buffer));
+        *__error_nid_postfix() = 0;
+        Require(fgets_nid_postfix(buffer, size, &stream) == nullptr);
+        Require(*__error_nid_postfix() == 22 && ferror_nid_postfix(&stream) != 0 && feof_nid_postfix(&stream) == 0);
+        Require(buffer[0] == '!' && ftello_nid_postfix(&stream) == 0);
+        Require(ferror_nid_postfix(&stream) != 0);
+        clearerr_nid_postfix(&stream);
+        Require(ferror_nid_postfix(&stream) == 0);
+    }
+    char line[8]{};
+    Require(fgets_nid_postfix(line, sizeof(line), &stream) == line && std::strcmp(line, "line\n") == 0);
+    Require(ferror_nid_postfix(&stream) == 0);
+    stream.Close();
+}
+
 static void CheckRewind() {
     FileStream stream(std::tmpfile());
     Require(fwrite_nid_postfix("ab", 1, 2, &stream) == 2);
@@ -186,7 +261,7 @@ static void CheckRewind() {
     rewind_nid_postfix(&stream);
     Require(fgetc_nid_postfix(&stream) == 'a' && fgetc_nid_postfix(&stream) == 'b' && fgetc_nid_postfix(&stream) == EOF);
     Require(feof_nid_postfix(&stream) != 0);
-    stream.SetEncodingError();
+    stream.SetError();
     Require(ferror_nid_postfix(&stream) != 0);
     rewind_nid_postfix(&stream);
     Require(feof_nid_postfix(&stream) == 0 && ferror_nid_postfix(&stream) == 0 && fgetc_nid_postfix(&stream) == 'a');
@@ -458,8 +533,10 @@ int main() {
     Require(fgetc_nid_postfix(&locked) == 'A' && fgetc_nid_postfix(&locked) == 'B');
     locked.Close();
     CheckRewind();
+    CheckFgetsSize();
     CheckUnlockedStreams();
     CheckUnlockedStreamLock(false);
     CheckUnlockedStreamLock(true);
+    CheckTryLock();
     return CheckBinaryModes() ? 0 : 1;
 }

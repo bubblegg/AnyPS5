@@ -200,4 +200,9 @@ int APS5_VABI sceSslGetSubjectName(void) {
     return 0;
 }
 
+int APS5_VABI sceSslEnableVerifyOption(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

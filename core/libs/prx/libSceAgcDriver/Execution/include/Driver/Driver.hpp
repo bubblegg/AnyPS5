@@ -384,6 +384,7 @@ private:
     std::deque<std::uint64_t> queue0Uncommitted;
     std::atomic<std::uint32_t> orderHolders{0};
     std::atomic<std::uint32_t> runningWorkers{0};
+    std::atomic<std::uint64_t> idleEpoch{0};
     std::atomic<std::uint64_t> queue0Awaited{0};
     std::atomic<std::uint32_t> flipsAhead{0};
     std::atomic<std::uint32_t> flipHolders{0};

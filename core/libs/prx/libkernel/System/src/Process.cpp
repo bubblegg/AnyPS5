@@ -13,6 +13,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
+#include "prx/libc/include/HostEntropy.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
@@ -29,7 +30,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -107,9 +107,8 @@ ProcessArguments& getProcessArguments() {
     return arguments;
 }
 
-void validateSchedulingPolicy(int policy) {
-    if (policy < 1 || policy > 3)
-        throw std::invalid_argument("Unsupported guest scheduling policy");
+bool hasPriorityRange(int policy) {
+    return policy == 1 || policy == 3;
 }
 
 constexpr int guestFault = 14;
@@ -200,6 +199,12 @@ int APS5_VABI getpid_nid_postfix(void) {
     return static_cast<int>(pid);
 }
 
+int APS5_VABI getsid_nid_postfix(int pid) {
+    (void)pid;
+    NotImplemented_nid_no_patch("getsid: process sessions");
+    return -1;
+}
+
 int APS5_VABI getppid_nid_postfix(void) {
 #ifdef _WIN32
     const DWORD self = GetCurrentProcessId();
@@ -281,10 +286,21 @@ int APS5_VABI waitpid_nid_postfix(int pid, int* status, int options) {
     return -1;
 }
 
+int APS5_VABI wait_nid_postfix(int* status) {
+    return waitpid_nid_postfix(-1, status, 0);
+}
+
 int APS5_VABI execvp_nid_postfix(const char* file, char* const* arguments) {
     (void)file;
     (void)arguments;
     NotImplemented_nid_no_patch("execvp: executable replacement");
+    return -1;
+}
+
+int APS5_VABI execv_nid_postfix(const char* path, char* const* arguments) {
+    (void)path;
+    (void)arguments;
+    NotImplemented_nid_no_patch("execv: executable replacement");
     return -1;
 }
 
@@ -329,11 +345,8 @@ void* APS5_VABI sceKernelGetProcParam(void) {
 
 int APS5_VABI sceKernelUuidCreate(std::uint32_t* uuid) {
     if (!uuid) return sceInvalidArgument;
-    static thread_local std::random_device device;
-    std::uniform_int_distribution<std::uint32_t> distribution;
     std::array<std::uint32_t, 4> value;
-    for (auto& word : value)
-        word = distribution(device);
+    HostEntropy_nid_no_patch(value.data(), sizeof(value));
     value[1] = (value[1] & 0x0fffffffu) | 0x40000000u;
     value[2] = (value[2] & 0xffffff3fu) | 0x80u;
     std::memcpy(uuid, value.data(), sizeof(value));
@@ -349,18 +362,28 @@ void APS5_VABI sync_nid_postfix(void) {
 }
 
 int APS5_VABI sched_get_priority_max_nid_postfix(int policy) {
-    validateSchedulingPolicy(policy);
-    return 256;
+    if (!hasPriorityRange(policy)) {
+        *__error_nid_postfix() = guestInvalid;
+        return -1;
+    }
+    return 767;
 }
 
 int APS5_VABI sched_get_priority_min_nid_postfix(int policy) {
-    validateSchedulingPolicy(policy);
-    return 767;
+    if (!hasPriorityRange(policy)) {
+        *__error_nid_postfix() = guestInvalid;
+        return -1;
+    }
+    return 256;
 }
 
 int APS5_VABI getrusage_nid_postfix(int who, GuestResourceUsage* usage) {
     if (usage == nullptr)
         throw std::invalid_argument("getrusage: usage is null");
+    if (who == -1) {
+        *usage = {};
+        return 0;
+    }
     if (who != 0 && who != 1)
         throw std::invalid_argument("getrusage: unsupported who");
 #ifdef _WIN32
@@ -453,12 +476,11 @@ int APS5_VABI sceKernelIsTrinityMode(void) {
     return 0;
 }
 
-int APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
+void APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
     if (!mode || !submode)
         throw std::invalid_argument("sceKernelGetOperationMode: null output");
-    *mode = 0;
+    *mode = 2;
     *submode = 0;
-    return 0;
 }
 
 int APS5_VABI seteuid_nid_postfix(std::uint32_t euid) {

@@ -125,10 +125,11 @@ inline int SonyWcscpyS(std::uint16_t* dest, std::size_t size, const std::uint16_
 
 inline std::size_t SonyMbstowcs(std::uint16_t* dest, const char* src, std::size_t size) {
     if (!src) return 0;
+    if (!dest) return std::strlen(src);
     std::size_t converted = 0;
     while (converted < size) {
         const auto value = static_cast<unsigned char>(src[converted]);
-        if (dest) dest[converted] = value;
+        dest[converted] = value;
         if (value == 0) return converted;
         ++converted;
     }

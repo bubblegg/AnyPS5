@@ -237,6 +237,7 @@ function(add_shader_recompiler target runtimeTarget)
             MatchesPreparedShader
             GetPreparedArtifact
             MaterializeShader
+            RegistrationResult
             ResolveSource
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
@@ -247,6 +248,7 @@ function(add_shader_recompiler target runtimeTarget)
             SrgbUnormFormat
             ThreadOwned
             UnresolvableSwappcTarget
+            ValidateAndOptimizeSpirv
             FindUserDataCalls
             UserDataCalleeLength
             LinkUserDataCalls

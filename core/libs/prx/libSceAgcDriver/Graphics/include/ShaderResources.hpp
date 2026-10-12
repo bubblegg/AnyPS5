@@ -51,6 +51,14 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
 // a storage image other than `except` has results pending in [address, address + bytes).
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
 
+struct PipelineSetLayouts {
+    VkDescriptorSetLayout main = VK_NULL_HANDLE;
+    VkDescriptorSetLayout fragment = VK_NULL_HANDLE;
+    bool split = false;
+    std::span<const std::uint32_t> mainKey;
+    std::span<const std::uint32_t> fragmentKey;
+};
+
 class DescriptorCache {
 public:
     explicit DescriptorCache(const Context& context);
@@ -60,7 +68,7 @@ public:
 
     // The layout for `key` (binding, type, count, stage flags per binding, as ShaderResources builds
     // it from `bindings`), created on first use.
-    VkDescriptorSetLayout Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind = false);
+    VkDescriptorSetLayout Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind = false, std::span<const VkDescriptorBindingFlags> flags = {});
     struct SetAllocation {
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
@@ -114,6 +122,12 @@ public:
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
+    std::vector<VkDescriptorSetLayoutBinding> LayoutBindings() const;
+    bool LayoutUpdateAfterBind() const;
+    std::span<const VkDescriptorBindingFlags> LayoutBindingFlags() const { return layoutBindingFlags; }
+    VkDescriptorSetLayout FragmentLayout() const { return fragment.layout; }
+    bool SplitSets() const { return splitSets; }
+    PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     struct DrawBindings {
         DrawBindings() = default;
@@ -124,6 +138,7 @@ public:
             std::shared_ptr<Buffer> buffer;
         };
         DescriptorCache* cache = nullptr;
+        DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         // A set of the draw ring (see prepareRingBindings): the offsets its bind passes. Empty
@@ -142,6 +157,7 @@ public:
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
@@ -165,7 +181,9 @@ public:
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
+    bool HasCachedStorageImages() const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
+    const std::vector<std::uint32_t>& FragmentLayoutKey() const { return fragmentLayoutKey; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
 
@@ -429,6 +447,17 @@ private:
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.
     DescriptorCache::SetAllocation cacheAllocation;
+    struct SetObjects {
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        bool ownsLayout = false;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        DescriptorCache::SetAllocation cacheAllocation;
+    };
+    bool splitSets = false;
+    std::vector<std::uint32_t> fragmentLayoutKey;
+    SetObjects fragment;
+    std::uint32_t setOf(const Binding& binding) const;
     std::vector<Allocation> allocations;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
@@ -492,6 +521,8 @@ private:
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
     // the descriptor counts the set was sized for, and the compute stage of a deferred build.
     std::vector<Binding> bindings;
+    std::vector<VkDescriptorBindingFlags> layoutBindingFlags;
+    std::vector<VkDescriptorBindingFlags> fragmentBindingFlags;
     std::vector<std::uint32_t> refreshResourceKey;
     struct DeferredImages {
         const ShaderRecompiler::DescriptorBinding* binding;

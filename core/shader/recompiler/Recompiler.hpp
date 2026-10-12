@@ -141,6 +141,7 @@ struct ShaderPixelStageInfo {
     std::array<ColorExportPacking, 8> targetExportPacking;
     bool dualSourceBlend;
     bool alphaToCoverage;
+    bool stencilRefExportEnable;
 };
 
 struct ShaderVertexBufferResource {
@@ -176,6 +177,7 @@ struct ShaderFloatMode {
 inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
+inline constexpr std::uint32_t InterpolationRound16Shift = 3u;
 
 struct GuestContext {
     std::uint32_t waveSize;
@@ -228,6 +230,8 @@ struct SpirvTarget {
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
+    bool registrationModules = false;
+    std::uint32_t registrationWordLimit = 200000u;
 };
 
 struct BindingLayout {
@@ -474,6 +478,7 @@ struct CompiledShaderArtifact {
     std::uint32_t imageMetadataDword = 0;
     std::uint32_t runtimeImageCount = 0;
     std::vector<std::uint32_t> runtimeImageResources;
+    bool registrationModule = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t runtimeAbiVersion = RuntimeAbi::Version;
     std::vector<VertexInput> vertexInputs;

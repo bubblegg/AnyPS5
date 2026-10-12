@@ -113,6 +113,8 @@ struct GuestBufferMemory::AddressSpace {
 
 namespace {
 
+struct RetiredImport;
+
 struct AddressSpaceCache {
     std::atomic<std::shared_ptr<const GuestBufferMemory::AddressSpace>> current;
     std::atomic<std::uint64_t> serials{0};
@@ -148,6 +150,7 @@ struct HostImports {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
+    std::map<VkDevice, std::vector<std::shared_ptr<RetiredImport>>> parked;
     std::uint64_t liveBytes = 0;
     std::set<std::uint64_t> failed;
     std::set<std::uint64_t> unaliasedSpans;
@@ -214,6 +217,26 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
     state.imports.erase(it);
+}
+
+bool releaseParkedImports(HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    std::vector<std::shared_ptr<RetiredImport>> released;
+    {
+        std::lock_guard lock(state.mutex);
+        for (auto device = state.parked.begin(); device != state.parked.end();) {
+            auto& list = device->second;
+            for (auto it = list.begin(); it != list.end();) {
+                if ((*it)->entry.base < end && begin < (*it)->entry.base + (*it)->entry.bytes) {
+                    released.push_back(std::move(*it));
+                    it = list.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            device = list.empty() ? state.parked.erase(device) : std::next(device);
+        }
+    }
+    return !released.empty();
 }
 
 const char* bindImport(const Context& context, HostImport& entry, VkExternalMemoryHandleTypeFlagBits handleType, const void* import, std::uint32_t importTypes, bool& allocated, VkResult& failure) {
@@ -766,8 +789,8 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (state.device != context.device) {
         for (const auto& [address, entry] : state.imports) {
             if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
-                state.destroyBuffer(state.device, entry.buffer, nullptr);
-                state.freeMemory(state.device, entry.memory, nullptr);
+                state.parked[state.device].push_back(std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, entry));
+                continue;
             }
 #ifdef _WIN32
             GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -1534,6 +1557,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
             if (recorder != nullptr) recorder->FlushDeferredReleases();
             const auto end = static_cast<std::uint64_t>(address) + bytes;
             auto& imports = Imports();
+            if (releaseParkedImports(imports, address, end)) retiredImport = true;
             const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
             {
                 std::lock_guard importsLock(imports.mutex);
@@ -1585,6 +1609,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
 
             const auto end = static_cast<std::uint64_t>(address) + bytes;
             auto& imports = Imports();
+            if (releaseParkedImports(imports, address, end)) retiredImport = true;
             bool overlapsImport = false;
             {
                 std::lock_guard importsLock(imports.mutex);
@@ -1734,6 +1759,7 @@ void ClearImageMirrors(VkDevice device) {
 void ClearHostImports(VkDevice device) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
+    state.parked.erase(device);
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
         state.destroyBuffer(state.device, entry.buffer, nullptr);

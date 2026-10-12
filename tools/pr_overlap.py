@@ -3,13 +3,13 @@ import json
 import os
 import re
 import subprocess
-from itertools import chain, combinations
+from itertools import combinations
 from pathlib import Path
 from urllib.parse import urlencode
 
 PARENT = 'if .parent then "\\(.parent.owner.login)/\\(.parent.name)" else .nameWithOwner end'
 EXPORT = re.compile(r"^\+.*\bAPS5_VABI\s+(\w+)\s*\(")
-DEPENDS = re.compile(r'Depends on:([^\r\n]*(?:\r?\n[ \t]*[-*][ \t]*#\d+[^\r\n]*)*)')
+DEPENDS = re.compile(r'Depends on:[ \t]*((?:#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)#\d+\b)*|none\b)?(?:\r?\n[ \t]*[-*][ \t]*#\d+\b[^\r\n]*)*)')
 PLAIN_DEPENDS = re.compile(r'Depends on[ \t]+(#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)#\d+\b)*)')
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))?", re.M)
 MARKER = "<!-- pr-overlap -->"
@@ -37,9 +37,9 @@ def depends_on(body):
 
 def open_prs(base):
     query = urlencode({"state": "open", "base": base, "per_page": 100})
-    out = gh("api", "--paginate", "--slurp", f"repos/{REPO}/pulls?{query}")
+    out = gh("api", "--paginate", f"repos/{REPO}/pulls?{query}")
     prs = {}
-    for pr in chain.from_iterable(json.loads(out)):
+    for pr in json.loads(out):
         prs[pr["number"]] = {
             "ref": f"refs/pr/{pr['number']}",
             "sha": pr["head"]["sha"],

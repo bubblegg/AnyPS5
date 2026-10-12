@@ -12,7 +12,7 @@ def pull_requests(body):
     response = [{"number": number, "user": {"login": "contributor"}, "head": {"sha": str(number) * 40},
                  "body": body if number == 1 else "Depends on: none"} for number in (1, 2)]
     with patch.object(pr_overlap, "REPO", "owner/repo", create=True), \
-            patch.object(pr_overlap, "gh", return_value=json.dumps([response])):
+            patch.object(pr_overlap, "gh", return_value=json.dumps(response)):
         return pr_overlap.open_prs("main")
 
 
@@ -53,6 +53,15 @@ class DependencyTests(unittest.TestCase):
                      "**Depends on #2**. Refs #3."):
             with self.subTest(body=body):
                 self.assertEqual(pull_requests(body)[1]["depends"], {2})
+
+    def test_colon_declaration_stops_before_unrelated_prose(self):
+        for body in ("Depends on: #2. Related #3 covers something else.",
+                     "Depends on: #2; related #3 covers something else.",
+                     "Depends on: none; see issue #3.",
+                     "Depends on: #2, related work is in #3."):
+            with self.subTest(body=body):
+                expected = set() if "none" in body else {2}
+                self.assertEqual(pull_requests(body)[1]["depends"], expected)
 
     def test_checklist_declaration_keeps_precedence(self):
         for declaration, expected in (("#3", {3}), ("none", set())):

@@ -60,6 +60,8 @@ bool isLaneLocal(IrOpcode opcode) {
         case IrOpcode::CompositeExtractU32x4:
         case IrOpcode::PackHalf2x16:
         case IrOpcode::PackFloat2x16Rtz:
+        case IrOpcode::FPAdd16x2:
+        case IrOpcode::FPMul16x2:
         case IrOpcode::BitFieldInsert:
         case IrOpcode::BitFieldUExtract:
         case IrOpcode::BitFieldSExtract:
@@ -271,6 +273,64 @@ bool alwaysTrue(const IrValue* value, std::uint32_t waveSize, std::uint32_t dept
     return bit && isImmediate(bit->low, 0xffffffffu) && isImmediate(bit->high, 0xffffffffu);
 }
 
+using BlockSet = std::unordered_set<const IrBlock*>;
+
+BlockSet uniformEntryBlocks(const IrProgram& program) {
+    BlockSet result;
+    if (program.BlockOrder().empty()) return result;
+    const IrBlock* block = program.BlockOrder().front();
+    while (block->Predecessors().empty() || (block->Predecessors().size() == 1u && result.contains(block->Predecessors().front()))) {
+        if (!result.insert(block).second || block->Successors().size() != 1u) break;
+        block = block->Successors().front();
+    }
+    return result;
+}
+
+bool sameCondition(const IrValue* condition, const IrValue* predicate, std::uint32_t depth) {
+    condition = condition->Resolve();
+    predicate = predicate->Resolve();
+    if (condition == predicate || (predicate->HasImmediate() && predicate->Type() == IrType::Bool && predicate->ImmediateBool())) return true;
+    if (depth > DepthLimit) return false;
+    return condition->Opcode() == IrOpcode::LogicalAnd && (sameCondition(condition->Argument(0), predicate, depth + 1u) || sameCondition(condition->Argument(1), predicate, depth + 1u));
+}
+
+bool withinBallotWord(const IrValue* condition, const IrValue* word, std::uint32_t half, const BlockSet& uniform, std::uint32_t depth) {
+    if (word->Opcode() != IrOpcode::CompositeExtractU32x4 || !isImmediate(word->Argument(1)->Resolve(), half)) return false;
+    const IrValue* ballot = word->Argument(0)->Resolve();
+    return ballot->Opcode() == IrOpcode::Ballot && uniform.contains(ballot->Parent()) && sameCondition(condition, ballot->Argument(0), depth + 1u);
+}
+
+bool withinWords(const IrValue* condition, const IrValue* low, const IrValue* high, std::uint32_t waveSize, const BlockSet& uniform, std::uint32_t depth) {
+    if (depth > DepthLimit) return false;
+    if (low->Opcode() == IrOpcode::CompositeExtractU32x4) {
+        return withinBallotWord(condition, low, 0u, uniform, depth) && (waveSize == 32u || withinBallotWord(condition, high, 1u, uniform, depth));
+    }
+    if (low->Opcode() != IrOpcode::BitwiseAnd32) return false;
+    const IrValue* lowLeft = low->Argument(0)->Resolve();
+    const IrValue* lowRight = low->Argument(1)->Resolve();
+    if (waveSize == 32u) return withinWords(condition, lowLeft, high, waveSize, uniform, depth + 1u) && withinWords(condition, lowRight, high, waveSize, uniform, depth + 1u);
+    if (high->Opcode() != IrOpcode::BitwiseAnd32) return false;
+    const IrValue* highLeft = high->Argument(0)->Resolve();
+    const IrValue* highRight = high->Argument(1)->Resolve();
+    return (withinWords(condition, lowLeft, highLeft, waveSize, uniform, depth + 1u) && withinWords(condition, lowRight, highRight, waveSize, uniform, depth + 1u)) ||
+           (withinWords(condition, lowLeft, highRight, waveSize, uniform, depth + 1u) && withinWords(condition, lowRight, highLeft, waveSize, uniform, depth + 1u));
+}
+
+const IrValue* wholeQuadSource(const IrValue* mask, std::uint32_t waveSize) {
+    const auto bit = threadBit(mask, waveSize);
+    if (!bit || bit->low->Opcode() != IrOpcode::CompositeExtractU64 || !isImmediate(bit->low->Argument(1)->Resolve(), 0u)) return nullptr;
+    const IrValue* wqm = bit->low->Argument(0)->Resolve();
+    if (waveSize != 32u && (bit->high->Opcode() != IrOpcode::CompositeExtractU64 || bit->high->Argument(0)->Resolve() != wqm || !isImmediate(bit->high->Argument(1)->Resolve(), 1u))) return nullptr;
+    if (wqm->Opcode() != IrOpcode::WqmU64) return nullptr;
+    const IrValue* source = wqm->Argument(0)->Resolve();
+    return source->Opcode() == IrOpcode::CompositeConstructU64 ? source : nullptr;
+}
+
+bool withinQuadsOf(const IrValue* condition, const IrValue* mask, std::uint32_t waveSize, const BlockSet& uniform) {
+    const IrValue* source = wholeQuadSource(mask, waveSize);
+    return source != nullptr && withinWords(condition, source->Argument(0)->Resolve(), source->Argument(1)->Resolve(), waveSize, uniform, 0u);
+}
+
 enum class Region : std::uint8_t { Unreached, Once, Loop };
 
 Region regionOf(const std::vector<Region>& regions, const IrBlock* block) {
@@ -297,7 +357,7 @@ struct ImplicationKeyHash {
 
 class Implications {
 public:
-    Implications(const std::vector<Region>& regions, std::uint32_t waveSize, std::size_t& work) : regions(regions), waveSize(waveSize), work(work) {}
+    Implications(const std::vector<Region>& regions, const BlockSet& uniform, std::uint32_t waveSize, std::size_t& work) : regions(regions), uniform(uniform), waveSize(waveSize), work(work) {}
 
     void Reset(const IrValue* writeMask, bool acrossLoops) {
         mask = writeMask;
@@ -318,8 +378,15 @@ public:
         --work;
         const Attempt attempt = assume(key);
         bool result = false;
-        if (condition->Opcode() == IrOpcode::LogicalAnd) {
+        if (withinQuadsOf(condition, mask, waveSize, uniform)) {
+            result = true;
+        } else if (condition->Opcode() == IrOpcode::LogicalAnd) {
             result = Implies(condition->Argument(0), depth + 1u) || Implies(condition->Argument(1), depth + 1u);
+        } else if (condition->Opcode() == IrOpcode::SelectU1) {
+            const IrValue* selector = condition->Argument(0)->Resolve();
+            const bool trueCase = Implies(condition->Argument(1), depth + 1u) || Implies(selector, depth + 1u);
+            const bool falseCase = Implies(condition->Argument(2), depth + 1u) || (selector->Opcode() == IrOpcode::LogicalNot && Implies(selector->Argument(0), depth + 1u));
+            result = trueCase && falseCase;
         } else if (condition->IsPhi()) {
             result = merges(*condition);
             for (std::size_t index = 0; result && index < condition->ArgumentCount(); ++index) {
@@ -381,6 +448,8 @@ private:
 
     bool wordsImply(const IrValue* low, const IrValue* high, std::uint32_t depth) {
         if (isImmediate(low, 0u) && (waveSize == 32u || isImmediate(high, 0u))) return true;
+        const auto maskBit = threadBit(mask, waveSize);
+        if (maskBit && low == maskBit->low && (waveSize == 32u || high == maskBit->high)) return true;
         const ImplicationKey key{low, high};
         if (const auto known = lookup(key)) return *known;
         if (depth > ImplicationDepthLimit || work == 0) return false;
@@ -414,6 +483,7 @@ private:
     }
 
     const std::vector<Region>& regions;
+    const BlockSet& uniform;
     std::uint32_t waveSize;
     std::size_t& work;
     const IrValue* mask = nullptr;
@@ -474,12 +544,14 @@ std::size_t walkLimit(const IrProgram& program) {
 
 class MaskedLaneWalk {
 public:
-    MaskedLaneWalk(const IrProgram& program, const std::vector<Region>& regions) : program(program), regions(regions), limit(walkLimit(program)), implications(regions, program.WaveSize(), work) {}
+    MaskedLaneWalk(const IrProgram& program, const std::vector<Region>& regions, std::uint32_t nesting = 0) : program(program), regions(regions), uniform(uniformEntryBlocks(program)), limit(walkLimit(program)), implications(regions, uniform, program.WaveSize(), work), nesting(nesting) {}
 
     bool UnobservedWhereMasked(const IrValue& select, const IrValue* mask) {
         const bool acrossLoops = mask->HasImmediate() || regionOf(regions, mask->Parent()) == Region::Once;
+        const bool sameIteration = !acrossLoops && select.Opcode() == IrOpcode::ReadFirstLane;
         work = limit;
         implications.Reset(mask, acrossLoops);
+        const bool quadMasked = program.Resources().stage == IrShaderStage::Pixel && wholeQuadSource(mask, program.WaveSize()) != nullptr;
         startVisits();
         pending.clear();
         pending.push_back(&select);
@@ -489,11 +561,18 @@ public:
             pending.pop_back();
             for (const IrUse& use : value->OperandUses()) {
                 const IrValue* user = use.user;
-                if (!followable(regions, user->Parent(), acrossLoops)) return false;
+                if (sameIteration ? user->Parent() != select.Parent() || user->IsPhi() : !followable(regions, user->Parent(), acrossLoops)) return false;
                 if (isSelect(user->Opcode()) && use.operand == 1u && implications.Implies(user->Argument(0))) continue;
                 if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implications.Implies(user->Argument(1u - use.operand))) continue;
                 if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && implications.Implies(user->Argument(user->ArgumentCount() - 1u))) continue;
-                if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user)) return false;
+                if (user->Opcode() == IrOpcode::ReadFirstLane && use.operand == 0u && nesting < DepthLimit && implications.Implies(user->Argument(1))) {
+                    MaskedLaneWalk nested(program, regions, nesting + 1u);
+                    nested.limit = work;
+                    const bool unobserved = nested.UnobservedWhereMasked(*user, user->Argument(1)->Resolve());
+                    work = nested.work;
+                    if (unobserved) continue;
+                }
+                if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user) && !(quadMasked && user->Opcode() == IrOpcode::ImageSampleRaw)) return false;
                 if (firstVisit(*user)) {
                     if (work == 0) return false;
                     --work;
@@ -521,12 +600,14 @@ private:
 
     const IrProgram& program;
     const std::vector<Region>& regions;
+    BlockSet uniform;
     std::size_t limit;
     std::size_t work = 0;
     Implications implications;
     std::vector<const IrValue*> pending;
     std::vector<std::uint32_t> visits;
     std::uint32_t epoch = 0;
+    std::uint32_t nesting = 0;
 };
 
 }

@@ -137,6 +137,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         pixelStorage.psPixelKillEnable = pixel.pixelKillEnable;
         pixelStorage.psDepthExportEnable = pixel.depthExportEnable;
         pixelStorage.psSampleMaskExportEnable = pixel.sampleMaskExportEnable;
+        pixelStorage.psStencilRefExportEnable = pixel.stencilRefExportEnable;
         pixelStorage.psSampleShading = pixel.sampleShading;
         pixelStorage.psEarlyZ = pixel.earlyZ;
         pixelStorage.psExecuteOnNoop = pixel.executeOnNoop;
@@ -164,6 +165,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         std::destroy_at(&vertexStorage);
         std::construct_at(&vertexStorage);
         vertexStorage.logicalStage = _toIrShaderStage(stage);
+        vertexStorage.hostSubgroupSize = hostSubgroupSize;
         vertexStorage.fetchEmbedded = vertex.fetchEmbedded;
         vertexStorage.fetchExternal = false;
         vertexStorage.fetchAttribReg = static_cast<int>(vertex.fetchAttribReg);

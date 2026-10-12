@@ -5,10 +5,13 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "Optimization/SrtWalker.hpp"
+#include "IntermediateRepresentation/IrBuilder.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -47,7 +50,7 @@
 namespace {
 
 ShaderRecompiler::SpirvTarget BufferTarget() {
-    static constexpr std::array<std::uint32_t, 5> capabilities{spv::CapabilityShader, spv::CapabilityImageGatherExtended, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    static constexpr std::array<std::uint32_t, 6> capabilities{spv::CapabilityShader, spv::CapabilityImageGatherExtended, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityClipDistance};
     static constexpr std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     ShaderRecompiler::SpirvTarget target{};
     target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
@@ -443,6 +446,9 @@ void verifySignedSrtComparison() {
     source.dwords[1] = &make(IrOpcode::SelectU32, IrType::U32, {&aboveMin, &greaterThanMin, &equalMin});
     source.dwords[2] = &make(IrOpcode::SelectU32, IrType::U32, {&belowMaxValue, &belowMax, &equalMax});
     plan.descriptorSources.push_back(source);
+    for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
+        require(SrtWalker().ValidateRuntimeValue(plan, source.dwords[dword]), "signed SRT comparison: the runtime validator rejects a descriptor dword the evaluator computes");
+    }
     const std::array<std::uint32_t, 1> sourceIndex{0u};
     const std::array<std::pair<std::uint32_t, std::array<std::uint32_t, 3>>, 4> cases{{
         {0x80000000u, {0xau, 0xdu, 0xeu}},
@@ -1196,7 +1202,7 @@ void verifyLanesOutsideHostSubgroup() {
 
 void verifyHalfWaveReduction() {
     using namespace ShaderRecompiler;
-    static constexpr std::array<std::uint32_t, 4> capabilities{spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic};
+    static constexpr std::array<std::uint32_t, 5> capabilities{spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilityClipDistance};
     const auto pixel = [](std::span<const std::uint32_t> code, std::uint32_t subgroupSize, bool arithmetic) {
         ShaderPixelStageInfo info{};
         info.inputAddr = PixelInputBit(PixelInput::PositionX);
@@ -1335,6 +1341,13 @@ void verifyHalfWaveReduction() {
     divergent.insert(divergent.begin() + 3, 0x88fe1a7eu);
     divergent.insert(divergent.begin() + 2, {0xbe860480u, 0x7d821688u, 0xbe9a246au, 0xbf880001u});
     require(reductions(pixel(divergent, 32u, true), spv::OpGroupNonUniformUMin) == 1u, "half-wave reduction: keys masked inside a divergent branch did not read lane 31 as a subgroup UMin");
+    auto windowed = umin;
+    windowed.insert(windowed.begin() + 23, 0x7e008514u);
+    require(reductions(pixel(windowed, 32u, true), spv::OpGroupNonUniformUMin) == 1u, "half-wave reduction: a UMin scan of registers in a v_movreld_b32 window did not read lane 31 as a subgroup UMin on 32 lanes");
+    require(halves(pixel(windowed, 64u, true), spv::OpGroupNonUniformUMin, 0xffffffffu), "half-wave reduction: a UMin scan of registers in a v_movreld_b32 window did not read lanes 31 and 63 as reductions of host invocations 0-31 and 32-63 on 64 lanes");
+    auto overwritten = umin;
+    overwritten.insert(overwritten.begin() + 17, {0x7ef80500u, 0x7e008514u});
+    expectFailure([&] { static_cast<void>(pixel(overwritten, 32u, true)); }, lane63, "half-wave reduction: a scan of window registers read lane 63 after a v_movreld_b32 at a runtime M0 that may overwrite them");
     const char* arithmetic = "v_readlane_b32 of lane 31 of a wave64 half-wave reduction scan needs subgroup arithmetic";
     expectFailure([&] { static_cast<void>(pixel(umin, 32u, false)); }, arithmetic, "half-wave reduction: a device without subgroup arithmetic read lane 31 on 32 lanes");
     expectFailure([&] { static_cast<void>(pixel(umin, 64u, false)); }, arithmetic, "half-wave reduction: a device without subgroup arithmetic read lane 31 on 64 lanes");
@@ -1354,6 +1367,101 @@ void verifyHalfWaveReduction() {
     compared.insert(compared.begin() + 3, {0xd4c50006u, 0x00021680u});
     expectFailure([&] { static_cast<void>(pixel(compared, 32u, true)); }, lane63, "half-wave reduction: a scan selected by a compare under the all-lanes EXEC read lane 63");
     expectFailure([&] { static_cast<void>(pixel(umin, 8u, true)); }, "v_permlanex16_b32 from lanes 16-31 is outside the 8-lane host subgroup", "half-wave reduction: the scan built on an 8-lane subgroup");
+}
+
+void verifyNarrowVertexWave() {
+    using namespace ShaderRecompiler;
+    static constexpr std::array<std::uint32_t, 5> capabilities{spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityGroupNonUniformArithmetic, spv::CapabilityClipDistance};
+    static constexpr std::array<std::uint32_t, 4> userData{0u, 0u, 0u, 0x2020u};
+    const auto vertex = [](std::span<const std::uint32_t> code, std::uint32_t waveSize, std::uint32_t subgroupSize, std::uint32_t userDataBase) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Vertex, 0x50000u, code, 0, {}};
+        request.context.waveSize = waveSize;
+        request.context.userDataBaseRegister = userDataBase;
+        if (userDataBase == 0u) request.context.userData = userData;
+        request.context.vertex = ShaderVertexStageInfo{};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = subgroupSize;
+        request.target.supportedCapabilities = capabilities;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        return request;
+    };
+    const auto prepared = [&vertex](std::span<const std::uint32_t> code, std::uint32_t subgroupSize, std::uint32_t userDataBase = 8u) {
+        return GetPreparedArtifact(*PrepareShader(vertex(code, 64u, subgroupSize, userDataBase))).spirv;
+    };
+    const auto prepares = [&prepared](std::span<const std::uint32_t> code, std::uint32_t subgroupSize, std::uint32_t userDataBase = 8u) {
+        return !prepared(code, subgroupSize, userDataBase).empty();
+    };
+    const auto reductions = [](const std::vector<std::uint32_t>& spirv) {
+        std::uint32_t count = 0;
+        for (std::size_t cursor = 5; cursor < spirv.size() && (spirv[cursor] >> 16u) != 0u; cursor += spirv[cursor] >> 16u) {
+            if ((spirv[cursor] & 0xffffu) == spv::OpGroupNonUniformBitwiseOr && (spirv[cursor] >> 16u) == 6u && spirv[cursor + 4u] == spv::GroupOperationReduce) ++count;
+        }
+        return count;
+    };
+    const std::vector<std::uint32_t> culling{
+        0xd7650015u, 0x000100c1u, 0xd7660015u, 0x00022ac1u, 0x7e0e0280u, 0x7da206f9u, 0x81060015u, 0x360e0a81u,
+        0xbefe04c1u, 0xd4c50002u, 0x00020e80u, 0xd763000fu, 0x00022a81u, 0xd5010000u, 0x000a1e80u,
+        0x380000fau, 0xff091100u, 0x380000fau, 0xff091200u, 0x380000fau, 0xff091400u, 0x380000fau, 0xff091800u,
+        0xd778000fu, 0x03058300u, 0x38001f00u, 0xd7600002u, 0x00013f00u, 0xd760006bu, 0x00017f00u, 0x88026b02u,
+        0x7e020202u, 0xf80008cfu, 0x01010101u, 0xbf810000u,
+    };
+    const auto patched = [&culling](std::initializer_list<std::pair<std::size_t, std::uint32_t>> words) {
+        auto code = culling;
+        for (const auto& [index, word] : words) code[index] = word;
+        return code;
+    };
+    const char* lane63 = "v_readlane_b32 of lane 63 is outside the 32-lane host subgroup";
+    require(reductions(prepared(culling, 32u)) == 1u, "narrow vertex wave: the NGG culling scan, keyed on lanes below the primitive count in s3, did not read lane 31 as a subgroup OR on 32 lanes");
+    const auto wide64 = prepared(culling, 64u);
+    require(!wide64.empty() && reductions(wide64) == 0u, "narrow vertex wave: the NGG culling scan, keyed on lanes below 64 on 64 lanes, did not keep its DPP scan");
+    require(prepares(patched({{6, 0x80060015u}}), 32u), "narrow vertex wave: the scan keyed on lanes below the vertex count in s3 did not prepare on 32 lanes");
+    static constexpr std::array<std::uint32_t, 4> noArithmetic{spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityClipDistance};
+    const auto otherKeys = patched({{7, 0x360e0a82u}});
+    auto withoutArithmetic = vertex(otherKeys, 64u, 32u, 8u);
+    withoutArithmetic.target.supportedCapabilities = noArithmetic;
+    const auto shuffled = GetPreparedArtifact(*PrepareShader(withoutArithmetic)).spirv;
+    require(!shuffled.empty() && reductions(shuffled) == 0u, "narrow vertex wave: without subgroup arithmetic, the scan did not keep lane 31 as a shuffle with lane 63 read as 0");
+    require(prepares(patched({{5, 0x7da82aa0u}, {6, 0xbf800000u}}), 32u), "narrow vertex wave: the scan keyed on lanes below 32 did not prepare on 32 lanes");
+    expectFailure([&] { static_cast<void>(prepares(patched({{5, 0x7da82aa1u}, {6, 0xbf800000u}}), 32u)); }, lane63, "narrow vertex wave: a scan keyed on lanes below 33 read lane 63");
+    expectFailure([&] { static_cast<void>(prepares(culling, 32u, 0u)); }, lane63, "narrow vertex wave: a scan keyed on a count from user data read lane 63");
+    expectFailure([&] { static_cast<void>(prepares(patched({{6, 0x81060005u}}), 32u)); }, lane63, "narrow vertex wave: a scan keyed on the vertex index instead of the lane read lane 63");
+    auto otherRegister = patched({{21, 0x380200fau}, {24, 0x03058301u}, {25, 0x38001f01u}});
+    otherRegister.insert(otherRegister.begin(), 0x7e020305u);
+    require(reductions(prepared(otherRegister, 32u)) == 1u, "narrow vertex wave: a scan whose bound_ctrl:1 step is written to another register did not read lane 31 as a subgroup OR on 32 lanes");
+    otherRegister[23] = 0xff011800u;
+    expectFailure([&] { static_cast<void>(prepares(otherRegister, 32u)); }, lane63, "narrow vertex wave: a scan step written to another register without bound_ctrl:1, which keeps that register's lanes outside the row, read lane 63");
+    auto threeSteps = culling;
+    threeSteps.erase(threeSteps.begin() + 21, threeSteps.begin() + 23);
+    const auto partialScan = prepared(threeSteps, 32u);
+    require(!partialScan.empty() && reductions(partialScan) == 0u, "narrow vertex wave: lane 63 of row_shr 1/2/4 steps over keys of 0 in lanes 32-63 did not read 0, or lane 31 became a subgroup OR");
+    threeSteps[5] = 0x7da82aa1u;
+    threeSteps[6] = 0xbf800000u;
+    expectFailure([&] { static_cast<void>(prepares(threeSteps, 32u)); }, lane63, "narrow vertex wave: lane 63 of row_shr 1/2/4 steps over keys of lanes below 33 read 0");
+
+    std::array<std::vector<std::uint32_t>, 2> narrow;
+    std::array<std::vector<std::uint32_t>, 2> wide;
+    for (const bool narrowFirst : {false, true}) {
+        const std::vector<std::uint32_t> code{0xbf800001u + static_cast<std::uint32_t>(narrowFirst), 0x7e020203u, 0xf80008cfu, 0x01010101u, 0xbf810000u};
+        const auto narrowRequest = vertex(code, 64u, 32u, 8u);
+        const auto wideRequest = vertex(code, 64u, 64u, 8u);
+        ShaderPreparationContext preparation;
+        const auto first = PrepareShader(narrowFirst ? narrowRequest : wideRequest, &preparation);
+        const auto second = PrepareShader(narrowFirst ? wideRequest : narrowRequest, &preparation);
+        const auto& narrowHandle = narrowFirst ? *first : *second;
+        const auto& wideHandle = narrowFirst ? *second : *first;
+        require(first->source != second->source, "narrow vertex wave: the program prepared for 32 and for 64 lanes shares one translated source");
+        require(MatchesPreparedShader(narrowRequest, narrowHandle) && MatchesPreparedShader(wideRequest, wideHandle), "narrow vertex wave: a prepared program did not match its own request");
+        require(!MatchesPreparedShader(narrowRequest, wideHandle) && !MatchesPreparedShader(wideRequest, narrowHandle), "narrow vertex wave: a program prepared for one subgroup width matched a request for the other");
+        narrow[narrowFirst ? 1u : 0u] = GetPreparedArtifact(narrowHandle).spirv;
+        wide[narrowFirst ? 1u : 0u] = GetPreparedArtifact(wideHandle).spirv;
+    }
+    require(narrow[0] == narrow[1] && wide[0] == wide[1], "narrow vertex wave: preparing for one subgroup width after the other gave another program than preparing it first");
+    require(narrow[0] != wide[0], "narrow vertex wave: s3 of a wave64 vertex program was the same on 32 and 64 lanes");
+    const std::vector<std::uint32_t> wave32{0x7e020203u, 0xf80008cfu, 0x01010101u, 0xbf810000u};
+    require(GetPreparedArtifact(*PrepareShader(vertex(wave32, 32u, 32u, 8u))).spirv == GetPreparedArtifact(*PrepareShader(vertex(wave32, 32u, 64u, 8u))).spirv, "narrow vertex wave: s3 of a wave32 vertex program depended on the subgroup width");
 }
 
 void verifyMeshConfiguration() {
@@ -1441,7 +1549,7 @@ void verifyPixelRequestSerialization() {
                         value.posZ, value.posW, value.frontFace, value.ancillary, value.sampleShading,
                         value.noPerspective, value.linearCentroid, value.pixelKillEnable, value.depthExportEnable,
                         value.sampleMaskExportEnable, value.earlyZ, value.executeOnNoop, value.conservativeZExport, value.orderedPixelShader,
-                        value.targetOutputMode, value.targetExportMapping, value.alphaToCoverage);
+                        value.targetOutputMode, value.targetExportMapping, value.alphaToCoverage, value.stencilRefExportEnable);
     };
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     const std::array<std::uint32_t, 3> userData{0x12345678u, 0xabcdef01u, 0x87654321u};
@@ -1485,6 +1593,7 @@ void verifyPixelRequestSerialization() {
     };
     for (std::uint32_t i = 0; i < pixel.interpolatorSettings.size(); ++i) pixel.interpolatorSettings[i] = 0x10101010u + i;
     pixel.alphaToCoverage = true;
+    pixel.stencilRefExportEnable = true;
     const std::array<std::array<std::uint8_t, 8>, 3> mappings{{
         {0x00u, 0xe4u, 0xc6u, 0x1bu, 0xffu, 0x80u, 0x55u, 0xaau},
         {0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u},
@@ -1513,6 +1622,10 @@ void verifyPixelRequestSerialization() {
         withoutCoverage.context.pixel->alphaToCoverage = false;
         RecompileCacheKey::Build(withoutCoverage, replayKey);
         require(key != replayKey && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(withoutCoverage), "alpha-to-coverage did not change the static shader identity");
+        auto withoutStencilRef = request;
+        withoutStencilRef.context.pixel->stencilRefExportEnable = false;
+        RecompileCacheKey::Build(withoutStencilRef, replayKey);
+        require(key != replayKey && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(withoutStencilRef), "the stencil reference export did not change the static shader identity");
     }
     request.context.pixel.reset();
     request.shader.stage = ShaderStage::Vertex;
@@ -1524,12 +1637,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRAAAAA=", "new requests did not use serialization version 16");
+    require(requestPrefix(encoded, 8u) == "NVNQQREAAAA=", "new requests did not use serialization version 17");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
-    for (std::size_t bytes = 0; bytes < 18u; ++bytes) {
-        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source or alpha-to-coverage flag was accepted");
+    for (std::size_t bytes = 0; bytes < 19u; ++bytes) {
+        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage or stencil reference export flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQREAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRIAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }
@@ -1619,12 +1732,13 @@ void verifyLegacyPixelRequests() {
         require(pixel.targetExportPacking == std::array<ColorExportPacking, 8>{}, "a legacy request packed a color export");
         require(!pixel.dualSourceBlend, "a legacy request enabled dual-source blending");
         require(!pixel.alphaToCoverage, "a legacy request enabled alpha-to-coverage");
+        require(!pixel.stencilRefExportEnable, "a legacy request exported a stencil reference");
         require(pixel.inputAddr == 2u && pixel.hasPerspectiveCenterVgpr && pixel.targetOutputMode[0] == 9u, "legacy pixel layout was misread");
         require(pixel.conservativeZExport == (version >= 7u ? ConservativeZExport::GreaterThanZ : ConservativeZExport::AnyZ), "legacy conservative Z layout was misread");
         require(!pixel.orderedPixelShader, "a legacy request became a primitive-ordered pixel shader");
         require(request.shader.stage == ShaderStage::Fragment && request.shader.code.size() == 1u && request.shader.code[0] == 0xbf810000u && !request.context.vertex.has_value() && request.context.memory.empty(), "legacy guest context was misaligned");
         require(request.target.vulkanVersion == 0x00401000u && request.target.spirvVersion == 0x00010300u && request.target.subgroupSize == 64u && request.layout.firstBinding == 11u && request.layout.pushConstantSizeBytes == 128u, "legacy target or binding layout was misaligned");
-        require(request.useCache == (version == 1u) && request.target.nonConstantImageOffsets == (version >= 6u) && request.target.srgbDecodeFormats == 0u && !request.target.narrowSubgroupClock && !request.target.float64DenormPreserve, "legacy request trailer was misread");
+        require(request.useCache == (version == 1u) && request.target.nonConstantImageOffsets == (version >= 6u) && request.target.srgbDecodeFormats == 0u && !request.target.narrowSubgroupClock && !request.target.float64DenormPreserve && !request.target.registrationModules, "legacy request trailer was misread");
         const auto upgraded = serializer.Deserialize(serializer.Serialize(request));
         require(upgraded.request.context.pixel->targetExportMapping == pixel.targetExportMapping && RecompileCacheKey::ContextHash(upgraded.request) == RecompileCacheKey::ContextHash(request), "upgrading a legacy capture changed its pixel mapping");
     }
@@ -2655,6 +2769,36 @@ void verifyFunctionLdsBound() {
     require(unsized == FunctionLdsDwordLimit, "function LDS: an access without a known width must keep the full array");
 }
 
+void verifySrtReadPatching() {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    program.Resources().memoryInfo.push_back(memory);
+
+    auto& block = program.CreateBlock();
+    program.SetEntryBlock(block);
+    program.BlockOrder().push_back(&block);
+    IrBuilder builder(program);
+    builder.SetInsertionPoint(block);
+    auto& address = builder.Emit(IrOpcode::GetAddressResource, IrType::AddressResource, {&builder.Constant(0u), &builder.Constant(0u)});
+    auto& active = program.CreateValue(IrOpcode::Void, IrType::U1);
+    active.SetImmediateBool(true);
+    auto& read = builder.Emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &builder.Constant(0u), &builder.Constant(0u), &active}, MemoryFlags{0u, 0u});
+    auto& repeatedUse = builder.Emit(IrOpcode::IAdd32, IrType::U32, {&read, &read});
+    auto& secondUser = builder.Emit(IrOpcode::IMul32, IrType::U32, {&read, &builder.Constant(2u)});
+
+    SrtWalker{}.BuildPlan(program);
+
+    require(program.Resources().srtReads.size() == 1u, "SRT read patching: the scalar read was not planned");
+    const auto* replacement = repeatedUse.Argument(0);
+    require(replacement->Opcode() == IrOpcode::ReadConst, "SRT read patching: the uses do not reference a flat read");
+    require(repeatedUse.Argument(1) == replacement && secondUser.Argument(0) == replacement, "SRT read patching: not every operand uses the same replacement");
+    const auto& remainingUses = read.OperandUses();
+    require(remainingUses.size() == 1u && remainingUses.front().user->Opcode() == IrOpcode::ReferenceU32, "SRT read patching: the original read retains non-planning uses");
+}
+
 struct NestedRequest {
     std::vector<std::uint32_t> code;
     std::array<std::uint32_t, 2> userData{};
@@ -2912,6 +3056,24 @@ void verifyCubeDepthCompareMode() {
     require(modes[selected].cube && (modes[selected].emulatedCompare & EmulatedCompare::Enabled) != 0u, "cube color comparison did not select its emulated runtime mode");
 }
 
+void verifySrgbDepthCompareModes() {
+    using namespace ShaderRecompiler;
+    for (const auto decodeFormats : {0u, 1u, 2u, 3u}) {
+        ImageResource image{};
+        image.resourceClass = ImageResourceClass::Sampled;
+        image.dimension = RdnaImageDimension::Dim2D;
+        image.depthCompare = true;
+        image.srgbDecodeCompatible = false;
+        image.srgbDecodeFormats = decodeFormats;
+        const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+        for (const auto format : {128u, 129u, 130u}) {
+            const DescriptorValue descriptor{{0x100u, format << 20u, 0u, 0x90000facu, 0u, 0u, 0u, 0u}, 8u};
+            const auto selected = ResourceMaterializer::RuntimeImageMode(image, descriptor, modes);
+            require(!modes[selected].srgbDecode && (modes[selected].emulatedCompare & EmulatedCompare::Enabled) != 0u, "sRGB color comparison did not select its emulated runtime mode independently of decode support");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
@@ -2923,6 +3085,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
             verifyBindlessTable();
             std::cout << "Bindless mapping, indexing capabilities and strict validation passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--srt-read-patching") {
+            verifySrtReadPatching();
+            std::cout << "SRT read patching replaces repeated and multiple uses\n";
             return 0;
         }
         require(argc == 1, "unknown shader memory test arguments");
@@ -2939,6 +3106,7 @@ int main(int argc, char** argv) {
         verifyProgramCounterRelativeData();
         verifyLanesOutsideHostSubgroup();
         verifyHalfWaveReduction();
+        verifyNarrowVertexWave();
         verifyMeshConfiguration();
         verifyPixelInputs();
         verifyPixelRequestSerialization();
@@ -2956,8 +3124,10 @@ int main(int argc, char** argv) {
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();
         verifyFunctionLdsBound();
+        verifySrtReadPatching();
         verifyGuardedNullPointers();
         verifyCubeDepthCompareMode();
+        verifySrgbDepthCompareModes();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,
@@ -3061,6 +3231,16 @@ int main(int argc, char** argv) {
         auto float64Denormals = uncached;
         float64Denormals.target.float64DenormPreserve = true;
         require(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(float64Denormals)).request.target.float64DenormPreserve, "f64 denormal preservation was lost in serialization");
+        auto registrationModules = uncached;
+        registrationModules.target.registrationModules = true;
+        registrationModules.target.registrationWordLimit = 1234u;
+        const auto roundTrip = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(registrationModules)).request.target;
+        require(roundTrip.registrationModules && roundTrip.registrationWordLimit == 1234u, "registration modules were lost in serialization");
+        std::vector<std::uint64_t> plainKey;
+        std::vector<std::uint64_t> registrationKey;
+        RecompileCacheKey::Build(uncached, plainKey);
+        RecompileCacheKey::Build(registrationModules, registrationKey);
+        require(plainKey != registrationKey, "registration modules did not change the cache key");
         auto changedLayout = request;
         changedLayout.layout.pushConstantSizeBytes = 64;
         require(!Recompile(changedLayout).cacheHit, "binding layout change reused an incompatible variant");

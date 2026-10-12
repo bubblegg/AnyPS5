@@ -192,7 +192,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
             if (((descriptorImageSwizzle(descriptor) >> (component * 3u)) & 7u) == 7u) throw std::runtime_error("selects a channel the converted image format does not have");
         }
     }
-    decoded.srgbDecode = !storage && (srgbDecodeFormats & SrgbDecodeBit(format)) != 0u;
+    decoded.srgbDecode = !storage && !base.depthCompare && (srgbDecodeFormats & SrgbDecodeBit(format)) != 0u;
     if (decoded.srgbDecode && !base.srgbDecodeCompatible) {
         throw std::runtime_error("samples or gathers an sRGB image the device cannot sample, which is not implemented");
     }
@@ -552,7 +552,8 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
         if (((words[0] >> 29u) & 0x3u) != 0u) throw std::runtime_error("comparison sampling of a color texture through a min or max reduction sampler is not implemented");
         const auto magFilter = (words[2] >> 20u) & 0x3u;
         const auto minFilter = (words[2] >> 22u) & 0x3u;
-        if (type == ImageType::Cube && magFilter == 1u && ((words[0] >> 28u) & 1u) == 0u) {
+        const bool eightBitSrgb = format == IrBufferFormat::Format8Srgb || format == IrBufferFormat::Format8_8Srgb || format == IrBufferFormat::Format8_8_8_8Srgb;
+        if (type == ImageType::Cube && magFilter == 1u && ((words[0] >> 28u) & 1u) == 0u && !eightBitSrgb) {
             throw std::runtime_error("bilinear cube comparison requires DISABLE_CUBE_WRAP to avoid seamless face filtering");
         }
         const auto addressMode = [](std::uint32_t clamp) {
@@ -747,7 +748,7 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             modes.push_back(mode);
         }
     }
-    if (image.srgbDecodeFormats != 0u && image.srgbDecodeCompatible && !storage && !image.depthCompare && !image.packed) {
+    if (image.srgbDecodeFormats != 0u && image.srgbDecodeCompatible && !image.depthCompare && !storage && !image.packed) {
         const auto count = modes.size();
         for (std::size_t index = 0; index < count; ++index) {
             const auto& base = modes[index];
