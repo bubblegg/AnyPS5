@@ -3,6 +3,7 @@
 #include "IntermediateRepresentation/IrMetadata.hpp"
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -158,7 +159,10 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         if (vertex.resourcesNum > vertex.resources.size()) throw std::runtime_error("ShaderInputInfoBuilder: invalid vertex resource count");
         struct VertexStorage {};
         auto& vertexStorage = HostThreadLocal<ShaderVertexInputInfo, VertexStorage>();
-        vertexStorage = ShaderVertexInputInfo{};
+        // Reset in place: the record is about 10 KiB, and assigning a fresh one built it on the
+        // stack and copied it, for every draw's vertex stage.
+        std::destroy_at(&vertexStorage);
+        std::construct_at(&vertexStorage);
         vertexStorage.logicalStage = _toIrShaderStage(stage);
         vertexStorage.fetchEmbedded = vertex.fetchEmbedded;
         vertexStorage.fetchExternal = false;

@@ -628,7 +628,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
     static HostMutex mutex;
-    static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
+    static std::unordered_map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>, SourceKeyHash> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
     {
         std::shared_lock lock(mutex);
