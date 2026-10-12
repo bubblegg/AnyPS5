@@ -2036,14 +2036,25 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
-    auto passReads = addressBased ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : resources.DeviceReads();
+    // The pass access lists are the thread's, kept from draw to draw (the recorder copies what it
+    // keeps of them).
+    struct PassLists {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        std::vector<std::pair<VkImage, bool>> images, attachments;
+    };
+    struct PassListsTag {};
+    auto& lists = HostThreadLocal<PassLists, PassListsTag>();
+    auto& passReads = lists.reads;
+    if (addressBased) passReads.clear();
+    else resources.DeviceReadsInto(passReads);
     if (gpuIndirect) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
+    auto& passImages = lists.images;
+    resources.StorageImagesInto(passImages);
+    auto& passAttachments = lists.attachments;
+    passAttachments.clear();
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }

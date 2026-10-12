@@ -3713,8 +3713,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
     std::array<Copy, 64> copies;
     std::size_t copyCount = 0;
     std::uint64_t total = 0;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
-    bool readsKnown = false;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3745,12 +3743,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
             } else {
                 // The checks a draw of its own makes before it reads a buffer the template binds in place.
                 if (guestMemory.WritesOverlap(item.address, item.size)) return refuse(DrawRingCounters::Written);
-                if (!readsKnown) {
-                    reads = guestMemory.InPlaceReads();
-                    readsKnown = true;
-                }
-                const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& span) { return item.address >= span.first && item.address < span.second && item.size <= span.second - item.address; });
-                if (!direct) return refuse(DrawRingCounters::NotDirect);
+                if (!guestMemory.ReadsInPlace(item.address, item.size)) return refuse(DrawRingCounters::NotDirect);
                 if (recorder.PendingWriteOverlaps(item.address, item.size)) return refuse(DrawRingCounters::PendingWrite);
             }
             const auto begin = address - item.adjustment;
@@ -3841,7 +3834,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
         context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
         ++counters.sets;
     }
-    auto result = std::make_shared<DrawBindings>();
+    // The thread's spare, while no recorded draw holds it (it frees nothing: ring sets are the
+    // template's); a draw made one and its two offset lists every time.
+    struct RingBindingsTag {};
+    auto& spare = HostThreadLocal<std::shared_ptr<DrawBindings>, RingBindingsTag>();
+    if (spare == nullptr || spare.use_count() != 1) spare = std::make_shared<DrawBindings>();
+    auto result = spare;
+    result->snapshots.clear();
+    result->allocation = {};
+    result->fragmentAllocation = {};
     result->allocation.set = ringAllocations[0].set;
     result->fragmentAllocation.set = ringAllocations[1].set;
     result->dynamicOffsets.assign(dynamicOrder[0].size(), 0u);
@@ -4042,13 +4043,18 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
+    StorageImagesInto(images);
+    return images;
+}
+
+void ShaderResources::StorageImagesInto(std::vector<std::pair<VkImage, bool>>& images) const {
+    images.clear();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageTextures[index] != nullptr) images.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
     }
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
     }
-    return images;
 }
 
 bool ShaderResources::HasCachedStorageImages() const {

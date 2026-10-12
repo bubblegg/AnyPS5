@@ -183,6 +183,9 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
+    // Filled into `out` (cleared first) instead of a list of their own.
+    void StorageImagesInto(std::vector<std::pair<VkImage, bool>>& out) const;
+    void DeviceReadsInto(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReadsInto(out); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }

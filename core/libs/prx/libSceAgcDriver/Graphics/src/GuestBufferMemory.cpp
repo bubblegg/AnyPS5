@@ -3631,30 +3631,47 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed) return result;
+    InPlaceReadsInto(result);
+    return result;
+}
+
+void GuestBufferMemory::InPlaceReadsInto(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+    out.clear();
+    if (!uploaded || committed) return;
     if (space != nullptr) {
         for (const auto& region : space->base) {
-            if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+            if (region.direct != nullptr) out.emplace_back(region.begin, region.end);
         }
     }
     for (const auto& region : regions) {
-        if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+        if (region.direct != nullptr) out.emplace_back(region.begin, region.end);
     }
-    return result;
+}
+
+bool GuestBufferMemory::ReadsInPlace(std::uint64_t address, std::uint64_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto covers = [&](const auto& region) { return region.direct != nullptr && address >= region.begin && address < region.end && bytes <= region.end - address; };
+    if (space != nullptr && std::any_of(space->base.begin(), space->base.end(), covers)) return true;
+    return std::any_of(regions.begin(), regions.end(), covers);
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed) return result;
+    DeviceReadsInto(result);
+    return result;
+}
+
+void GuestBufferMemory::DeviceReadsInto(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+    out.clear();
+    if (!uploaded || committed) return;
     if (space != nullptr) {
         for (const auto& region : space->base) {
-            if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
+            if (region.direct != nullptr || region.mirror != nullptr) out.emplace_back(region.begin, region.end);
         }
     }
     for (const auto& region : regions) {
-        if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
+        if (region.direct != nullptr || region.mirror != nullptr) out.emplace_back(region.begin, region.end);
     }
-    return result;
 }
 
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {

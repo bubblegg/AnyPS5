@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -14,28 +15,46 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// Room for every word drawRegisterKey gathers: the device, a header and the registers of each
+// range, and the programs' hash.
+constexpr std::size_t drawKeyWordCapacity() {
+    std::size_t words = 2;
+    for (const auto& range : Graphics::DrawKeyRegisters) words += 1 + range.count;
+    return words;
+}
+
+// Four FNV lanes over the words, then folded and mixed: the lanes stay in registers, where one
+// chain kept in memory had every word wait for the previous one's store.
+std::uint64_t hashDrawKeyWords(std::span<const std::uint64_t> words, std::uint64_t seed) {
+    constexpr std::uint64_t Prime = 0x100000001b3ull;
+    std::uint64_t a = 0xcbf29ce484222325ull ^ seed, b = a ^ 0x9e3779b97f4a7c15ull, c = a ^ 0xbf58476d1ce4e5b9ull, d = a ^ 0x94d049bb133111ebull;
+    std::size_t i = 0;
+    for (; i + 4 <= words.size(); i += 4) {
+        a = (a ^ words[i]) * Prime;
+        b = (b ^ words[i + 1]) * Prime;
+        c = (c ^ words[i + 2]) * Prime;
+        d = (d ^ words[i + 3]) * Prime;
+    }
+    for (; i < words.size(); ++i) a = (a ^ words[i]) * Prime;
+    auto hash = a ^ std::rotl(b, 17) ^ std::rotl(c, 31) ^ std::rotl(d, 47) ^ words.size();
+    hash ^= hash >> 31u;
+    hash *= 0x9e3779b97f4a7c15ull;
+    hash ^= hash >> 29u;
+    return hash;
+}
+
+}
+
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shapeKey) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
-    // Each key is two FNV lanes taking alternate values, a register's offset and value as one word:
-    // one chain of two multiplies per register made the key about a microsecond of every draw.
-    // Only equality of keys within the process matters. Mixes into both keys; mixUser only into the
-    // whole key.
-    struct Lanes {
-        std::uint64_t a = 0xcbf29ce484222325ull, b = 0x84222325cbf29ce4ull;
-        bool odd = false;
-        void Mix(std::uint64_t value) {
-            auto& lane = odd ? b : a;
-            lane = (lane ^ value) * 0x100000001b3ull;
-            odd = !odd;
-        }
-        std::uint64_t Value() const { return (a ^ ((b << 31u) | (b >> 33u))) * 0x9e3779b97f4a7c15ull; }
-    };
-    Lanes key, shape;
-    const auto mix = [&](std::uint64_t value) {
-        key.Mix(value);
-        shape.Mix(value);
-    };
-    const auto mixUser = [&](std::uint64_t value) { key.Mix(value); };
+    // The registers are gathered as words (offset and value) and hashed afterwards: the shape key
+    // over all but the user data words, the whole key over the user data words seeded with the shape
+    // key. Only equality of keys within the process matters.
+    std::array<std::uint64_t, drawKeyWordCapacity()> shared;
+    std::array<std::uint64_t, drawKeyWordCapacity()> user;
+    std::size_t sharedWords = 0, userWords = 0;
     const auto userEnd = [&](std::uint32_t base) {
         if (allUserWords) return base + 32u;
         const auto resources = queue.shader.find(base - 1);
@@ -50,41 +69,41 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     const auto userWord = [&](std::uint32_t offset) {
         return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.first && offset < user.second; });
     };
-    mix(deviceSerial);
+    shared[sharedWords++] = deviceSerial;
     for (const auto& range : Graphics::DrawKeyRegisters) {
         const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
-        mix((static_cast<std::uint64_t>(range.bank) << 32u) | range.first);
+        shared[sharedWords++] = (static_cast<std::uint64_t>(range.bank) << 32u) | range.first;
         const auto end = range.first + range.count;
         const bool shader = range.bank == Graphics::RegisterBank::Shader;
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
             if (shader && unread(it->first)) continue;
             const auto word = (static_cast<std::uint64_t>(it->first) << 32u) | it->second;
-            if (shader && userWord(it->first)) {
-                mixUser(word);
-                continue;
-            }
-            mix(word);
+            if (shader && userWord(it->first)) user[userWords++] = word;
+            else shared[sharedWords++] = word;
         }
     }
+    std::uint64_t programs = 0xcbf29ce484222325ull;
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
         const auto low = queue.shader.find(base);
         const auto high = queue.shader.find(base + 1);
         if (low == queue.shader.end() || high == queue.shader.end()) {
-            mix(0);
+            programs = (programs ^ 0u) * 0x100000001b3ull;
             continue;
         }
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
         auto it = registry.upper_bound(address);
         if (it == registry.begin()) {
-            mix(1);
+            programs = (programs ^ 1u) * 0x100000001b3ull;
             continue;
         }
         --it;
-        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
-        mix(address - it->first);
+        for (const auto& snapshot : it->second) programs = (programs ^ reinterpret_cast<std::uintptr_t>(snapshot.get())) * 0x100000001b3ull;
+        programs = (programs ^ (address - it->first)) * 0x100000001b3ull;
     }
-    if (shapeKey != nullptr) *shapeKey = shape.Value();
-    return key.Value();
+    shared[sharedWords++] = programs;
+    const auto shape = hashDrawKeyWords(std::span(shared).first(sharedWords), 0);
+    if (shapeKey != nullptr) *shapeKey = shape;
+    return hashDrawKeyWords(std::span(user).first(userWords), shape);
 }
 
 std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages, bool* shared) {

@@ -271,6 +271,11 @@ public:
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
+    // The same lists filled into `out` (cleared first), and whether one in-place read covers a range:
+    // a draw asks these of its template every time, and the lists allocated anew each time.
+    void InPlaceReadsInto(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
+    void DeviceReadsInto(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
+    bool ReadsInPlace(std::uint64_t address, std::uint64_t bytes) const;
 
 private:
     struct Region {
