@@ -37,6 +37,7 @@
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
+#include "Optimization/SrtWalker/SrtCompiledWalk.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
 #include "Optimization/include/Optimization/TessellationLowering.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
@@ -277,6 +278,8 @@ struct SourceEntry {
     // points into a registration the driver may replace while the entry lives on.
     std::vector<std::uint32_t> code;
     std::shared_ptr<const IrResourcePlan> plan;
+    // The plan's compiled SRT walk, set with it; null when the walk stays with the evaluator.
+    std::shared_ptr<const Detail::CompiledWalk> walk;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
     // title issues every frame (0x1048947300 at the intro video). APS5_NO_FAILURE_MEMO=1 rebuilds.
@@ -363,6 +366,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
             try {
                 ResourceProgram resource(request, preparation);
+                source->walk = Detail::CompileWalk(*resource.plan);
                 source->plan = std::move(resource.plan);
                 source->program = std::move(resource.program);
             } catch (...) {
@@ -1083,17 +1087,87 @@ std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& re
 
 namespace {
 
-// The capture's materialization; with pure flat slots in the plan the walk's read addresses are
-// traced into the capture (ResourceCapture::readTrace).
+// APS5_VERIFY_SRT_TAPE=1: a capture walked with the compiled walk is walked again with the
+// evaluator, and the two are compared; the evaluator's outcome is the one kept.
+bool VerifySrtTape() {
+    static const bool verify = std::getenv("APS5_VERIFY_SRT_TAPE") != nullptr;
+    return verify;
+}
+
+struct WalkOutcome {
+    ResourceSnapshot snapshot;
+    SrtReadTrace trace;
+    std::exception_ptr failure;
+    std::string reason;
+};
+
+void walkOutcome(const IrResourcePlan& plan, SrtRuntime runtime, bool traced, WalkOutcome& outcome) {
+    if (traced) runtime.readTrace = &outcome.trace;
+    try {
+        ResourceMaterializer{}.Materialize(plan, runtime, outcome.snapshot);
+    } catch (const std::exception& failure) {
+        outcome.failure = std::current_exception();
+        outcome.reason = failure.what();
+    }
+}
+
+const char* walkDifference(const WalkOutcome& tape, const WalkOutcome& expected) {
+    if ((tape.failure != nullptr) != (expected.failure != nullptr)) return tape.failure != nullptr ? "only the tape failed" : "only the evaluator failed";
+    if (tape.failure != nullptr) return tape.reason != expected.reason ? "failure reasons" : nullptr;
+    const auto& a = tape.snapshot;
+    const auto& b = expected.snapshot;
+    if (a.buffers != b.buffers) return "buffers";
+    if (a.images != b.images) return "images";
+    if (a.samplers != b.samplers) return "samplers";
+    if (a.flattenedSrt != b.flattenedSrt) return "flattened SRT";
+    if (a.userData != b.userData) return "user data";
+    if (!(a.uniformFill == b.uniformFill)) return "uniform fill";
+    if (a.srtPoison != b.srtPoison) return "poison";
+    if (a.nullRootReads != b.nullRootReads) return "null root reads";
+    if (tape.trace.leaves != expected.trace.leaves) return "traced leaves";
+    if (tape.trace.otherReads != expected.trace.otherReads) return "traced reads";
+    return nullptr;
+}
+
+void materializeVerified(ResourceCapture& capture, const SrtRuntime& runtime, bool traced) {
+    static std::atomic<std::uint64_t> walks{0};
+    static std::atomic<std::uint64_t> differences{0};
+    const auto& plan = *capture.plan;
+    WalkOutcome tape;
+    walkOutcome(plan, runtime, traced, tape);
+    SrtRuntime plain = runtime;
+    plain.compiled = nullptr;
+    WalkOutcome expected;
+    walkOutcome(plan, plain, traced, expected);
+    const auto count = walks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (const char* difference = walkDifference(tape, expected); difference != nullptr) {
+        const auto seen = differences.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (seen <= 16) std::fprintf(stderr, "[srt] tape verify: shader %llx differs in %s (tape: %s; evaluator: %s)\n", static_cast<unsigned long long>(plan.shaderHash), difference, tape.failure != nullptr ? tape.reason.c_str() : "walked", expected.failure != nullptr ? expected.reason.c_str() : "walked");
+    }
+    if ((count & (count - 1)) == 0 || count % 100000 == 0) {
+        const auto compiled = Detail::CompiledWalkStatistics();
+        std::fprintf(stderr, "[srt] tape verify: %llu walks compared, %llu differences; %llu plans compiled, %llu left to the evaluator\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)), static_cast<unsigned long long>(compiled.compiled), static_cast<unsigned long long>(compiled.refused));
+    }
+    if (expected.failure != nullptr) std::rethrow_exception(expected.failure);
+    capture.snapshot = std::move(expected.snapshot);
+    capture.readTrace = std::move(expected.trace);
+}
+
+// The capture's materialization, with the source's compiled walk when it has one; with pure flat
+// slots in the plan the walk's read addresses are traced into the capture
+// (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
-    if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot);
-        return;
+    SrtRuntime walked = runtime;
+    if (capture.source != nullptr && capture.source->plan == capture.plan) walked.compiled = capture.source->walk.get();
+    const bool traced = std::any_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; });
+    if (walked.compiled != nullptr && VerifySrtTape()) {
+        materializeVerified(capture, walked, traced);
+    } else {
+        if (traced) walked.readTrace = &capture.readTrace;
+        ResourceMaterializer{}.Materialize(plan, walked, capture.snapshot);
     }
-    SrtRuntime traced = runtime;
-    traced.readTrace = &capture.readTrace;
-    ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
+    if (!traced) return;
     auto& other = capture.readTrace.otherReads;
     std::sort(other.begin(), other.end());
     other.erase(std::unique(other.begin(), other.end()), other.end());

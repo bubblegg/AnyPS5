@@ -1,9 +1,11 @@
 #include "Optimization/SrtWalker.hpp"
+#include "Optimization/SrtWalker/SrtCompiledWalk.hpp"
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtPlanBuilder.hpp"
 #include "Optimization/SrtWalker/SrtRuntimeValidator.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -27,6 +29,15 @@ void SrtWalker::EvaluateUniformValues(const IrResourcePlan& program, std::span<I
     }
     auto clean = runtime;
     clean.readMemory = runtime.readSpecializationMemory != nullptr ? runtime.readSpecializationMemory : +[](void*, std::uint64_t, std::uint32_t*) { return false; };
+    if (const auto* compiled = Detail::UsableWalk(runtime, program); compiled != nullptr && values.data() == program.uniformFill.values.data() && values.size() <= compiled->uniformValues.size() && std::none_of(compiled->uniformValues.begin(), compiled->uniformValues.begin() + values.size(), [](std::uint32_t node) { return node == Detail::NoWalkNode; })) {
+        Detail::CompiledEvaluator evaluator(*compiled, clean);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (!evaluator.Evaluate(compiled->uniformValues[i], results[i])) {
+                throw std::runtime_error("SrtWalker::EvaluateUniformValues failed to evaluate a uniform value");
+            }
+        }
+        return;
+    }
     Detail::Evaluator evaluator(program, clean);
     for (std::size_t i = 0; i < values.size(); ++i) {
         if (!evaluator.Evaluate(values[i], results[i])) {

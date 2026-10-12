@@ -10,6 +10,10 @@
 
 namespace ShaderRecompiler {
 
+namespace Detail {
+struct CompiledWalk;
+}
+
 using SrtMemoryReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* value);
 using SrtMemoryProbe = bool (*)(void* userData, std::uint64_t address, std::uint64_t bytes);
 
@@ -32,6 +36,9 @@ struct SrtRuntime {
     SrtMemoryReader readSpecializationMemory = nullptr;
     SrtReadTrace* readTrace = nullptr;
     SrtMemoryProbe accessible = nullptr;
+    // The plan's compiled walk (Detail::CompileWalk), used when it belongs to the plan walked;
+    // null walks with the evaluator.
+    const Detail::CompiledWalk* compiled = nullptr;
 };
 
 enum class RuntimeValueType {
