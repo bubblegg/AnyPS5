@@ -76,13 +76,22 @@ private:
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
+    // Only the words whose `valid` bit is set are ever read, so a page starts with its words as
+    // they are.
     struct Page {
-        std::array<std::uint32_t, PageWords> words{};
+        std::array<std::uint32_t, PageWords> words;
         std::bitset<PageWords> valid;
         std::bitset<PageWords> read;
         std::bitset<PageWords> recent;
         bool wordwise = false;
     };
+    // Pages come from a pool and go back to it: a draw captures a handful, the preparing thread
+    // made each (4.5 KiB, zeroed) and the recording thread freed it with the draw.
+    struct PageRelease {
+        void operator()(Page* page) const noexcept;
+    };
+    using PagePointer = std::unique_ptr<Page, PageRelease>;
+    static PagePointer takePage();
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
@@ -91,7 +100,7 @@ private:
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.
     std::map<std::uint64_t, std::span<const std::byte>> initial;
-    std::map<std::uint64_t, Page> pages;
+    std::map<std::uint64_t, PagePointer> pages;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;

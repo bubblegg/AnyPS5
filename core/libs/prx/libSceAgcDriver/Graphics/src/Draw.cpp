@@ -1186,6 +1186,40 @@ void rememberPipeline(const Context&, const ShaderResources& resources, VkImageL
     memo.pipelineGeneration = memo.generation;
 }
 
+// The shape's remembered template when the draw's resource cache key (DrawResourceKey without the
+// ranges) is the remembered one and the cache still holds the object: what Find would return for
+// the key, without building or hashing it. Every 64th draw of the shape finds it the long way,
+// which keeps the cache's order of use current.
+std::shared_ptr<ShaderResources> memoResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, DrawShapeMemo& memo) {
+    const std::span<const std::uint32_t> key(memo.resourceKey);
+    if (memo.refresh || key.size() < 5) return nullptr;
+    const auto device = reinterpret_cast<std::uint64_t>(context.device);
+    if (key[0] != 0xffffffffu || key[1] != static_cast<std::uint32_t>(device) || key[2] != static_cast<std::uint32_t>(device >> 32u) || key[3] != shaders.size()) return nullptr;
+    std::size_t at = 4;
+    for (const auto& shader : shaders) {
+        if (at >= key.size()) return nullptr;
+        const std::size_t words = key[at++];
+        if (words > key.size() - at || !ShaderResources::ContentKeyIs(shader, true, MovableBuffers(), key.subspan(at, words))) return nullptr;
+        at += words;
+    }
+    if (at + 1 != key.size() || key[at] != colorAttachments) return nullptr;
+    auto resources = memo.resources.lock();
+    if (resources == nullptr || !resources->InResourceCache()) return nullptr;
+    if (memo.verify) {
+        const auto built = DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, false);
+        const auto found = built == memo.resourceKey ? SharedResourceCache().Find(built) : nullptr;
+        shapeMemoVerified(built != memo.resourceKey ? "resource key" : found != resources ? "resource template" : nullptr);
+        if (found != resources) return nullptr;
+    }
+    DrawShapeMemoCounters().resources.fetch_add(1, std::memory_order_relaxed);
+    return resources;
+}
+
+void rememberResources(DrawShapeMemo& memo, const ResourceCache::Key& key, const std::shared_ptr<ShaderResources>& resources) {
+    if (&memo.resourceKey != &key) memo.resourceKey = key;
+    memo.resources = resources;
+}
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, DrawShapeMemo* memo = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1447,11 +1481,13 @@ struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
     std::vector<ShaderResources::MovedBuffer> moved;
     ResourceCache::Key contentKey;
+    // The template came from the shape's memo, whose key is the draw's; `contentKey` is empty.
+    bool remembered = false;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, DrawShapeMemo* memo = nullptr) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1467,14 +1503,22 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        const auto colorAttachments = static_cast<std::uint32_t>(state.colors.size());
+        std::shared_ptr<ShaderResources> cached;
+        if (memo != nullptr && trimKey) cached = memoResources(context, shaders, state.color, colorAttachments, draw.indexAddress, indexBytes, *memo);
+        resolved.remembered = cached != nullptr;
+        if (!resolved.remembered) {
+            resolved.contentKey = DrawResourceKey(context, shaders, state.color, colorAttachments, draw.indexAddress, indexBytes, !trimKey);
+            cached = SharedResourceCache().Find(resolved.contentKey);
+        }
+        if (cached != nullptr) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                if (memo != nullptr && trimKey && !resolved.remembered) rememberResources(*memo, resolved.contentKey, cached);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -1482,9 +1526,16 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
             } else {
-                SharedResourceCache().Remove(resolved.contentKey);
+                if (resolved.remembered) SharedResourceCache().Remove(memo->resourceKey, cached.get());
+                else SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
+        }
+        // A remembered template that does not serve the draw after all: the build below is
+        // inserted under the key.
+        if (resolved.remembered && resolved.resources == nullptr) {
+            resolved.contentKey = memo->resourceKey;
+            resolved.remembered = false;
         }
     } else {
         countCache(&DrawProfile::uncacheable);
@@ -2180,9 +2231,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, memo);
     auto& resources = resolved.resources;
-    const auto& contentKey = resolved.contentKey;
+    const auto& contentKey = resolved.remembered ? memo->resourceKey : resolved.contentKey;
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
     // The memory-state decision of an indirect draw, made here after the resource build (which may
@@ -2284,7 +2335,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) {
+        SharedResourceCache().Insert(contentKey, resources);
+        if (memo != nullptr && resources->InResourceCache()) rememberResources(*memo, contentKey, resources);
+    }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.

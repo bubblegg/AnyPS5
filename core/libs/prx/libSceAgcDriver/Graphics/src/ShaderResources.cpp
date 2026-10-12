@@ -1868,6 +1868,16 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
     return key;
 }
 
+bool ShaderResources::ContentKeyIs(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> key) {
+    std::size_t cursor = 0;
+    bool equal = true;
+    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) {
+        equal &= cursor < key.size() && key[cursor] == word;
+        ++cursor;
+    });
+    return equal && cursor == key.size();
+}
+
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
     std::size_t cursor = 0;
     bool equal = true;
@@ -2689,10 +2699,12 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
     if (const auto found = index.find(key); found != index.end()) {
+        found->second->second->inResourceCache.store(false, std::memory_order_release);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
     }
+    resources->inResourceCache.store(true, std::memory_order_release);
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     static const std::size_t capacity = [] {
@@ -2701,6 +2713,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) {
+        entries.back().second->inResourceCache.store(false, std::memory_order_release);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
@@ -2723,6 +2736,7 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        it->second->inResourceCache.store(false, std::memory_order_release);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -2748,6 +2762,7 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
+    for (const auto& entry : entries) entry.second->inResourceCache.store(false, std::memory_order_release);
     index.clear();
     entries.clear();
 }
@@ -2760,6 +2775,7 @@ std::size_t ResourceCache::Size() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    found->second->second->inResourceCache.store(false, std::memory_order_release);
     entries.erase(found->second);
     index.erase(found);
 }

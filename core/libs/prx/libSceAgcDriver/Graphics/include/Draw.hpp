@@ -50,10 +50,15 @@ struct DrawShapeMemo {
     std::vector<std::uint32_t> mainKey, fragmentKey;
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::uint32_t proxiedTargets = 0;
+    // The resource cache key of the shape's last draw and the template the cache served it with:
+    // a draw whose key is the same (compared word by word, not built and hashed) takes the
+    // template while the cache still holds it, and proves it current as after a lookup.
+    ResourceCache::Key resourceKey;
+    std::weak_ptr<ShaderResources> resources;
 };
 
 struct DrawShapeMemoCounts {
-    std::atomic<std::uint64_t> draws{0}, outputs{0}, layouts{0}, pipelines{0};
+    std::atomic<std::uint64_t> draws{0}, outputs{0}, layouts{0}, pipelines{0}, resources{0};
 };
 DrawShapeMemoCounts& DrawShapeMemoCounters();
 

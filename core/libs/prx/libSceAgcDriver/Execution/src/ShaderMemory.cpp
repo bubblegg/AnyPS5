@@ -108,10 +108,55 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
     }
 }
 
+namespace {
+
+constexpr std::size_t PooledPages = 4096;
+
+struct PagePool {
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
+    std::vector<void*> pages;
+};
+
+// Never destroyed: pages are returned by whichever thread ends a draw, at any time.
+PagePool& pagePool() {
+    static auto* pool = new PagePool();
+    return *pool;
+}
+
+}
+
+ShaderMemory::PagePointer ShaderMemory::takePage() {
+    auto& pool = pagePool();
+    Page* page = nullptr;
+    while (pool.lock.test_and_set(std::memory_order_acquire)) {
+    }
+    if (!pool.pages.empty()) {
+        page = static_cast<Page*>(pool.pages.back());
+        pool.pages.pop_back();
+    }
+    pool.lock.clear(std::memory_order_release);
+    if (page == nullptr) return PagePointer(new Page);
+    page->valid.reset();
+    page->read.reset();
+    page->recent.reset();
+    page->wordwise = false;
+    return PagePointer(page);
+}
+
+void ShaderMemory::PageRelease::operator()(Page* page) const noexcept {
+    auto& pool = pagePool();
+    while (pool.lock.test_and_set(std::memory_order_acquire)) {
+    }
+    const bool kept = pool.pages.size() < PooledPages;
+    if (kept) pool.pages.push_back(page);
+    pool.lock.clear(std::memory_order_release);
+    if (!kept) delete page;
+}
+
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     const auto found = pages.find(base);
-    if (found != pages.end()) return found->second;
-    auto& page = pages[base];
+    if (found != pages.end()) return *found->second;
+    auto& page = *(pages[base] = takePage());
     ++CaptureTotals().pages;
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
@@ -302,8 +347,8 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
             result.push_back({next->first, next->second});
             ++next;
         }
-        forEachRun(page.read, [&](std::size_t first, std::size_t end) {
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, end - first))});
+        forEachRun(page->read, [&](std::size_t first, std::size_t end) {
+            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page->words).subspan(first, end - first))});
         });
     }
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
@@ -313,11 +358,11 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
     for (auto& [base, page] : pages) {
-        if (page.recent.none()) continue;
-        forEachRun(page.recent, [&](std::size_t first, std::size_t end) {
-            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page.words).subspan(first, end - first))});
+        if (page->recent.none()) continue;
+        forEachRun(page->recent, [&](std::size_t first, std::size_t end) {
+            result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page->words).subspan(first, end - first))});
         });
-        page.recent.reset();
+        page->recent.reset();
     }
     return result;
 }
