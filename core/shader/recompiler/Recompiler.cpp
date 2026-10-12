@@ -1087,11 +1087,16 @@ std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& re
 
 namespace {
 
-// APS5_VERIFY_SRT_TAPE=1: a capture walked with the compiled walk is walked again with the
-// evaluator, and the two are compared; the evaluator's outcome is the one kept.
+// APS5_VERIFY_SRT_TAPE=N: every Nth capture walked with the compiled walk is walked again with
+// the evaluator, and the two are compared; the evaluator's outcome is the one kept. A count that
+// shares no factor with a frame's captures (17, say) moves the sample through the frame's draws.
 bool VerifySrtTape() {
-    static const bool verify = std::getenv("APS5_VERIFY_SRT_TAPE") != nullptr;
-    return verify;
+    static const std::uint64_t interval = [] {
+        const char* text = std::getenv("APS5_VERIFY_SRT_TAPE");
+        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
+    }();
+    static std::atomic<std::uint64_t> captures{0};
+    return interval != 0u && captures.fetch_add(1, std::memory_order_relaxed) % interval == 0u;
 }
 
 struct WalkOutcome {
