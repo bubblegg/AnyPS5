@@ -135,7 +135,8 @@ private:
     static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shapeKey = nullptr);
     // A decode of the same shape (registers apart from the user data words) with this draw's
     // programs and user data, or nullptr; and the store of a fresh decode under its shape.
-    std::shared_ptr<const DrawDecode> shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages = nullptr);
+    std::shared_ptr<const DrawDecode> shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages = nullptr, bool* shared = nullptr);
+    static void readShapeUserWords(std::vector<DrawProgram>& programs, const QueueState& queue);
     void keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const DrawDecode>& decode);
     // Whether a draw that missed the cache should insert an entry (and build a recipe): not for a
     // shape whose draws rarely find their entry again, apart from an occasional probe.

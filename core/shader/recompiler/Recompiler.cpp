@@ -632,6 +632,8 @@ struct StageMemo {
     std::shared_ptr<PreparedModuleEntry> module;
     // Oldest at `next`; grows only while the oldest is still held by a draw.
     std::vector<std::shared_ptr<const RecompileResult>> results;
+    // The binding plan each held result's bindings were populated from (see Populate's `held`).
+    std::vector<const DescriptorBindingPlan*> populated;
     std::size_t next = 0;
 };
 
@@ -762,31 +764,40 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
 // `recycled`, when given, is a result nobody else holds any more: its bindings, push constants and
 // vertex attributes are taken over and overwritten, which saves the dozens of small allocations a
 // result of the same shader would make for them.
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, RecompileResult* recycled = nullptr, StageMemo* memo = nullptr) {
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, RecompileResult* recycled = nullptr, StageMemo* memo = nullptr, const DescriptorBindingPlan** populated = nullptr) {
     RecompileResult result;
     const auto& artifact = variant.artifact;
-    static_cast<CompiledShaderArtifact&>(result) = {
-        .memoryOffsetDword = artifact.memoryOffsetDword,
-        .shaderDataDwords = artifact.shaderDataDwords,
-        .imageMetadataDword = artifact.imageMetadataDword,
-        .runtimeImageCount = artifact.runtimeImageCount,
-        .runtimeImageResources = artifact.runtimeImageResources,
-        .registrationModule = artifact.registrationModule,
-        .bdaAbiVersion = artifact.bdaAbiVersion,
-        .runtimeAbiVersion = artifact.runtimeAbiVersion,
-        .vertexInputs = artifact.vertexInputs,
-        .vertexOffsetSgpr = artifact.vertexOffsetSgpr,
-        .instanceOffsetSgpr = artifact.instanceOffsetSgpr,
-        .vertexOffsetShared = artifact.vertexOffsetShared,
-        .instanceOffsetShared = artifact.instanceOffsetShared,
-        .vertexOffsetConflict = artifact.vertexOffsetConflict,
-        .instanceOffsetConflict = artifact.instanceOffsetConflict,
-        .hostSubgroupSize = artifact.hostSubgroupSize,
-        .parameterExports = artifact.parameterExports,
-        .fragmentParameters = artifact.fragmentParameters,
-        .barycentricEmulation = artifact.barycentricEmulation,
-        .variantId = artifact.variantId
-    };
+    // APS5_NO_HELD_BINDINGS=1 copies the artifact's part and assigns every binding's descriptor anew, as before.
+    static const bool heldBindings = std::getenv("APS5_NO_HELD_BINDINGS") == nullptr;
+    // A recycled result of this variant holds the variant's part already (four vectors a copy would
+    // allocate again for every stage of every draw).
+    if (heldBindings && recycled != nullptr && artifact.variantId != 0 && recycled->variantId == artifact.variantId) {
+        static_cast<CompiledShaderArtifact&>(result) = std::move(static_cast<CompiledShaderArtifact&>(*recycled));
+        result.spirv = SharedSpirv{};
+    } else {
+        static_cast<CompiledShaderArtifact&>(result) = {
+            .memoryOffsetDword = artifact.memoryOffsetDword,
+            .shaderDataDwords = artifact.shaderDataDwords,
+            .imageMetadataDword = artifact.imageMetadataDword,
+            .runtimeImageCount = artifact.runtimeImageCount,
+            .runtimeImageResources = artifact.runtimeImageResources,
+            .registrationModule = artifact.registrationModule,
+            .bdaAbiVersion = artifact.bdaAbiVersion,
+            .runtimeAbiVersion = artifact.runtimeAbiVersion,
+            .vertexInputs = artifact.vertexInputs,
+            .vertexOffsetSgpr = artifact.vertexOffsetSgpr,
+            .instanceOffsetSgpr = artifact.instanceOffsetSgpr,
+            .vertexOffsetShared = artifact.vertexOffsetShared,
+            .instanceOffsetShared = artifact.instanceOffsetShared,
+            .vertexOffsetConflict = artifact.vertexOffsetConflict,
+            .instanceOffsetConflict = artifact.instanceOffsetConflict,
+            .hostSubgroupSize = artifact.hostSubgroupSize,
+            .parameterExports = artifact.parameterExports,
+            .fragmentParameters = artifact.fragmentParameters,
+            .barycentricEmulation = artifact.barycentricEmulation,
+            .variantId = artifact.variantId
+        };
+    }
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, memo);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
@@ -892,7 +903,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         bindings.bindings = std::move(recycled->bindings);
         bindings.pushConstants = std::move(recycled->pushConstants);
     }
-    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
+    const bool held = heldBindings && recycled != nullptr && populated != nullptr && *populated == bindingPlan;
+    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), held);
+    if (populated != nullptr) *populated = bindingPlan;
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
@@ -1405,7 +1418,8 @@ void verifyStageMemo(const CompiledVariant& variant, const RecompileRequest& req
     const auto sameAttributes = std::ranges::equal(result.vertexAttributes, plain.vertexAttributes, [](const VertexAttribute& a, const VertexAttribute& b) {
         return a.location == b.location && a.components == b.components && a.resource.fields == b.resource.fields && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents;
     });
-    const char* difference = result.spirv.data() != plain.spirv.data() ? "module" : result.specializationId != plain.specializationId ? "specialization" : result.bindings != plain.bindings ? "bindings" : result.pushConstants != plain.pushConstants ? "push constants" : !sameAttributes ? "vertex attributes" : result.workgroupMemoryDwords != plain.workgroupMemoryDwords || result.poisonedSrtReads != plain.poisonedSrtReads ? "counts" : nullptr;
+    const bool sameArtifact = result.variantId == plain.variantId && result.memoryOffsetDword == plain.memoryOffsetDword && result.shaderDataDwords == plain.shaderDataDwords && result.imageMetadataDword == plain.imageMetadataDword && result.runtimeImageCount == plain.runtimeImageCount && result.runtimeImageResources == plain.runtimeImageResources && result.registrationModule == plain.registrationModule && result.vertexInputPatches.size() == plain.vertexInputPatches.size() && result.vertexInputs == plain.vertexInputs && result.vertexOffsetSgpr == plain.vertexOffsetSgpr && result.instanceOffsetSgpr == plain.instanceOffsetSgpr && result.vertexOffsetShared == plain.vertexOffsetShared && result.instanceOffsetShared == plain.instanceOffsetShared && result.vertexOffsetConflict == plain.vertexOffsetConflict && result.instanceOffsetConflict == plain.instanceOffsetConflict && result.hostSubgroupSize == plain.hostSubgroupSize && result.parameterExports == plain.parameterExports && std::ranges::equal(result.fragmentParameters, plain.fragmentParameters, [](const FragmentParameter& a, const FragmentParameter& b) { return a.location == b.location && a.sourceLocation == b.sourceLocation && a.flat == b.flat && a.perVertex == b.perVertex && a.custom == b.custom; }) && result.barycentricEmulation.active == plain.barycentricEmulation.active && result.barycentricEmulation.smooth == plain.barycentricEmulation.smooth && result.barycentricEmulation.linear == plain.barycentricEmulation.linear;
+    const char* difference = !sameArtifact ? "variant part" : result.spirv.data() != plain.spirv.data() ? "module" : result.specializationId != plain.specializationId ? "specialization" : result.bindings != plain.bindings ? "bindings" : result.pushConstants != plain.pushConstants ? "push constants" : !sameAttributes ? "vertex attributes" : result.workgroupMemoryDwords != plain.workgroupMemoryDwords || result.poisonedSrtReads != plain.poisonedSrtReads ? "counts" : nullptr;
     const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
     if (difference != nullptr && differences.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[stage-memo] verify: a result of variant %llu differs in its %s from one materialized without the memo\n", static_cast<unsigned long long>(variant.artifact.variantId), difference);
     if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[stage-memo] verify: %llu results compared, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
@@ -1428,14 +1442,18 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
             slot = oldest;
         }
     }
-    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, const_cast<RecompileResult*>(recycled.get()), memo));
+    if (memo->populated.size() < held.size()) memo->populated.resize(held.size(), nullptr);
+    const DescriptorBindingPlan* populated = recycled != nullptr ? memo->populated[slot] : nullptr;
+    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, const_cast<RecompileResult*>(recycled.get()), memo, &populated));
     recycled.reset();
     result->cacheHit = true;
     verifyStageMemo(*handle->artifact, request, capture.snapshot, *result);
     if (slot == held.size()) {
         held.push_back(result);
+        memo->populated.push_back(populated);
     } else {
         held[slot] = result;
+        memo->populated[slot] = populated;
         memo->next = slot + 1;
     }
     return result;

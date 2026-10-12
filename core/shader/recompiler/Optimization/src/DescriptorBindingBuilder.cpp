@@ -500,20 +500,25 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     return selected;
 }
 
-void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
+void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, bool held) const {
     const auto& layout = compiled.layout;
     const bool needsShaderData = layout.UsesPushData() || plan.storageData;
     auto shaderData = needsShaderData ? ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads, plan.imageMetadata, plan.runtimeState) : std::vector<std::uint32_t>{};
     // Written in place: the allocation may come with the bindings of an earlier result of the same
     // plan (a recycled memo entry), and assigning over those reuses every vector they hold.
     auto& bindings = allocation.bindings;
+    if (bindings.size() != plan.bindings.size()) held = false;
     bindings.resize(plan.bindings.size());
     std::size_t writtenHere = 0;
     std::size_t readOnlyHere = 0;
     std::size_t next = 0;
     for (const auto& entry : plan.bindings) {
         auto& physical = bindings[next++];
-        physical = entry.descriptor;
+        // A held binding is the plan's descriptor already (some fifteen vectors, assigned for every
+        // binding of every stage of every draw otherwise); only its guest descriptor is the last
+        // draw's, and the roles below that do not overwrite it start from the plan's again.
+        if (!held) physical = entry.descriptor;
+        else if (const auto role = physical.role; role != DescriptorRole::GuestBuffers && role != DescriptorRole::GuestSamplers && role != DescriptorRole::FlattenedSrt && role != DescriptorRole::ShaderData) physical.guestDescriptor = entry.descriptor.guestDescriptor;
         switch (physical.role) {
         case DescriptorRole::GuestBuffers:
             GuestBuffersDescriptor(physical.guestDescriptor, entry.resources, snapshot);

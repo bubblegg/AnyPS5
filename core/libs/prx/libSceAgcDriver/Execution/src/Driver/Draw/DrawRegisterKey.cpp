@@ -81,8 +81,9 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     return key;
 }
 
-std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages) {
+std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages, bool* shared) {
     static const bool disabled = std::getenv("APS5_NO_SHAPE_DECODE") != nullptr;
+    static const bool sharing = std::getenv("APS5_NO_SHARED_SHAPE_DECODE") == nullptr;
     static const bool stageMemo = std::getenv("APS5_NO_STAGE_MEMO") == nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_SHAPE_DECODE") != nullptr;
     if (disabled) return nullptr;
@@ -96,20 +97,22 @@ std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, co
         if (profile) ++(cached != nullptr ? drawEntryCounters.shapeDecodeHits : drawEntryCounters.shapeDecodeMisses);
     }
     if (cached == nullptr) return nullptr;
+    // The draws of a shape share its decode: a draw copied it (the state, the programs and their
+    // vectors) to write its own user data words into the copy, and the thread that records the
+    // draw destroyed the copy. The caller reads the words into its own programs instead
+    // (readShapeUserWords). A mesh shape keeps its copy (its hidden user words are the draw's).
+    // APS5_NO_SHARED_SHAPE_DECODE=1 copies as before.
+    if (sharing && shared != nullptr && !verify && !cached->state.stages.mesh && DecodeProgramsCurrent(*cached, *submission.shaders)) {
+        *shared = true;
+        return cached;
+    }
     // The register state and the pixel stage read no user data words. The programs are those of the
     // shape too (the key holds their snapshots, offsets and merged-stage pointers), so only their user
     // data words are read again; a raw program rewritten since is decoded afresh.
     std::shared_ptr<DrawDecode> decode;
     if (DecodeProgramsCurrent(*cached, *submission.shaders)) {
         decode = std::make_shared<DrawDecode>(*cached);
-        for (auto& program : decode->programs) {
-            if (program.userData.empty()) continue;
-            const auto found = queue.shader.find(program.userDataBase - 1);
-            const auto resources = found == queue.shader.end() ? 0u : found->second;
-            const auto count = std::min<std::size_t>(((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u), program.userData.size());
-            const auto first = program.userData.size() - count;
-            for (std::size_t i = 0; i < count; ++i) program.userData[first + i] = readUserData(queue.shader, program.userDataBase + static_cast<std::uint32_t>(i));
-        }
+        readShapeUserWords(decode->programs, queue);
     } else {
         decode = std::make_shared<DrawDecode>();
         decode->state = cached->state;
@@ -127,6 +130,17 @@ std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, co
         }
     }
     return decode;
+}
+
+void Driver::readShapeUserWords(std::vector<DrawProgram>& programs, const QueueState& queue) {
+    for (auto& program : programs) {
+        if (program.userData.empty()) continue;
+        const auto found = queue.shader.find(program.userDataBase - 1);
+        const auto resources = found == queue.shader.end() ? 0u : found->second;
+        const auto count = std::min<std::size_t>(((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u), program.userData.size());
+        const auto first = program.userData.size() - count;
+        for (std::size_t i = 0; i < count; ++i) program.userData[first + i] = readUserData(queue.shader, program.userDataBase + static_cast<std::uint32_t>(i));
+    }
 }
 
 void Driver::keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const DrawDecode>& decode) {

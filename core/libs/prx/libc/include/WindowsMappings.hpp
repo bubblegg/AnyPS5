@@ -232,6 +232,7 @@ public:
         *count = 0;
         const auto end = address + bytes;
         if (clear && !collectable(address, end)) return false;
+        auto next = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -242,7 +243,9 @@ public:
                 }
             }
             const auto base = cursor & ~(pageBytes - 1);
-            const auto found = views.find(base);
+            if (next != views.end() && next->first + 64 * pageBytes < base) next = views.lower_bound(base);
+            while (next != views.end() && next->first < base) ++next;
+            const auto found = next != views.end() && next->first == base ? next : views.end();
             if (found != views.end()) {
                 auto& view = found->second;
                 const auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
@@ -293,12 +296,17 @@ private:
     // APS5_REARM_WRITTEN_PAGES=1 protects a written page again at once, as before.
     const bool quietPages = std::getenv("APS5_REARM_WRITTEN_PAGES") == nullptr;
 
+    // The views are walked in their order: a lookup per page was a descent of the whole map for each
+    // of the hundreds of pages of a render target, on every collect of one.
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
+        auto next = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
-            if (const auto found = views.find(base); found != views.end()) {
-                if (found->second.protection == PAGE_NOACCESS) return false;
+            while (next != views.end() && next->first < base) ++next;
+            if (next != views.end() && next->first == base) {
+                if (next->second.protection == PAGE_NOACCESS) return false;
                 cursor = std::min(end, base + pageBytes);
+                ++next;
                 continue;
             }
             const auto memory = query(cursor);

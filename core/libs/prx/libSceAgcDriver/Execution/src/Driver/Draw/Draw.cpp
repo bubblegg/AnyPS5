@@ -141,6 +141,8 @@ struct DrawTail {
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     std::shared_ptr<ShapeStages> shape;
+    // `decode` is the shape's own, shared by its draws: its programs hold another draw's user data words.
+    bool sharedDecode = false;
     std::unique_ptr<DrawWork, DrawWorkReturn> work;
     std::array<double, DrawDriverPhaseCount>* phaseMs = nullptr;
     std::chrono::steady_clock::time_point* phaseLap = nullptr;
@@ -345,8 +347,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     // Without an entry for the whole key, a decode of the same registers apart from the user data
     // words (another frame's draw of the same object) saves decoding the state again.
+    bool sharedDecode = false;
     std::shared_ptr<ShapeStages> shape;
-    if (registerKey && decode == nullptr && !verifyDrawRecipe()) decode = shapeDecode(shapeKey, queue, submission, profile, &shape);
+    if (registerKey && decode == nullptr && !verifyDrawRecipe()) decode = shapeDecode(shapeKey, queue, submission, profile, &shape, &sharedDecode);
     const bool decodedAfresh = decode == nullptr;
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
     if (registerKey && decodedAfresh) keepShapeDecode(shapeKey, decode);
@@ -355,6 +358,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::unique_ptr<DrawWork, DrawWorkReturn> work(takeDrawWork());
     auto& programs = work->programs;
     programs = decode->programs;
+    if (sharedDecode) readShapeUserWords(programs, queue);
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;
@@ -386,6 +390,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.entry = std::move(entry);
     tail.decode = std::move(decode);
     tail.shape = std::move(shape);
+    tail.sharedDecode = sharedDecode;
     tail.work = std::move(work);
     tail.phaseMs = &phaseMs;
     tail.phaseLap = &phaseLap;
@@ -615,7 +620,14 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
     // Titles that move a draw's constant buffers every frame (Unity) never find most entries again;
     // building them, and their recipes, is skipped for such shapes.
     const bool insertEntry = useDrawEntries && (!registerKey || keepDrawEntry(shapeKey, drawHit));
-    cacheDrawStages(insertEntry, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
+    // An entry keeps a decode with its own draw's user data words.
+    std::shared_ptr<const DrawDecode> entryDecode = decode;
+    if (insertEntry && t.sharedDecode && !drawHit) {
+        auto own = std::make_shared<DrawDecode>(*decode);
+        for (std::size_t i = 0; i < programs.size(); ++i) own->programs[i].userData = programs[i].userData;
+        entryDecode = std::move(own);
+    }
+    cacheDrawStages(insertEntry, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, entryDecode, phaseTiming);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
