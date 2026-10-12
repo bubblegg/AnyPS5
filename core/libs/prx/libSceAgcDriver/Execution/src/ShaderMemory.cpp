@@ -101,11 +101,25 @@ void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
 }
 
-ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits) {
+ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits) {
+    Reset(regions, pendingWrite, observe, hookWaits);
+}
+
+void ShaderMemory::Reset(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWriteQuery, PendingWriteObserver observer, HookWaitCounter hookWaitCounter) {
+    pendingWrite = pendingWriteQuery;
+    observe = observer;
+    hookWaits = hookWaitCounter;
+    pagesUsed = 0;
+    initial.clear();
     const ShaderRecompiler::RequestMemoryView validated(regions);
-    for (const auto& region : regions) {
-        initial.emplace(region.guestAddress, region.bytes);
-    }
+    for (const auto& region : regions) initial.emplace_back(region.guestAddress, region.bytes);
+    // The first region given at an address is the one kept.
+    std::stable_sort(initial.begin(), initial.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    initial.erase(std::unique(initial.begin(), initial.end(), [](const auto& a, const auto& b) { return a.first == b.first; }), initial.end());
+}
+
+ShaderMemory::InitialRegions::const_iterator ShaderMemory::initialAfter(std::uint64_t address) const {
+    return std::upper_bound(initial.begin(), initial.end(), address, [](std::uint64_t value, const auto& region) { return value < region.first; });
 }
 
 namespace {
@@ -154,9 +168,22 @@ void ShaderMemory::PageRelease::operator()(Page* page) const noexcept {
 }
 
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
-    const auto found = pages.find(base);
-    if (found != pages.end()) return *found->second;
-    auto& page = *(pages[base] = takePage());
+    for (std::size_t i = 0; i < pagesUsed; ++i) {
+        if (pages[i].first == base) return *pages[i].second;
+    }
+    if (pagesUsed == pages.size()) {
+        pages.emplace_back(base, takePage());
+    } else {
+        auto& kept = *pages[pagesUsed].second;
+        kept.valid.reset();
+        kept.read.reset();
+        kept.recent.reset();
+        kept.wordwise = false;
+        pages[pagesUsed].first = base;
+    }
+    auto at = pagesUsed++;
+    for (; at > 0 && pages[at - 1].first > base; --at) std::swap(pages[at - 1], pages[at]);
+    auto& page = *pages[at].second;
     ++CaptureTotals().pages;
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
@@ -181,7 +208,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     }
     ++CaptureTotals().reads;
     if (!self.initial.empty()) {
-        const auto next = self.initial.upper_bound(address);
+        const auto next = self.initialAfter(address);
         if (next != self.initial.begin()) {
             const auto previous = std::prev(next);
             const auto offset = address - previous->first;
@@ -265,7 +292,7 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
     const auto end = address + bytes;
     while (address < end) {
-        const auto next = self.initial.upper_bound(address);
+        const auto next = self.initialAfter(address);
         if (next != self.initial.begin()) {
             const auto previous = std::prev(next);
             if (address - previous->first < previous->second.size()) {
@@ -339,10 +366,18 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
     std::vector<ShaderRecompiler::MemoryRegion> result;
-    result.reserve(initial.size() + pages.size());
+    Regions(result);
+    return result;
+}
+
+void ShaderMemory::Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) const {
+    result.clear();
+    result.reserve(initial.size() + pagesUsed);
     auto next = initial.begin();
-    // Both maps are ordered by address and never overlap, so a merge keeps the result sorted.
-    for (const auto& [base, page] : pages) {
+    // Both are ordered by address and never overlap, so a merge keeps the result sorted.
+    for (std::size_t used = 0; used < pagesUsed; ++used) {
+        const auto base = pages[used].first;
+        const auto& page = pages[used].second;
         while (next != initial.end() && next->first < base) {
             result.push_back({next->first, next->second});
             ++next;
@@ -352,19 +387,25 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
         });
     }
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
-    return result;
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
     std::vector<ShaderRecompiler::MemoryRegion> result;
-    for (auto& [base, page] : pages) {
+    TakeRecentRegions(result);
+    return result;
+}
+
+void ShaderMemory::TakeRecentRegions(std::vector<ShaderRecompiler::MemoryRegion>& result) {
+    result.clear();
+    for (std::size_t used = 0; used < pagesUsed; ++used) {
+        const auto base = pages[used].first;
+        auto& page = pages[used].second;
         if (page->recent.none()) continue;
         forEachRun(page->recent, [&](std::size_t first, std::size_t end) {
             result.push_back({base + first * sizeof(std::uint32_t), std::as_bytes(std::span(page->words).subspan(first, end - first))});
         });
         page->recent.reset();
     }
-    return result;
 }
 
 DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, std::span<const std::uint32_t> words, std::span<const std::uint32_t> flattenedSrt, std::vector<std::uint32_t>& positions, std::vector<std::uint32_t>& slots) {

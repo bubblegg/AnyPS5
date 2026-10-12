@@ -116,9 +116,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         return shaderMemory.Capture(invocation);
     }();
 
-    stageCapture.regions = shaderMemory.TakeRecentRegions();
+    shaderMemory.TakeRecentRegions(stageCapture.regions);
     recompiled[i] = true;
-    memory = shaderMemory.Regions();
+    shaderMemory.Regions(memory);
 
     if (drawHit) {
         for (std::size_t j = 0; j < programs.size(); ++j) {

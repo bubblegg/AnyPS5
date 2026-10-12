@@ -15,6 +15,112 @@
 
 namespace AgcDriver::DriverDetail {
 
+// Everything a draw builds between its decode and its commit, and what the commit reads. A draw
+// made some forty vectors and map nodes for this on the thread that prepares it, and the thread
+// that records it freed them with the commit closure (allocating and freeing were a fifth of the
+// one thread and a seventh of the other). The objects are pooled instead: a draw takes one, fills
+// it over what the last draw left (the vectors keep their storage, the captured pages too), and the
+// commit returns it. The commit closure is then two pointers, which a std::function holds without
+// allocating. APS5_NO_DRAW_WORK_POOL=1 makes and destroys one per draw.
+struct DrawWork {
+    std::vector<DrawProgram> programs;
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+    ShaderMemory shaderMemory{std::span<const ShaderRecompiler::MemoryRegion>{}};
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    std::vector<Graphics::CompiledShader> stages;
+    std::vector<const ShaderRecompiler::RecompileResult*> programResults;
+    std::vector<StageCapture> stageCaptures;
+    std::vector<std::shared_ptr<DispatchVariant>> matched;
+    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
+    std::vector<std::shared_ptr<DispatchVariant>> fresh;
+    std::vector<bool> recompiled;
+    std::vector<std::uint32_t> pushOffsets;
+    std::vector<std::size_t> resultIndex;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    // What only the commit reads.
+    std::shared_ptr<VulkanDevice> localDevice;
+    std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<DrawEntry> entry;
+    std::shared_ptr<ShapeStages> shape;
+    std::shared_ptr<const DrawRecipe> recipe;
+    Pm4::DrawParameters drawParameters;
+    std::uint64_t drawKey = 0;
+    std::uint64_t epoch = 0;
+    std::uint32_t commitQueue = 0;
+    std::uint32_t commitPacket = 0;
+};
+
+namespace {
+
+struct DrawWorkPool {
+    static constexpr std::size_t Kept = 1024;
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
+    std::vector<DrawWork*> works;
+};
+
+// Never destroyed: a commit may return its work while the process is going down.
+DrawWorkPool& drawWorkPool() {
+    static auto* pool = new DrawWorkPool();
+    return *pool;
+}
+
+bool drawWorkPooled() {
+    static const bool pooled = std::getenv("APS5_NO_DRAW_WORK_POOL") == nullptr;
+    return pooled;
+}
+
+DrawWork* takeDrawWork() {
+    DrawWork* work = nullptr;
+    if (drawWorkPooled()) {
+        auto& pool = drawWorkPool();
+        while (pool.lock.test_and_set(std::memory_order_acquire)) {
+        }
+        if (!pool.works.empty()) {
+            work = pool.works.back();
+            pool.works.pop_back();
+        }
+        pool.lock.clear(std::memory_order_release);
+    }
+    return work != nullptr ? work : new DrawWork();
+}
+
+// Lets go of everything the draw shared with others (results, variants, the decode, the device)
+// before the object waits for its next draw.
+void returnDrawWork(DrawWork* work) {
+    if (work == nullptr) return;
+    if (!drawWorkPooled()) {
+        delete work;
+        return;
+    }
+    work->results.clear();
+    work->matched.clear();
+    work->fresh.clear();
+    work->recipeStages.clear();
+    for (auto& capture : work->stageCaptures) capture.compiled.reset();
+    work->localDevice.reset();
+    work->decode.reset();
+    work->entry.reset();
+    work->shape.reset();
+    work->recipe.reset();
+    auto& pool = drawWorkPool();
+    while (pool.lock.test_and_set(std::memory_order_acquire)) {
+    }
+    const bool kept = pool.works.size() < DrawWorkPool::Kept;
+    if (kept) pool.works.push_back(work);
+    pool.lock.clear(std::memory_order_release);
+    if (!kept) delete work;
+}
+
+struct DrawWorkReturn {
+    void operator()(DrawWork* work) const { returnDrawWork(work); }
+};
+
+}
+
 // The rest of a draw after its decode, run on the queue worker or on a helper thread.
 struct DrawTail {
     QueueState* queue = nullptr;
@@ -35,7 +141,7 @@ struct DrawTail {
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     std::shared_ptr<ShapeStages> shape;
-    std::vector<DrawProgram> programs;
+    std::unique_ptr<DrawWork, DrawWorkReturn> work;
     std::array<double, DrawDriverPhaseCount>* phaseMs = nullptr;
     std::chrono::steady_clock::time_point* phaseLap = nullptr;
     std::uint64_t* captures = nullptr;
@@ -204,7 +310,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (registerKey && decodedAfresh) keepShapeDecode(shapeKey, decode);
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
-    std::vector<DrawProgram> programs = decode->programs;
+    std::unique_ptr<DrawWork, DrawWorkReturn> work(takeDrawWork());
+    auto& programs = work->programs;
+    programs = decode->programs;
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;
@@ -236,7 +344,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.entry = std::move(entry);
     tail.decode = std::move(decode);
     tail.shape = std::move(shape);
-    tail.programs = std::move(programs);
+    tail.work = std::move(work);
     tail.phaseMs = &phaseMs;
     tail.phaseLap = &phaseLap;
     tail.captures = &captures;
@@ -292,7 +400,8 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
     const auto shapeKey = t.shapeKey;
     auto& entry = t.entry;
     auto& decode = t.decode;
-    auto& programs = t.programs;
+    auto& work = *t.work;
+    auto& programs = work.programs;
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     const std::vector<Role>& roles = decode->roles;
@@ -324,8 +433,10 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
-    std::vector<ShaderRecompiler::MemoryRegion> memory;
-    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    auto& memory = work.memory;
+    auto& linked = work.linked;
+    memory.clear();
+    linked.clear();
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
         for (const auto& region : program.memory) {
@@ -336,8 +447,11 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
     timing.Mark("prepare");
     phaseTiming.Phase(DrawRowProgramPrepare);
 
-    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos(programs.size());
-    std::vector<std::vector<Graphics::DecodeRead>> decodeReads(programs.size());
+    auto& vertexInfos = work.vertexInfos;
+    vertexInfos.assign(programs.size(), std::nullopt);
+    auto& decodeReads = work.decodeReads;
+    decodeReads.resize(programs.size());
+    for (auto& reads : decodeReads) reads.clear();
     const auto decodeVertexInfo = [&](std::size_t i) {
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
@@ -348,22 +462,38 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
-    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
-    std::vector<Graphics::CompiledShader> stages;
+    auto& shaderMemory = work.shaderMemory;
+    shaderMemory.Reset(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    auto& results = work.results;
+    auto& stages = work.stages;
+    results.clear();
+    stages.clear();
     results.reserve(programs.size() + 2u);
     stages.reserve(programs.size());
     std::uint32_t pushCursorBytes = 0;
 
-    std::vector<const ShaderRecompiler::RecompileResult*> programResults(programs.size(), nullptr);
+    auto& programResults = work.programResults;
+    programResults.assign(programs.size(), nullptr);
 
-    std::vector<StageCapture> stageCaptures(programs.size());
-    std::vector<std::shared_ptr<DispatchVariant>> matched(programs.size());
-    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions(programs.size());
+    auto& stageCaptures = work.stageCaptures;
+    stageCaptures.resize(programs.size());
+    for (auto& capture : stageCaptures) {
+        capture.compiled.reset();
+        capture.regions.clear();
+        capture.forgetSerial = 0;
+        capture.pushOffset = 0;
+    }
+    auto& matched = work.matched;
+    matched.assign(programs.size(), nullptr);
+    auto& matchedRegions = work.matchedRegions;
+    matchedRegions.resize(programs.size());
+    for (auto& regions : matchedRegions) regions.clear();
 
-    std::vector<std::shared_ptr<DispatchVariant>> fresh(programs.size());
+    auto& fresh = work.fresh;
+    fresh.assign(programs.size(), nullptr);
 
-    std::vector<bool> recompiled(programs.size(), false);
+    auto& recompiled = work.recompiled;
+    recompiled.assign(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
     // The shape's stage records are this draw's until it returns.
@@ -401,8 +531,10 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
 
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
-    std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
-    std::vector<std::size_t> resultIndex(programs.size(), 0);
+    auto& pushOffsets = work.pushOffsets;
+    pushOffsets.assign(programs.size(), 0);
+    auto& resultIndex = work.resultIndex;
+    resultIndex.assign(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -492,7 +624,7 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         results.push_back(std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits())));
         stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, results.back().get(), 0});
     }
-    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    auto& snapshots = work.snapshots;
     const auto snapshot = [&] {
         snapshots.clear();
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
@@ -588,7 +720,8 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         return drawn();
     }
 
-    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    auto& recipeStages = work.recipeStages;
+    recipeStages.clear();
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
@@ -611,21 +744,34 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         const auto commitQueue = submission.queue;
         const auto commitPacket = t.packetOpcode;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), shape = t.shape] {
-            DrawPipeline::FollowEpoch(epoch);
-            GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+        // The commit reads everything from the draw's work and returns it when it is done.
+        work.localDevice = std::move(localDevice);
+        work.decode = std::move(decode);
+        work.entry = std::move(entry);
+        work.shape = t.shape;
+        work.recipe = std::move(recipe);
+        work.drawParameters = drawParameters;
+        work.drawKey = drawKey;
+        work.epoch = epoch;
+        work.commitQueue = commitQueue;
+        work.commitPacket = commitPacket;
+        const auto commit = [this, work = &work] {
+            const std::unique_ptr<DrawWork, DrawWorkReturn> returned(work);
+            DrawPipeline::FollowEpoch(work->epoch);
+            GuestMemory::SetCurrentPacket(work->commitPacket, work->commitQueue);
             const auto commitStart = __rdtsc();
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, shape != nullptr ? &shape->drawn : nullptr);
+            commitDraw(work->localDevice, work->commitQueue, work->decode->state, work->drawParameters, work->stages, work->snapshots, work->recipe, work->recipeStages, work->drawKey, work->shape != nullptr ? &work->shape->drawn : nullptr);
             drawPerf().committed.cycles.fetch_add(__rdtsc() - commitStart, std::memory_order_relaxed);
             drawPerf().committed.draws.fetch_add(1, std::memory_order_relaxed);
         };
-        auto held = std::make_shared<decltype(commit)>(std::move(commit));
+        // The queue owns the work once it holds the commit (a failure it reports first leaves it here).
         if (t.helper) {
-            DrawPipeline::Queue0().Publish(t.pending, [held] { (*held)(); }, std::move(writes));
+            DrawPipeline::Queue0().Publish(t.pending, commit, std::move(writes));
             t.published = true;
         } else {
-            DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+            DrawPipeline::Queue0().Enqueue(commit, std::move(writes));
         }
+        static_cast<void>(t.work.release());
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();

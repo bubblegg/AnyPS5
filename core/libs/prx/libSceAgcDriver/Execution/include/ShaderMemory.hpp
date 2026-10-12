@@ -63,7 +63,13 @@ public:
     // resolution.
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle = nullptr);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation);
+    // Starts over with other initial regions and keeps its pages' storage: one object serves a
+    // draw after another (the draw path's pooled work).
+    void Reset(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
+    // The same into a vector the caller keeps.
+    void Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) const;
+    void TakeRecentRegions(std::vector<ShaderRecompiler::MemoryRegion>& result);
     // The page regions read since the previous call (or construction), a word read again
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.
@@ -99,8 +105,15 @@ private:
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.
-    std::map<std::uint64_t, std::span<const std::byte>> initial;
-    std::map<std::uint64_t, PagePointer> pages;
+    // In address order.
+    using InitialRegions = std::vector<std::pair<std::uint64_t, std::span<const std::byte>>>;
+    InitialRegions initial;
+    // The first initial region above `address`.
+    InitialRegions::const_iterator initialAfter(std::uint64_t address) const;
+    // The first `pagesUsed` are this capture's, in address order (a draw reads a handful); the
+    // rest are kept for the next one.
+    std::vector<std::pair<std::uint64_t, PagePointer>> pages;
+    std::size_t pagesUsed = 0;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
