@@ -10,7 +10,7 @@ This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyP
 
 ## Known problems
 
-- The frame rate falls with the number of draws in view; the truck is the worst case.
+- The frame rate falls with the number of draws in view; the truck being one of the worst cases.
 - Brief colour blocks appear when the camera moves to the lobby whiteboard.
 - One draw type is skipped (`multisampled image resources have no descriptor image shape`).
 - Multisampled targets are drawn with one sample.
