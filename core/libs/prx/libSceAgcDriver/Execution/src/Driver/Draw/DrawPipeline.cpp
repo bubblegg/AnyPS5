@@ -231,6 +231,11 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        // The closure holds what the draw prepared (results, captures, regions): it is destroyed
+        // here, before the lock, which the preparing thread needs for every draw it enqueues. Only
+        // this thread touches a front item's commit; the item itself stays queued until the pop, so
+        // a drain still returns after everything the draw held is released.
+        *commit = nullptr;
         std::lock_guard lock(mutex);
         items.pop_front();
         ++commits;
