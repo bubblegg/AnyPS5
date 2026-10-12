@@ -16,19 +16,26 @@ namespace AgcDriver::DriverDetail {
 
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shapeKey) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
-    std::uint64_t key = 0xcbf29ce484222325ull;
-    std::uint64_t shape = key;
-    // Mixes into both keys; mixUser only into the whole key.
+    // Each key is two FNV lanes taking alternate values, a register's offset and value as one word:
+    // one chain of two multiplies per register made the key about a microsecond of every draw.
+    // Only equality of keys within the process matters. Mixes into both keys; mixUser only into the
+    // whole key.
+    struct Lanes {
+        std::uint64_t a = 0xcbf29ce484222325ull, b = 0x84222325cbf29ce4ull;
+        bool odd = false;
+        void Mix(std::uint64_t value) {
+            auto& lane = odd ? b : a;
+            lane = (lane ^ value) * 0x100000001b3ull;
+            odd = !odd;
+        }
+        std::uint64_t Value() const { return (a ^ ((b << 31u) | (b >> 33u))) * 0x9e3779b97f4a7c15ull; }
+    };
+    Lanes key, shape;
     const auto mix = [&](std::uint64_t value) {
-        key ^= value;
-        key *= 0x100000001b3ull;
-        shape ^= value;
-        shape *= 0x100000001b3ull;
+        key.Mix(value);
+        shape.Mix(value);
     };
-    const auto mixUser = [&](std::uint64_t value) {
-        key ^= value;
-        key *= 0x100000001b3ull;
-    };
+    const auto mixUser = [&](std::uint64_t value) { key.Mix(value); };
     const auto userEnd = [&](std::uint32_t base) {
         if (allUserWords) return base + 32u;
         const auto resources = queue.shader.find(base - 1);
@@ -51,13 +58,12 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         const bool shader = range.bank == Graphics::RegisterBank::Shader;
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
             if (shader && unread(it->first)) continue;
+            const auto word = (static_cast<std::uint64_t>(it->first) << 32u) | it->second;
             if (shader && userWord(it->first)) {
-                mixUser(it->first);
-                mixUser(it->second);
+                mixUser(word);
                 continue;
             }
-            mix(it->first);
-            mix(it->second);
+            mix(word);
         }
     }
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
@@ -77,8 +83,8 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
         mix(address - it->first);
     }
-    if (shapeKey != nullptr) *shapeKey = shape;
-    return key;
+    if (shapeKey != nullptr) *shapeKey = shape.Value();
+    return key.Value();
 }
 
 std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages, bool* shared) {

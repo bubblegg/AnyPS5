@@ -995,19 +995,20 @@ struct ThreadCollectMemo {
 };
 thread_local ThreadCollectMemo threadCollectMemo;
 
+// The thread's ranges walked in the current epoch, by their first page: a direct-mapped table whose
+// entries carry their epoch and exact first page, so a stale or colliding entry never matches (a
+// collision only costs a walk). A hash map here cost a hash, a division and a node per collect,
+// some ten collects per draw.
 struct EpochCollectMap {
-    std::uint64_t epoch = 0;
-    std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+    static constexpr std::size_t Slots = 512;
+    // The top nine bits of the page's Fibonacci hash pick one of the 512 slots.
+    std::array<WriteTracker::Memo, Slots> slots{};
+    WriteTracker::Memo& Slot(std::uintptr_t first) { return slots[(first >> 12u) * 0x9e3779b97f4a7c15ull >> 55u]; }
 };
 
-EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
+EpochCollectMap& epochCollectMap() {
     thread_local EpochCollectMap* slot = nullptr;
-    auto& map = ShaderRecompiler::ThreadOwned(slot);
-    if (map.epoch != epoch) {
-        map.ranges.clear();
-        map.epoch = epoch;
-    }
-    return map;
+    return ShaderRecompiler::ThreadOwned(slot);
 }
 
 bool epochCollectMapEnabled() {
@@ -1112,8 +1113,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
-            const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+            const auto& entry = epochCollectMap().Slot(first);
+            if (entry.epoch == epoch && entry.begin == first && entry.unwatched == unwatched && stop <= entry.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -1159,8 +1160,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         else {
             threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
             if (epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
-                if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
+                auto& entry = epochCollectMap().Slot(first);
+                if (entry.epoch != epoch || entry.begin != first || entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
             }
         }
     }

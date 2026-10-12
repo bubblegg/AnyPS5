@@ -376,8 +376,8 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 
 // APS5_PROFILE_DRAW: per-draw phase timers in microseconds (a recorded draw's phases are far below
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
-enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
-constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseKeyMemo, PhaseRevalidate, PhaseMoved, PhaseBindings, PhasePass, PhaseBind, PhasePush, PhaseCommands, PhaseIndex, PhaseCount };
+constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe", "lookup.key", "lookup.revalidate", "lookup.moved", "record.bindings", "record.pass", "record.bind", "record.push", "record.commands", "vertex.index"};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -941,7 +941,7 @@ struct DrawTimer {
         totals.afterUs += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         ++totals.draws;
         if (now - totals.since < std::chrono::seconds(10)) return;
-        char line[640];
+        char line[1024];
         int n = std::snprintf(line, sizeof(line), "[draw-phases] %llu draws, us per draw:", static_cast<unsigned long long>(totals.draws));
         double sum = totals.afterUs;
         for (std::size_t i = 0; i < PhaseCount; ++i) sum += totals.us[i];
@@ -1263,9 +1263,27 @@ bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
 // The resident image the shape's last draw attached for `color` at `index`, while the storage
 // cache still holds it for its surface and its DCC keys; null otherwise (the lookup runs).
 std::shared_ptr<StorageTexture> memoTarget(const Context& context, const DrawShapeMemo* memo, std::size_t index, const ColorTarget& color) {
-    if (memo == nullptr || memo->refresh || index >= memo->targets.size() || !sameColorTarget(memo->targetColors[index], color)) return nullptr;
+    // Why a lookup ran instead, printed every 10 s with APS5_DRAW_PHASES as a [shape-targets] line.
+    enum Miss { NoMemo, Refresh, Unseen, OtherTarget, Gone, Uncached, Keys, Taken, Count };
+    static std::array<std::uint64_t, Count> misses{};
+    static auto since = std::chrono::steady_clock::now();
+    const auto outcome = [&](Miss miss) {
+        ++misses[miss];
+        if ((misses[Taken] + misses[Unseen]) % 4096 == 0 && DrawTimer::phasesOnly() && std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[shape-targets] taken %llu; looked up: no memo %llu, refresh %llu, unseen %llu, other target %llu, gone %llu, uncached %llu, keys %llu\n", static_cast<unsigned long long>(misses[Taken]), static_cast<unsigned long long>(misses[NoMemo]), static_cast<unsigned long long>(misses[Refresh]), static_cast<unsigned long long>(misses[Unseen]), static_cast<unsigned long long>(misses[OtherTarget]), static_cast<unsigned long long>(misses[Gone]), static_cast<unsigned long long>(misses[Uncached]), static_cast<unsigned long long>(misses[Keys]));
+            misses = {};
+            since = std::chrono::steady_clock::now();
+        }
+    };
+    if (memo == nullptr) return outcome(NoMemo), nullptr;
+    if (memo->refresh) return outcome(Refresh), nullptr;
+    if (index >= memo->targets.size()) return outcome(Unseen), nullptr;
+    if (!sameColorTarget(memo->targetColors[index], color)) return outcome(OtherTarget), nullptr;
     auto stored = memo->targets[index].lock();
-    if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, color.dccAddress)) return nullptr;
+    if (stored == nullptr) return outcome(Gone), nullptr;
+    if (!StorageImageCached(context, stored.get())) return outcome(Uncached), nullptr;
+    if (!StorageImageServesKeys(*stored, color.dccAddress)) return outcome(Keys), nullptr;
+    outcome(Taken);
     return stored;
 }
 
@@ -1400,6 +1418,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indexHandle = inputs.indices->Handle();
         }
     }
+    timer.phase(PhaseIndex);
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
@@ -1597,11 +1616,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, colorAttachments, draw.indexAddress, indexBytes, !trimKey);
             cached = SharedResourceCache().Find(resolved.contentKey);
         }
+        timer.phase(PhaseKeyMemo);
         if (cached != nullptr) {
             const bool valid = cached->Revalidate(shaders);
+            timer.phase(PhaseRevalidate);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            timer.phase(PhaseMoved);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 if (memo != nullptr && trimKey && !resolved.remembered) rememberResources(*memo, resolved.contentKey, cached);
@@ -2010,6 +2032,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    timer.phase(PhaseBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -2028,6 +2051,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    timer.phase(PhasePass);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -2089,8 +2113,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
+    timer.phase(PhaseBind);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    timer.phase(PhasePush);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
@@ -2102,6 +2128,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
+    timer.phase(PhaseCommands);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
