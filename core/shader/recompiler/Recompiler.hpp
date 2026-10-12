@@ -375,6 +375,8 @@ struct DescriptorBinding {
     std::vector<bool> imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
+
+    bool operator==(const DescriptorBinding&) const = default;
 };
 
 struct VertexAttribute {

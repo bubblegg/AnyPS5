@@ -48,7 +48,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> DrawTwice() {
+std::vector<std::uint32_t> Draws(std::uint32_t repeats, std::uint32_t others) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
@@ -81,15 +81,19 @@ std::vector<std::uint32_t> DrawTwice() {
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
-    Append(commands, 0x2d, {3, 2});
-    Append(commands, 0x2d, {3, 2});
+    for (std::uint32_t i = 0; i < repeats; ++i) Append(commands, 0x2d, {3, 2});
+    // The same draw with another pixel user word: another draw key, the same shape.
+    for (std::uint32_t i = 0; i < others; ++i) {
+        Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(2.0f + static_cast<float>(i))});
+        Append(commands, 0x2d, {3, 2});
+    }
     return commands;
 }
 
 void SecondDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
-    auto commands = DrawTwice();
+    auto commands = Draws(2, 0);
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -99,6 +103,20 @@ void SecondDrawHitsTheCache(bool libraries) {
     Require(counters.lookups == 2 && counters.absent == 1, mode + ": the two draws made " + std::to_string(counters.lookups) + " draw-cache lookups (" + std::to_string(counters.absent) + " without an entry), expected 2 lookups with 1 absent");
     Require(layout == 0, mode + ": the repeated draw missed the draw cache on its push offset (" + std::to_string(layout) + " layout misses)");
     Require(counters.hits == 1, mode + ": the repeated draw did not reuse the cached draw (" + std::to_string(counters.hits) + " hits)");
+}
+
+// Draws of one shape that differ in a user word take their stages' prepared artifacts from the
+// shape's record after the draw that filled it (APS5_VERIFY_STAGE_MEMO=1 compares each with the
+// artifact and the result found the long way and reports a difference on stderr).
+void ShapeDrawsReuseTheirStages() {
+    auto& counts = AgcDriver::DriverDetail::StageMemoCounters();
+    const auto reusedBefore = counts.reused.load();
+    auto commands = Draws(0, 6);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the shape draw submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto reused = counts.reused.load() - reusedBefore;
+    Require(reused == 10, "six draws of one shape took " + std::to_string(reused) + " stages from the shape's record, expected 10 (two stages of every draw after the first)");
 }
 
 }
@@ -113,6 +131,7 @@ int main() {
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         SecondDrawHitsTheCache(libraries);
+        ShapeDrawsReuseTheirStages();
         AgcDriverShutdown_nid_postfix();
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;

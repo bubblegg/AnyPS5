@@ -12,6 +12,11 @@
 #include <memory>
 #include <vector>
 
+namespace ShaderRecompiler {
+struct SourceHandle;
+struct StageMemo;
+}
+
 namespace AgcDriver::DriverDetail {
 
 struct DrawProgram {
@@ -86,6 +91,32 @@ struct StageCapture {
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+
+// What a stage of a shape's last draw resolved to, and what it was resolved from: a draw of the
+// shape that gives the stage the same takes the prepared artifact from here (APS5_NO_STAGE_MEMO=1
+// resolves every stage as before; APS5_VERIFY_STAGE_MEMO=N resolves every Nth as well and compares).
+struct ShapeStage {
+    std::shared_ptr<const ShaderSnapshot> snapshot;
+    std::size_t codeOffset = 0;
+    ShaderRecompiler::ShaderStage stage = ShaderRecompiler::ShaderStage::Vertex;
+    std::uint32_t waveSize = 0, firstUserSgpr = 0, userWords = 0, pushOffset = 0, pushSize = 0;
+    // A fragment stage: the variant whose exports defaulted its unexported inputs (0: none).
+    std::uint64_t pixelFrom = 0;
+    std::unique_ptr<ShaderRecompiler::ShaderVertexStageInfo> vertex;
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    std::shared_ptr<ShaderRecompiler::StageMemo> memo;
+};
+
+// Held by one draw at a time (`busy`); a draw that finds it taken resolves its stages as before.
+struct ShapeStages {
+    std::atomic_flag busy;
+    std::vector<ShapeStage> stages;
+};
+
+struct StageMemoCounts {
+    std::atomic<std::uint64_t> reused{0}, revalidated{0}, resolved{0};
+};
+StageMemoCounts& StageMemoCounters();
 
 }
 

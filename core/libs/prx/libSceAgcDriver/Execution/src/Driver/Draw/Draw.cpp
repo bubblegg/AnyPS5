@@ -34,6 +34,7 @@ struct DrawTail {
     std::uint64_t shapeKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<ShapeStages> shape;
     std::vector<DrawProgram> programs;
     std::array<double, DrawDriverPhaseCount>* phaseMs = nullptr;
     std::chrono::steady_clock::time_point* phaseLap = nullptr;
@@ -97,7 +98,7 @@ struct PreparedScope {
         const auto waitedNow = DrawPipeline::FullWaitCycles().load(std::memory_order_relaxed);
         const auto presents = VulkanDevice::PresentCounts().presents;
         const auto shown = presents - perf.lastPresents;
-        std::fprintf(stderr, "[perf] %.1f s: %llu draws prepared in %.1f us each (and %.1f us each waiting for room in the queue), %llu committed in %.1f us each; %llu presents (%.1f a second, %.0f draws each)\n", seconds, static_cast<unsigned long long>(preparedDraws), preparedDraws != 0 ? static_cast<double>(preparedCycles) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, preparedDraws != 0 ? static_cast<double>(waitedNow - perf.lastWaited) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, static_cast<unsigned long long>(committedDraws), committedDraws != 0 ? static_cast<double>(committedCycles) / cyclesPerUs / static_cast<double>(committedDraws) : 0.0, static_cast<unsigned long long>(shown), static_cast<double>(shown) / seconds, shown != 0 ? static_cast<double>(preparedDraws) / static_cast<double>(shown) : 0.0);
+        std::fprintf(stderr, "[perf] %.1f s: %llu draws prepared in %.1f us each (and %.1f us each waiting for room in the queue), %llu committed in %.1f us each; %llu presents (%.1f a second, %.0f draws each); stages taken from their shape: %llu, %llu of them with the stage inputs checked again, %llu resolved\n", seconds, static_cast<unsigned long long>(preparedDraws), preparedDraws != 0 ? static_cast<double>(preparedCycles) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, preparedDraws != 0 ? static_cast<double>(waitedNow - perf.lastWaited) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, static_cast<unsigned long long>(committedDraws), committedDraws != 0 ? static_cast<double>(committedCycles) / cyclesPerUs / static_cast<double>(committedDraws) : 0.0, static_cast<unsigned long long>(shown), static_cast<double>(shown) / seconds, shown != 0 ? static_cast<double>(preparedDraws) / static_cast<double>(shown) : 0.0, static_cast<unsigned long long>(StageMemoCounters().reused.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().revalidated.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().resolved.exchange(0, std::memory_order_relaxed)));
         perf.lastQpc = qpc.QuadPart;
         perf.lastTsc = now;
         perf.lastPresents = presents;
@@ -196,7 +197,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     // Without an entry for the whole key, a decode of the same registers apart from the user data
     // words (another frame's draw of the same object) saves decoding the state again.
-    if (registerKey && decode == nullptr && !verifyDrawRecipe()) decode = shapeDecode(shapeKey, queue, submission, profile);
+    std::shared_ptr<ShapeStages> shape;
+    if (registerKey && decode == nullptr && !verifyDrawRecipe()) decode = shapeDecode(shapeKey, queue, submission, profile, &shape);
     const bool decodedAfresh = decode == nullptr;
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
     if (registerKey && decodedAfresh) keepShapeDecode(shapeKey, decode);
@@ -233,6 +235,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.shapeKey = shapeKey;
     tail.entry = std::move(entry);
     tail.decode = std::move(decode);
+    tail.shape = std::move(shape);
     tail.programs = std::move(programs);
     tail.phaseMs = &phaseMs;
     tail.phaseLap = &phaseLap;
@@ -363,6 +366,18 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
     std::vector<bool> recompiled(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
+    // The shape's stage records are this draw's until it returns.
+    struct ShapeHold {
+        ShapeStages* shape;
+        ~ShapeHold() {
+            if (shape != nullptr) shape->busy.clear(std::memory_order_release);
+        }
+    } shapeHold{t.shape != nullptr && !t.shape->busy.test_and_set(std::memory_order_acquire) ? t.shape.get() : nullptr};
+    if (shapeHold.shape != nullptr && shapeHold.shape->stages.size() != programs.size()) {
+        shapeHold.shape->stages.clear();
+        shapeHold.shape->stages.resize(programs.size());
+    }
+    std::uint64_t pixelFrom = 0;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
 
     if (registerKey) {
@@ -403,10 +418,11 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
                 for (auto previous = i; previous-- > 0;) {
                     if (programResults[previous] == nullptr) continue;
                     pixel = Graphics::DefaultUnexportedInputs(decode->pixel, programResults[previous]->parameterExports);
+                    pixelFrom = programResults[previous]->variantId;
                     break;
                 }
             }
-            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, shapeHold.shape, pixelFrom));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[i] = results.back().get();
         }
@@ -550,7 +566,7 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
             for (const auto programIndex : patched) {
                 const auto pushBytes = results[resultIndex[programIndex]]->pushConstants.size();
                 decodeVertexInfo(programIndex);
-                auto result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                auto result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, shapeHold.shape, pixelFrom);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
                 replaceResult(resultIndex[programIndex], std::move(result));

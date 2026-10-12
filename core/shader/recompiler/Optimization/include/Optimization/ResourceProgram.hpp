@@ -50,13 +50,27 @@ struct SourceHandle {
     std::shared_ptr<const CompiledVariant> artifact;
     std::vector<std::uint64_t> staticKey;
 };
+// What a caller that materializes one prepared shader again and again (the stage of a draw shape)
+// keeps between its results: the binding plan and the module of the last one, with the keys they
+// were found by, and its last results, whose storage serves the next once their draw is done.
+// One thread at a time.
+struct StageMemo;
+[[nodiscard]] std::shared_ptr<StageMemo> MakeStageMemo();
 class PreparedShaderInvocation {
 public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key);
+    // Without TryCreate's comparisons: for a caller that knows the request has the code, the layout
+    // and the interface key of a request TryCreate accepted with this handle. `validated` says the
+    // vertex stage inputs are those of that request too; otherwise they are validated again.
+    static PreparedShaderInvocation Reuse(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, bool validated);
     const RecompileRequest& Request() const { return request; }
+    const std::shared_ptr<const SourceHandle>& Handle() const { return handle; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
+    // The same result without the result memo's hash of the whole snapshot (APS5_VERIFY_STAGE_MEMO=N
+    // compares every Nth with a result materialized without the memo).
+    std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture, StageMemo* memo) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);

@@ -81,14 +81,18 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     return key;
 }
 
-std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile) {
+std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages) {
     static const bool disabled = std::getenv("APS5_NO_SHAPE_DECODE") != nullptr;
+    static const bool stageMemo = std::getenv("APS5_NO_STAGE_MEMO") == nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_SHAPE_DECODE") != nullptr;
     if (disabled) return nullptr;
     std::shared_ptr<const DrawDecode> cached;
     {
         std::lock_guard cacheLock(drawCacheMutex);
-        if (const auto found = drawShapes.find(shapeKey); found != drawShapes.end()) cached = found->second.decode;
+        if (const auto found = drawShapes.find(shapeKey); found != drawShapes.end()) {
+            cached = found->second.decode;
+            if (stages != nullptr && stageMemo && cached != nullptr) *stages = found->second.stages;
+        }
         if (profile) ++(cached != nullptr ? drawEntryCounters.shapeDecodeHits : drawEntryCounters.shapeDecodeMisses);
     }
     if (cached == nullptr) return nullptr;
@@ -129,7 +133,9 @@ void Driver::keepShapeDecode(std::uint64_t shapeKey, const std::shared_ptr<const
     constexpr std::size_t MaxShapes = 1u << 15u;
     std::lock_guard cacheLock(drawCacheMutex);
     if (drawShapes.size() >= MaxShapes && !drawShapes.contains(shapeKey)) drawShapes.clear();
-    drawShapes[shapeKey].decode = decode;
+    auto& record = drawShapes[shapeKey];
+    record.decode = decode;
+    record.stages = std::make_shared<ShapeStages>();
 }
 
 bool Driver::keepDrawEntry(std::uint64_t shapeKey, bool drawHit) {

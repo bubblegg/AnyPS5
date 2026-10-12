@@ -10,7 +10,88 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
+StageMemoCounts& StageMemoCounters() {
+    static StageMemoCounts counts;
+    return counts;
+}
+
+namespace {
+
+// Whether two vertex stage infos give a request the same interface key (the formats and where the
+// attributes go); `sameBuffers` says the vertex buffer table, which the stage input validation
+// reads, is the same too.
+bool SameVertexInterface(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b, bool& sameBuffers) {
+    if (a.resourcesNum != b.resourcesNum || a.resourcesNum > a.resources.size() || a.fetchAttribReg != b.fetchAttribReg || a.fetchBufferReg != b.fetchBufferReg || a.fetchEmbedded != b.fetchEmbedded) return false;
+    sameBuffers = true;
+    for (std::uint32_t i = 0; i < a.resourcesNum; ++i) {
+        const auto& x = a.resources[i].fields;
+        const auto& y = b.resources[i].fields;
+        const auto& from = a.resourcesDst[i];
+        const auto& to = b.resourcesDst[i];
+        if (x[3] != y[3] || from.registerStart != to.registerStart || from.registersNum != to.registersNum || from.attrId != to.attrId || from.fetchIndex != to.fetchIndex) return false;
+        if (x[0] != y[0] || x[1] != y[1] || x[2] != y[2]) sameBuffers = false;
+    }
+    return true;
+}
+
+// The stage's prepared invocation, from the shape's record when this draw gives the stage what the
+// record was resolved from. InvocationFor builds the request's interface key and compares it, the
+// code and the stage inputs with the snapshot's prepared entries under their lock, for every stage
+// of every draw; the draws of a shape differ in none of that but the vertex buffer table. What
+// the shape key covers (the pixel stage info, the mesh and tessellation state, the device) is not
+// compared again.
+ShaderRecompiler::PreparedShaderInvocation ShapeInvocation(ShapeStage& recall, const DrawProgram& program, const ShaderRecompiler::RecompileRequest& request, std::uint64_t pixelFrom) {
+    static const std::uint64_t verifyEvery = [] {
+        const char* text = std::getenv("APS5_VERIFY_STAGE_MEMO");
+        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
+    }();
+    auto& counts = StageMemoCounters();
+    const auto* vertex = request.context.vertex ? &*request.context.vertex : nullptr;
+    bool same = recall.handle != nullptr && recall.snapshot == program.snapshot && recall.codeOffset == program.codeOffset && recall.stage == request.shader.stage && recall.waveSize == request.context.waveSize && recall.firstUserSgpr == program.firstUserSgpr && recall.userWords == program.userData.size() && recall.pushOffset == request.layout.pushConstantOffsetBytes && recall.pushSize == request.layout.pushConstantSizeBytes && recall.pixelFrom == pixelFrom && (recall.vertex != nullptr) == (vertex != nullptr);
+    bool sameBuffers = true;
+    if (same && vertex != nullptr) same = SameVertexInterface(*vertex, *recall.vertex, sameBuffers);
+    if (same) {
+        const bool validated = sameBuffers || vertex->fetchEmbedded;
+        if (!validated) *recall.vertex = *vertex;
+        auto reused = request;
+        reused.shader.code = ShaderRecompiler::GetPreparedCode(*recall.handle);
+        auto invocation = ShaderRecompiler::PreparedShaderInvocation::Reuse(reused, recall.handle, validated);
+        const auto reuses = counts.reused.fetch_add(1, std::memory_order_relaxed);
+        if (!validated) counts.revalidated.fetch_add(1, std::memory_order_relaxed);
+        if (verifyEvery == 0u || reuses % verifyEvery != 0u) return invocation;
+        static std::atomic<std::uint64_t> compared{0}, differences{0};
+        auto resolved = InvocationFor(*program.snapshot, program.codeOffset, request);
+        const bool differs = resolved.Handle() != recall.handle;
+        const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (differs && differences.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[stage-memo] verify: program 0x%llx (stage %u) resolves to another artifact than its shape's record holds\n", static_cast<unsigned long long>(program.binary.codeAddress), static_cast<unsigned>(request.shader.stage));
+        if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[stage-memo] verify: %llu reused stages resolved again, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
+        if (!differs) return invocation;
+        recall.handle = resolved.Handle();
+        recall.memo = ShaderRecompiler::MakeStageMemo();
+        return resolved;
+    }
+    auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    counts.resolved.fetch_add(1, std::memory_order_relaxed);
+    recall.snapshot = program.snapshot;
+    recall.codeOffset = program.codeOffset;
+    recall.stage = request.shader.stage;
+    recall.waveSize = request.context.waveSize;
+    recall.firstUserSgpr = program.firstUserSgpr;
+    recall.userWords = static_cast<std::uint32_t>(program.userData.size());
+    recall.pushOffset = request.layout.pushConstantOffsetBytes;
+    recall.pushSize = request.layout.pushConstantSizeBytes;
+    recall.pixelFrom = pixelFrom;
+    if (vertex == nullptr) recall.vertex.reset();
+    else if (recall.vertex == nullptr) recall.vertex = std::make_unique<ShaderRecompiler::ShaderVertexStageInfo>(*vertex);
+    else *recall.vertex = *vertex;
+    if (recall.handle != invocation.Handle() || recall.memo == nullptr) recall.memo = ShaderRecompiler::MakeStageMemo();
+    recall.handle = invocation.Handle();
+    return invocation;
+}
+
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, ShapeStages* shape, std::uint64_t pixelFrom) {
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
@@ -24,7 +105,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    auto* const recall = shape != nullptr && i < shape->stages.size() ? &shape->stages[i] : nullptr;
+    const auto invocation = recall != nullptr ? ShapeInvocation(*recall, program, request, program.binary.stage == Stage::Fragment ? pixelFrom : 0u) : InvocationFor(*program.snapshot, program.codeOffset, request);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
@@ -75,7 +157,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowCapture);
 
     timing.Mark("capture_resources");
-    stageCapture.compiled = invocation.Materialize(*capture);
+    stageCapture.compiled = invocation.Materialize(*capture, recall != nullptr ? recall->memo.get() : nullptr);
     timing.Mark("materialize");
     // Shared, not copied: a copy allocated every descriptor binding's vectors again for every stage
     // of every draw (after boykopovar/AnyPS5#1202).

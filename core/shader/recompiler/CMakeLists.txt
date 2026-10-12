@@ -233,6 +233,8 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileResult
             PrepareShader
             GetPreparedCode
+            MakeStageMemo
+            PreparedShaderInvocation::Reuse
             PreparedShaderInvocation::TryCreate
             MatchesPreparedShader
             GetPreparedArtifact

@@ -623,6 +623,22 @@ struct PreparedBindingPlan {
     std::map<std::vector<std::uint32_t>, std::shared_ptr<PreparedModuleEntry>> modules;
 };
 
+}
+
+struct StageMemo {
+    std::vector<std::uint64_t> planKey;
+    std::shared_ptr<PreparedBindingPlan> plan;
+    std::vector<std::uint32_t> moduleKey;
+    std::shared_ptr<PreparedModuleEntry> module;
+    // Oldest at `next`; grows only while the oldest is still held by a draw.
+    std::vector<std::shared_ptr<const RecompileResult>> results;
+    std::size_t next = 0;
+};
+
+namespace {
+
+constexpr std::size_t StageMemoResults = 16;
+
 struct RegistrationModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
@@ -655,7 +671,7 @@ std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t varian
     return entry->module;
 }
 
-std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
+std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet, StageMemo* memo = nullptr) {
     struct BindingPlanKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
     key.clear();
@@ -685,7 +701,8 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     static HostMutex mutex;
     static std::unordered_map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>, SourceKeyHash> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
-    {
+    if (memo != nullptr && memo->plan != nullptr && memo->planKey == key) plan = memo->plan;
+    if (plan == nullptr) {
         std::shared_lock lock(mutex);
         if (const auto found = plans.find(key); found != plans.end()) plan = found->second;
     }
@@ -693,6 +710,11 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
         std::unique_lock lock(mutex);
         const auto found = plans.find(key);
         plan = found != plans.end() ? found->second : plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
+    }
+    if (memo != nullptr && memo->plan != plan) {
+        memo->planKey = key;
+        memo->plan = plan;
+        memo->module = nullptr;
     }
     if (!plan->done.load(std::memory_order_acquire)) {
         std::call_once(plan->ready, [&] {
@@ -740,7 +762,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
 // `recycled`, when given, is a result nobody else holds any more: its bindings, push constants and
 // vertex attributes are taken over and overwritten, which saves the dozens of small allocations a
 // result of the same shader would make for them.
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, RecompileResult* recycled = nullptr) {
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, RecompileResult* recycled = nullptr, StageMemo* memo = nullptr) {
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -765,7 +787,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .barycentricEmulation = artifact.barycentricEmulation,
         .variantId = artifact.variantId
     };
-    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
+    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, memo);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -809,7 +831,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         }
     }
     if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel) {
-        {
+        if (memo != nullptr && memo->module != nullptr && memo->moduleKey == moduleKey) entry = memo->module;
+        if (entry == nullptr) {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
         }
@@ -817,6 +840,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             std::unique_lock lock(plan->mutex);
             const auto found = plan->modules.find(moduleKey);
             entry = found != plan->modules.end() ? found->second : plan->modules.emplace(moduleKey, std::make_shared<PreparedModuleEntry>()).first->second;
+        }
+        if (memo != nullptr && memo->module != entry) {
+            memo->moduleKey = moduleKey;
+            memo->module = entry;
         }
         const auto prepare = [&] {
             auto constants = plan->bindings.specialization;
@@ -1351,6 +1378,66 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
+    return result;
+}
+
+std::shared_ptr<StageMemo> MakeStageMemo() {
+    return std::make_shared<StageMemo>();
+}
+
+PreparedShaderInvocation PreparedShaderInvocation::Reuse(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, bool validated) {
+    if (!validated && request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
+    return PreparedShaderInvocation(request, handle);
+}
+
+namespace {
+
+// APS5_VERIFY_STAGE_MEMO=N: every Nth result materialized with a stage memo is materialized again
+// without it and compared.
+void verifyStageMemo(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const RecompileResult& result) {
+    static const std::uint64_t interval = [] {
+        const char* text = std::getenv("APS5_VERIFY_STAGE_MEMO");
+        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
+    }();
+    static std::atomic<std::uint64_t> results{0}, compared{0}, differences{0};
+    if (interval == 0u || results.fetch_add(1, std::memory_order_relaxed) % interval != 0u) return;
+    const auto plain = materializeResult(variant, request, snapshot);
+    const auto sameAttributes = std::ranges::equal(result.vertexAttributes, plain.vertexAttributes, [](const VertexAttribute& a, const VertexAttribute& b) {
+        return a.location == b.location && a.components == b.components && a.resource.fields == b.resource.fields && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents;
+    });
+    const char* difference = result.spirv.data() != plain.spirv.data() ? "module" : result.specializationId != plain.specializationId ? "specialization" : result.bindings != plain.bindings ? "bindings" : result.pushConstants != plain.pushConstants ? "push constants" : !sameAttributes ? "vertex attributes" : result.workgroupMemoryDwords != plain.workgroupMemoryDwords || result.poisonedSrtReads != plain.poisonedSrtReads ? "counts" : nullptr;
+    const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (difference != nullptr && differences.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[stage-memo] verify: a result of variant %llu differs in its %s from one materialized without the memo\n", static_cast<unsigned long long>(variant.artifact.variantId), difference);
+    if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[stage-memo] verify: %llu results compared, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
+}
+
+}
+
+std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture, StageMemo* memo) const {
+    if (memo == nullptr || !request.useCache || !ResultMemo()) return Materialize(capture);
+    if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    auto& held = memo->results;
+    std::shared_ptr<const RecompileResult> recycled;
+    auto slot = held.size();
+    if (!held.empty()) {
+        const auto oldest = memo->next % held.size();
+        if (held[oldest] == nullptr || held[oldest].use_count() == 1) {
+            recycled = std::move(held[oldest]);
+            slot = oldest;
+        } else if (held.size() >= StageMemoResults) {
+            slot = oldest;
+        }
+    }
+    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, const_cast<RecompileResult*>(recycled.get()), memo));
+    recycled.reset();
+    result->cacheHit = true;
+    verifyStageMemo(*handle->artifact, request, capture.snapshot, *result);
+    if (slot == held.size()) {
+        held.push_back(result);
+    } else {
+        held[slot] = result;
+        memo->next = slot + 1;
+    }
     return result;
 }
 
