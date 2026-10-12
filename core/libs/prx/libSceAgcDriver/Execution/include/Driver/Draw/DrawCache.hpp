@@ -111,6 +111,8 @@ struct ShapeStage {
 struct ShapeStages {
     std::atomic_flag busy;
     std::vector<ShapeStage> stages;
+    // The recording side's memo of the shape; under the GPU mutex, not under `busy`.
+    Graphics::DrawShapeMemo drawn;
 };
 
 struct StageMemoCounts {

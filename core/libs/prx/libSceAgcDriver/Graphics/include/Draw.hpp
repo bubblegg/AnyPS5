@@ -14,10 +14,53 @@ namespace AgcDriver::Graphics {
 
 struct HostImport;
 
+// What the last draw of a draw shape (the driver's: one register state apart from the user data
+// words) derived from its stages, its vertex attributes and its state alone, for the next draw of
+// the shape to take when those have the same signature: the fragment outputs of the stage
+// validation, the vertex input layout and the pipeline. Every draw built a validation key and a
+// pipeline key and looked both up, and built and checked its vertex input layout anew. A draw that
+// differs is derived as before and remembered; so is every 64th, which keeps the pipeline store's
+// order of use current. Used under the GPU mutex only. APS5_NO_DRAW_SHAPE_MEMO=1 derives every
+// draw as before; APS5_VERIFY_DRAW_SHAPE_MEMO=N derives every Nth the long way too and compares.
+struct DrawShapeMemo {
+    struct Attribute {
+        std::uint32_t location = 0, components = 0, formatComponents = 0, fetchIndex = 0;
+        // The V#'s format word and its stride with the flag above it; the format's alignment.
+        std::uint32_t format = 0, stride = 0, alignment = 1;
+        bool null = false;
+    };
+    VkDevice device = VK_NULL_HANDLE;
+    std::weak_ptr<BufferPool> pool;
+    std::uint32_t uses = 0;
+    // This draw: derived the long way to refresh the memo, or also the long way to compare.
+    bool refresh = false, verify = false;
+    // Counts the changes of what the pipeline was looked up with.
+    std::uint64_t generation = 0;
+    bool outputsValid = false;
+    std::vector<std::uint64_t> validationKey;
+    std::set<std::uint32_t> fragmentOutputs;
+    VkPipelineStageFlags shaderStages = 0;
+    bool layoutValid = false;
+    std::vector<Attribute> attributes;
+    VertexInputLayout vertexInput;
+    std::uint64_t pipelineGeneration = ~std::uint64_t{0};
+    std::weak_ptr<Pipeline> pipeline;
+    VkDescriptorSetLayout mainLayout = VK_NULL_HANDLE, fragmentLayout = VK_NULL_HANDLE;
+    bool split = false;
+    std::vector<std::uint32_t> mainKey, fragmentKey;
+    VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::uint32_t proxiedTargets = 0;
+};
+
+struct DrawShapeMemoCounts {
+    std::atomic<std::uint64_t> draws{0}, outputs{0}, layouts{0}, pipelines{0};
+};
+DrawShapeMemoCounts& DrawShapeMemoCounters();
+
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, DrawShapeMemo* memo = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 

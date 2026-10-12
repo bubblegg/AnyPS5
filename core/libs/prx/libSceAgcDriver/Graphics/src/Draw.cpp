@@ -644,13 +644,12 @@ void countCache(std::uint64_t DrawProfile::*counter) {
 // fragment results the key already names (the pipeline key treats them the same way). `memoized`
 // says whether the memo applied, `hit` whether it answered. APS5_NO_VALIDATE_CACHE=1 validates
 // every draw.
-bool ValidationKey(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::vector<std::uint64_t>& key) {
+template<typename TAdd>
+bool validationKeyFields(const Context& context, std::span<const CompiledShader> shaders, const State& state, TAdd&& add) {
     using Stage = ShaderRecompiler::ShaderStage;
     static const bool disabled = std::getenv("APS5_NO_VALIDATE_CACHE") != nullptr;
-    const auto add = [&](auto value) { key.push_back(static_cast<std::uint64_t>(value)); };
     bool keyed = !disabled;
     if (keyed) {
-        key.reserve(40 + shaders.size() * 12);
         add(shaders.size());
         for (const auto& shader : shaders) {
             Require(shader.program != nullptr, "missing compiled shader");
@@ -711,6 +710,22 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
     return keyed;
 }
 
+bool ValidationKey(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::vector<std::uint64_t>& key) {
+    key.reserve(40 + shaders.size() * 12);
+    return validationKeyFields(context, shaders, state, [&](auto value) { key.push_back(static_cast<std::uint64_t>(value)); });
+}
+
+// Whether the draw's validation key is `key`, without building it.
+bool validationKeyIs(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::span<const std::uint64_t> key) {
+    std::size_t at = 0;
+    bool same = true;
+    const bool keyed = validationKeyFields(context, shaders, state, [&](auto value) {
+        if (same && at < key.size() && key[at] == static_cast<std::uint64_t>(value)) ++at;
+        else same = false;
+    });
+    return keyed && same && at == key.size();
+}
+
 std::mutex& validationMutex() {
     static std::mutex mutex;
     return mutex;
@@ -719,6 +734,13 @@ std::mutex& validationMutex() {
 std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
     static std::map<std::vector<std::uint64_t>, std::string> failures;
     return failures;
+}
+
+// How many failures are known: the driver asks for every draw before it is queued, and with none
+// known (the usual case) no key is built for the answer.
+std::atomic<std::size_t>& knownValidationFailures() {
+    static std::atomic<std::size_t> count{0};
+    return count;
 }
 
 std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
@@ -744,6 +766,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
             auto& failures = validationFailures();
             if (failures.size() >= 1024) failures.clear();
             failures.emplace(std::move(key), error.what());
+            knownValidationFailures().store(failures.size(), std::memory_order_release);
         }
         throw;
     }
@@ -1046,7 +1069,124 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRec
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+// The draw shape memo (DrawShapeMemo, Draw.hpp).
+void shapeMemoVerified(const char* difference) {
+    static std::atomic<std::uint64_t> compared{0}, differences{0};
+    const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (difference != nullptr && differences.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[shape-memo] verify: a draw's %s differs from what its shape remembered\n", difference);
+    if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[shape-memo] verify: %llu derivations compared, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
+}
+
+// Whether the draw takes part; the memo is emptied for another device.
+bool beginShapeMemo(const Context& context, const Pm4::DrawParameters& draw, DrawShapeMemo& memo) {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_SHAPE_MEMO") == nullptr;
+    static const std::uint64_t verifyEvery = [] {
+        const char* text = std::getenv("APS5_VERIFY_DRAW_SHAPE_MEMO");
+        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
+    }();
+    if (!enabled || draw.indirect) return false;
+    if (memo.device != context.device || memo.pool.owner_before(context.bufferPool) || context.bufferPool.owner_before(memo.pool)) {
+        memo = DrawShapeMemo{};
+        memo.device = context.device;
+        memo.pool = context.bufferPool;
+    }
+    memo.refresh = ++memo.uses % 64 == 0;
+    const auto draws = DrawShapeMemoCounters().draws.fetch_add(1, std::memory_order_relaxed);
+    static std::uint64_t verified = 0;
+    memo.verify = verifyEvery != 0 && !memo.refresh && ++verified % verifyEvery == 0;
+    static_cast<void>(draws);
+    return true;
+}
+
+bool memoOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, DrawShapeMemo& memo, DrawInputs& inputs) {
+    if (!memo.outputsValid || memo.refresh || !validationKeyIs(context, shaders, state, memo.validationKey)) return false;
+    inputs.fragmentOutputs = memo.fragmentOutputs;
+    inputs.shaderStages = memo.shaderStages;
+    if (memo.verify) {
+        bool memoized = false, hit = false;
+        shapeMemoVerified(CachedFragmentOutputs(context, shaders, state, memoized, hit) != memo.fragmentOutputs ? "fragment outputs" : PipelineStages(shaders) != memo.shaderStages ? "pipeline stages" : nullptr);
+    }
+    DrawShapeMemoCounters().outputs.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void rememberOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, DrawShapeMemo& memo, const DrawInputs& inputs) {
+    memo.validationKey.clear();
+    memo.outputsValid = ValidationKey(context, shaders, state, memo.validationKey);
+    memo.fragmentOutputs = inputs.fragmentOutputs;
+    memo.shaderStages = inputs.shaderStages;
+    ++memo.generation;
+}
+
+// The remembered layout when every attribute has the signature it was built from (BuildVertexInputLayout
+// reads nothing else of an attribute but its address, whose check is repeated here).
+bool memoLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes, DrawShapeMemo& memo, DrawInputs& inputs) {
+    if (!memo.layoutValid || memo.refresh || memo.attributes.size() != attributes.size()) return false;
+    for (std::size_t i = 0; i < attributes.size(); ++i) {
+        const auto& attribute = attributes[i];
+        const auto& kept = memo.attributes[i];
+        const auto& fields = attribute.resource.fields;
+        const bool null = NullVertexDescriptor(attribute);
+        if (attribute.location != kept.location || attribute.components != kept.components || attribute.formatComponents != kept.formatComponents || attribute.fetchIndex != kept.fetchIndex || fields[3] != kept.format || (fields[1] >> 16u) != kept.stride || null != kept.null) return false;
+        if (null) continue;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        if (address == 0 || address % kept.alignment != 0) return false;
+    }
+    inputs.vertexInput = memo.vertexInput;
+    if (memo.verify) {
+        const auto built = BuildVertexInputLayout(context, attributes);
+        const bool same = std::ranges::equal(built.bindings, memo.vertexInput.bindings, [](const VkVertexInputBindingDescription& a, const VkVertexInputBindingDescription& b) { return a.binding == b.binding && a.stride == b.stride && a.inputRate == b.inputRate; }) &&
+            std::ranges::equal(built.attributes, memo.vertexInput.attributes, [](const VkVertexInputAttributeDescription& a, const VkVertexInputAttributeDescription& b) { return a.location == b.location && a.binding == b.binding && a.format == b.format && a.offset == b.offset; });
+        shapeMemoVerified(same ? nullptr : "vertex input layout");
+    }
+    DrawShapeMemoCounters().layouts.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void rememberLayout(std::span<const ShaderRecompiler::VertexAttribute> attributes, DrawShapeMemo& memo, const DrawInputs& inputs) {
+    memo.attributes.clear();
+    for (const auto& attribute : attributes) {
+        const auto& fields = attribute.resource.fields;
+        memo.attributes.push_back({attribute.location, attribute.components, attribute.formatComponents, attribute.fetchIndex, fields[3], fields[1] >> 16u, DecodeVertexFormat(attribute).alignment, NullVertexDescriptor(attribute)});
+    }
+    memo.vertexInput = inputs.vertexInput;
+    memo.layoutValid = true;
+    ++memo.generation;
+}
+
+// The remembered pipeline when the draw's outputs and layout are the remembered ones (so its
+// stages and vertex input are those the pipeline was looked up with), its set layouts, attachment
+// layout and proxied targets too, and the pipeline store still holds it. The state is the shape's.
+std::shared_ptr<Pipeline> memoPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::uint32_t proxiedTargets, DrawShapeMemo& memo) {
+    if (memo.refresh || !memo.outputsValid || !memo.layoutValid || memo.pipelineGeneration != memo.generation || memo.attachmentLayout != attachmentLayout || memo.proxiedTargets != proxiedTargets) return nullptr;
+    const auto layouts = resources.SetLayouts();
+    if (layouts.main != memo.mainLayout || layouts.fragment != memo.fragmentLayout || layouts.split != memo.split || !std::ranges::equal(layouts.mainKey, memo.mainKey) || !std::ranges::equal(layouts.fragmentKey, memo.fragmentKey)) return nullptr;
+    auto pipeline = memo.pipeline.lock();
+    if (pipeline == nullptr) return nullptr;
+    if (memo.verify) {
+        auto found = CachedPipeline(context, state, vertexInput, resources, shaders, attachmentLayout);
+        shapeMemoVerified(found != pipeline ? "pipeline" : nullptr);
+        pipeline = std::move(found);
+    }
+    DrawShapeMemoCounters().pipelines.fetch_add(1, std::memory_order_relaxed);
+    return pipeline;
+}
+
+void rememberPipeline(const Context&, const ShaderResources& resources, VkImageLayout attachmentLayout, std::uint32_t proxiedTargets, const std::shared_ptr<Pipeline>& pipeline, DrawShapeMemo& memo) {
+    if (!memo.outputsValid || !memo.layoutValid) return;
+    const auto layouts = resources.SetLayouts();
+    memo.pipeline = pipeline;
+    memo.mainLayout = layouts.main;
+    memo.fragmentLayout = layouts.fragment;
+    memo.split = layouts.split;
+    memo.mainKey.assign(layouts.mainKey.begin(), layouts.mainKey.end());
+    memo.fragmentKey.assign(layouts.fragmentKey.begin(), layouts.fragmentKey.end());
+    memo.attachmentLayout = attachmentLayout;
+    memo.proxiedTargets = proxiedTargets;
+    memo.pipelineGeneration = memo.generation;
+}
+
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, DrawShapeMemo* memo = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1083,9 +1223,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
-    } else {
+    } else if (memo == nullptr || !memoOutputs(context, shaders, state, *memo, inputs)) {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
+        if (memo != nullptr) rememberOutputs(context, shaders, state, *memo, inputs);
     }
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders OK");
     APS5_LOG_OUT_DEBUG("PipelineStages=0x%x", static_cast<unsigned>(inputs.shaderStages));
@@ -1170,8 +1311,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
-    if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
-    else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    if (recipe != nullptr) {
+        inputs.vertexInput = recipe->vertexInput;
+    } else if (memo == nullptr || !memoLayout(context, attributes, *memo, inputs)) {
+        inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+        if (memo != nullptr) rememberLayout(attributes, *memo, inputs);
+    }
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
@@ -1881,6 +2026,7 @@ bool RecordDraws() {
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
+    if (knownValidationFailures().load(std::memory_order_acquire) == 0) return std::nullopt;
     std::vector<std::uint64_t> key;
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
     std::lock_guard lock(validationMutex());
@@ -1889,7 +2035,13 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+DrawShapeMemoCounts& DrawShapeMemoCounters() {
+    static DrawShapeMemoCounts counts;
+    return counts;
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, DrawShapeMemo* memo) {
+    if (memo != nullptr && !beginShapeMemo(context, draw, *memo)) memo = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -1908,7 +2060,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, memo);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2161,7 +2313,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto built = resources->SetLayouts();
         Require(described.layouts.main == built.main && described.layouts.fragment == built.fragment && described.layouts.split == built.split && std::ranges::equal(described.mainKey, built.mainKey) && std::ranges::equal(described.fragmentKey, built.fragmentKey), "set layouts described from the shaders differ from the draw's");
     }
-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    const auto attachmentLayout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    std::uint32_t proxiedTargets = 0;
+    for (std::size_t index = 0; index < targets.size() && index < 32; ++index) proxiedTargets |= targets[index].proxied ? 1u << index : 0u;
+    auto pipeline = memo != nullptr ? memoPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, attachmentLayout, proxiedTargets, *memo) : nullptr;
+    if (pipeline == nullptr) {
+        pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, attachmentLayout);
+        if (memo != nullptr) rememberPipeline(context, *resources, attachmentLayout, proxiedTargets, pipeline, *memo);
+    }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;

@@ -98,7 +98,7 @@ struct PreparedScope {
         const auto waitedNow = DrawPipeline::FullWaitCycles().load(std::memory_order_relaxed);
         const auto presents = VulkanDevice::PresentCounts().presents;
         const auto shown = presents - perf.lastPresents;
-        std::fprintf(stderr, "[perf] %.1f s: %llu draws prepared in %.1f us each (and %.1f us each waiting for room in the queue), %llu committed in %.1f us each; %llu presents (%.1f a second, %.0f draws each); stages taken from their shape: %llu, %llu of them with the stage inputs checked again, %llu resolved\n", seconds, static_cast<unsigned long long>(preparedDraws), preparedDraws != 0 ? static_cast<double>(preparedCycles) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, preparedDraws != 0 ? static_cast<double>(waitedNow - perf.lastWaited) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, static_cast<unsigned long long>(committedDraws), committedDraws != 0 ? static_cast<double>(committedCycles) / cyclesPerUs / static_cast<double>(committedDraws) : 0.0, static_cast<unsigned long long>(shown), static_cast<double>(shown) / seconds, shown != 0 ? static_cast<double>(preparedDraws) / static_cast<double>(shown) : 0.0, static_cast<unsigned long long>(StageMemoCounters().reused.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().revalidated.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().resolved.exchange(0, std::memory_order_relaxed)));
+        std::fprintf(stderr, "[perf] %.1f s: %llu draws prepared in %.1f us each (and %.1f us each waiting for room in the queue), %llu committed in %.1f us each; %llu presents (%.1f a second, %.0f draws each); stages taken from their shape: %llu, %llu of them with the stage inputs checked again, %llu resolved; recorded with their shape's outputs %llu, layout %llu, pipeline %llu of %llu\n", seconds, static_cast<unsigned long long>(preparedDraws), preparedDraws != 0 ? static_cast<double>(preparedCycles) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, preparedDraws != 0 ? static_cast<double>(waitedNow - perf.lastWaited) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, static_cast<unsigned long long>(committedDraws), committedDraws != 0 ? static_cast<double>(committedCycles) / cyclesPerUs / static_cast<double>(committedDraws) : 0.0, static_cast<unsigned long long>(shown), static_cast<double>(shown) / seconds, shown != 0 ? static_cast<double>(preparedDraws) / static_cast<double>(shown) : 0.0, static_cast<unsigned long long>(StageMemoCounters().reused.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().revalidated.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().resolved.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().outputs.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().layouts.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().pipelines.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().draws.exchange(0, std::memory_order_relaxed)));
         perf.lastQpc = qpc.QuadPart;
         perf.lastTsc = now;
         perf.lastPresents = presents;
@@ -611,11 +611,11 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         const auto commitQueue = submission.queue;
         const auto commitPacket = t.packetOpcode;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry)] {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), shape = t.shape] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             const auto commitStart = __rdtsc();
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, shape != nullptr ? &shape->drawn : nullptr);
             drawPerf().committed.cycles.fetch_add(__rdtsc() - commitStart, std::memory_order_relaxed);
             drawPerf().committed.draws.fetch_add(1, std::memory_order_relaxed);
         };
@@ -643,7 +643,7 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, t.shape != nullptr ? &t.shape->drawn : nullptr);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
@@ -687,7 +687,7 @@ void Driver::runDrawTailOnHelper(DrawTail& tail, std::uint64_t seq, std::uint64_
 }
 
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::DrawShapeMemo* memo) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
@@ -705,7 +705,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, memo);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

@@ -111,12 +111,16 @@ void SecondDrawHitsTheCache(bool libraries) {
 void ShapeDrawsReuseTheirStages() {
     auto& counts = AgcDriver::DriverDetail::StageMemoCounters();
     const auto reusedBefore = counts.reused.load();
+    auto& drawn = AgcDriver::Graphics::DrawShapeMemoCounters();
+    const auto outputsBefore = drawn.outputs.load(), layoutsBefore = drawn.layouts.load(), pipelinesBefore = drawn.pipelines.load();
     auto commands = Draws(0, 6);
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the shape draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
     const auto reused = counts.reused.load() - reusedBefore;
     Require(reused == 10, "six draws of one shape took " + std::to_string(reused) + " stages from the shape's record, expected 10 (two stages of every draw after the first)");
+    const auto outputs = drawn.outputs.load() - outputsBefore, layouts = drawn.layouts.load() - layoutsBefore, pipelines = drawn.pipelines.load() - pipelinesBefore;
+    Require(outputs == 5 && layouts == 5 && pipelines == 5, "six draws of one shape were recorded with the shape's outputs " + std::to_string(outputs) + ", layout " + std::to_string(layouts) + " and pipeline " + std::to_string(pipelines) + " times, expected 5 each (every draw after the first)");
 }
 
 }
