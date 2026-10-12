@@ -214,7 +214,49 @@ struct PreparedScope {
 
 }
 
+namespace {
+
+// Measuring aid, APS5_NULL_DRAW_TEST=1: the driver alternates 20 s of normal work with 10 s in
+// which every draw packet is dropped at once, and prints the presents of each such window. With
+// the draws costing nothing, the frame rate of those windows is what the title's own threads and
+// the rest of the driver (dispatches, flips, labels) allow: the ceiling any draw path work can
+// reach. The picture is wrong during the windows.
+bool nullDrawNow() {
+    static const bool enabled = std::getenv("APS5_NULL_DRAW_TEST") != nullptr;
+    if (!enabled) return false;
+    constexpr double NormalSeconds = 20.0, NullSeconds = 10.0;
+    static std::atomic<bool> dropping{false};
+    static std::atomic<std::uint64_t> dropped{0};
+    static std::atomic<std::uint32_t> untilCheck{0};
+    static long long since = 0;
+    static std::uint64_t presentsAtStart = 0;
+    if (dropping.load(std::memory_order_relaxed)) dropped.fetch_add(1, std::memory_order_relaxed);
+    if (untilCheck.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+        LARGE_INTEGER now{}, frequency{};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        if (since == 0) since = now.QuadPart;
+        const double seconds = static_cast<double>(now.QuadPart - since) / static_cast<double>(frequency.QuadPart);
+        const bool isDropping = dropping.load(std::memory_order_relaxed);
+        if (seconds >= (isDropping ? NullSeconds : NormalSeconds)) {
+            const auto presents = VulkanDevice::PresentCounts().presents;
+            if (isDropping) {
+                const auto shown = presents - presentsAtStart;
+                const auto count = dropped.exchange(0, std::memory_order_relaxed);
+                std::fprintf(stderr, "[null-draws] %.1f s without draws: %llu draws dropped, %llu presents (%.1f a second, %.0f draws each)\n", seconds, static_cast<unsigned long long>(count), static_cast<unsigned long long>(shown), static_cast<double>(shown) / seconds, shown != 0 ? static_cast<double>(count) / static_cast<double>(shown) : 0.0);
+            }
+            presentsAtStart = presents;
+            since = now.QuadPart;
+            dropping.store(!isDropping, std::memory_order_relaxed);
+        }
+    }
+    return dropping.load(std::memory_order_relaxed);
+}
+
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+    if (nullDrawNow()) return DrawVerdict::Drawn;
     const PreparedScope prepared;
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
