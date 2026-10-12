@@ -197,15 +197,53 @@ struct Magazine {
     void* blocks[Blocks];
 };
 
+// Above the small classes there is one class per 256 bytes up to 8 KiB (APS5_NO_LARGE_ALLOC_CACHE=1
+// leaves those blocks to the heap as before). A draw makes a handful of such blocks (its commit
+// closure, its copy of the decode, the pages of guest memory it captured), the preparing thread
+// allocates them and the recording thread frees them, and malloc and free took 300 to 400 cycles
+// each for them: 5% of the one thread and 7% of the other. Their magazines count as full at 16
+// blocks, which bounds what a thread and the depot hold.
 struct SmallCache {
-    static constexpr std::size_t Classes = 64;
+    static constexpr std::size_t SmallClasses = 64;
     static constexpr std::size_t Granule = 8;
-    static constexpr std::size_t MaxBytes = Classes * Granule;
+    static constexpr std::size_t SmallBytes = SmallClasses * Granule;
+    static constexpr std::size_t LargeClasses = 30;
+    static constexpr std::size_t LargeGranule = 256;
+    static constexpr std::size_t Classes = SmallClasses + LargeClasses;
+    static constexpr std::size_t MaxBytes = SmallBytes + LargeClasses * LargeGranule;
+    static constexpr std::uint32_t LargeMagazineBlocks = 16;
     static constexpr std::uint32_t DepotMagazines = 64;
     static constexpr std::uint32_t EmptyMagazines = 1024;
     Magazine* current[Classes];
     Magazine* spare[Classes];
+
+    // The class whose blocks hold `size` bytes (at most MaxBytes), and what its blocks hold.
+    static constexpr std::size_t ClassFor(std::size_t size) {
+        return size <= SmallBytes ? (size != 0 ? size - 1 : 0) / Granule : SmallClasses + (size - SmallBytes - 1) / LargeGranule;
+    }
+    static constexpr std::size_t ClassBytes(std::size_t c) {
+        return c < SmallClasses ? (c + 1) * Granule : SmallBytes + (c - SmallClasses + 1) * LargeGranule;
+    }
+    // The largest class a block of `capacity` bytes fully holds, or Classes.
+    static constexpr std::size_t ClassOf(std::size_t capacity) {
+        if (capacity < Granule || capacity > MaxBytes) return Classes;
+        if (capacity <= SmallBytes) return capacity / Granule - 1;
+        if (capacity < SmallBytes + LargeGranule) return Classes;
+        return SmallClasses + (capacity - SmallBytes) / LargeGranule - 1;
+    }
+    // Whether `size` is exactly what a class holds.
+    static constexpr bool WholeClass(std::size_t size) {
+        const auto c = ClassOf(size);
+        return c != Classes && ClassBytes(c) == size;
+    }
+    static constexpr std::uint32_t MagazineBlocks(std::size_t c) {
+        return c < SmallClasses ? Magazine::Blocks : LargeMagazineBlocks;
+    }
 };
+
+static_assert(SmallCache::ClassFor(SmallCache::SmallBytes) == SmallCache::SmallClasses - 1 && SmallCache::ClassFor(SmallCache::SmallBytes + 1) == SmallCache::SmallClasses && SmallCache::ClassFor(SmallCache::MaxBytes) == SmallCache::Classes - 1);
+static_assert(SmallCache::ClassBytes(SmallCache::ClassFor(513)) == 768 && SmallCache::ClassBytes(SmallCache::ClassFor(768)) == 768 && SmallCache::ClassBytes(SmallCache::ClassFor(769)) == 1024 && SmallCache::ClassBytes(SmallCache::Classes - 1) == SmallCache::MaxBytes);
+static_assert(SmallCache::ClassOf(767) == SmallCache::Classes && SmallCache::ClassOf(768) == SmallCache::SmallClasses && SmallCache::ClassOf(1023) == SmallCache::SmallClasses && SmallCache::ClassOf(SmallCache::MaxBytes) == SmallCache::Classes - 1 && SmallCache::ClassOf(512) == 63 && SmallCache::ClassOf(15) == 0);
 
 struct Depot {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -342,11 +380,17 @@ SmallCache* smallCache(bool create) {
     return cache;
 }
 
+// The largest size the cache serves.
+std::size_t cachedBytes() {
+    static const std::size_t bytes = std::getenv("APS5_NO_LARGE_ALLOC_CACHE") == nullptr ? SmallCache::MaxBytes : SmallCache::SmallBytes;
+    return bytes;
+}
+
 void* takeCached(std::size_t size) {
-    if (size > SmallCache::MaxBytes) return nullptr;
+    if (size > cachedBytes()) return nullptr;
     auto* cache = smallCache(false);
     if (cache == nullptr) return nullptr;
-    const std::size_t c = (size != 0 ? size - 1 : 0) / SmallCache::Granule;
+    const std::size_t c = SmallCache::ClassFor(size);
     Magazine* magazine = cache->current[c];
     if (magazine == nullptr || magazine->count == 0) {
         if (Magazine* spare = cache->spare[c]; spare != nullptr && spare->count != 0) {
@@ -388,9 +432,9 @@ void checkSizedDelete(void* block, std::size_t capacity, std::size_t deleting, v
         const auto count = check->sized.fetch_add(1, std::memory_order_relaxed) + 1;
         if (deleting > capacity) {
             if (check->violations.fetch_add(1, std::memory_order_relaxed) < 40) std::fprintf(stderr, "[alloc] sized delete names more than its block holds: %llu bytes deleted at libSceAgcDriver.prx+0x%llx, the block %p holds %llu\n", static_cast<unsigned long long>(deleting), offsetOf(site), block, static_cast<unsigned long long>(capacity));
-        } else if (deleting < SmallCache::Granule || deleting > SmallCache::MaxBytes) {
-            if (capacity >= SmallCache::Granule && capacity <= SmallCache::MaxBytes) check->uncached.fetch_add(1, std::memory_order_relaxed);
-        } else if (deleting / SmallCache::Granule == capacity / SmallCache::Granule) {
+        } else if (SmallCache::ClassOf(deleting) == SmallCache::Classes) {
+            if (SmallCache::ClassOf(capacity) != SmallCache::Classes) check->uncached.fetch_add(1, std::memory_order_relaxed);
+        } else if (SmallCache::ClassOf(deleting) == SmallCache::ClassOf(capacity)) {
             check->exact.fetch_add(1, std::memory_order_relaxed);
         } else {
             check->lower.fetch_add(1, std::memory_order_relaxed);
@@ -403,21 +447,23 @@ void checkSizedDelete(void* block, std::size_t capacity, std::size_t deleting, v
 // has no room. `deleting` is the size a sized delete named, or -1.
 bool keepCached(void* block, std::size_t deleting, void* site) {
     std::size_t capacity = 0;
-    // A size that is no whole number of granules says too little: the block may hold the granule
-    // it ends in (one of this library's does), so the heap is asked. Over the largest class it
-    // says enough: the block has no class.
-    if (deleting != static_cast<std::size_t>(-1) && sizedDelete() && (deleting > SmallCache::MaxBytes || (deleting >= SmallCache::Granule && deleting % SmallCache::Granule == 0))) {
+    // A size that is not exactly what a class holds says too little: the block may hold the class
+    // the size ends in (one of this library's does), so the heap is asked. Over the largest class
+    // it says enough: the block has no class.
+    const auto limit = cachedBytes();
+    if (deleting != static_cast<std::size_t>(-1) && sizedDelete() && (deleting > limit || SmallCache::WholeClass(deleting))) {
         capacity = deleting;
     } else {
         capacity = _msize(block);
         if (verifySizedDelete()) checkSizedDelete(block, capacity, deleting, site);
     }
-    if (capacity < SmallCache::Granule || capacity > SmallCache::MaxBytes) return false;
-    const std::size_t c = capacity / SmallCache::Granule - 1;
+    if (capacity > limit) return false;
+    const std::size_t c = SmallCache::ClassOf(capacity);
+    if (c == SmallCache::Classes) return false;
     auto* cache = smallCache(true);
     if (cache == nullptr) return false;
     Magazine* magazine = cache->current[c];
-    if (magazine == nullptr || magazine->count == Magazine::Blocks) {
+    if (magazine == nullptr || magazine->count >= SmallCache::MagazineBlocks(c)) {
         Magazine* spare = cache->spare[c];
         if (spare != nullptr && spare->count == 0) {
             cache->spare[c] = magazine;
@@ -443,7 +489,7 @@ void* guardedAllocate(std::size_t size, void* site, bool nothrow) {
             return cached;
         }
         // A miss allocates the whole class, so the block is reused for any size of its class.
-        if (size <= SmallCache::MaxBytes) size = std::max<std::size_t>((size + SmallCache::Granule - 1) / SmallCache::Granule * SmallCache::Granule, SmallCache::Granule);
+        if (size <= cachedBytes()) size = SmallCache::ClassBytes(SmallCache::ClassFor(size));
     }
     auto* block = static_cast<unsigned char*>(std::malloc(guard ? size + TailBytes : size != 0 ? size : 1));
     if (allocProfiled()) noteAllocation(size, __rdtsc() - started);
