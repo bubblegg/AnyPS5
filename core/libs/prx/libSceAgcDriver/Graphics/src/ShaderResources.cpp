@@ -1419,17 +1419,14 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             updateAfterBind = true;
         }
         // A draw's read-only buffers move every frame in some titles; with dynamic buffer bindings
-        // such a draw binds one prepared set with offsets into the draw ring instead of a set of
-        // its own (prepareRingBindings). APS5_NO_DRAW_RING=1 keeps plain bindings.
-        static const bool noDrawRing = std::getenv("APS5_NO_DRAW_RING") != nullptr;
-        // The ring is not used with split sets: their layouts are those of the pipeline libraries
-        // built at registration, which name plain storage buffers.
-        ringLayout = drawBuild && !noDrawRing && !SplitsSets(context, shaders) && !updateAfterBind && !usesBda && context.descriptorCache != nullptr && storageBuffers != 0 && storageBuffers <= context.limits.maxDescriptorSetStorageBuffersDynamic;
-        if (ringLayout) {
-            for (auto& binding : bindings) {
-                if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) binding.layout.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
-            }
+        // such a draw binds prepared sets with offsets into the draw ring instead of sets of its
+        // own (prepareRingBindings).
+        splitSets = SplitsSets(context, shaders);
+        if (drawBuild) dynamicSets = DynamicBufferSets(context, shaders, updateAfterBind);
+        for (auto& binding : bindings) {
+            if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && dynamicSets[setOf(binding)]) binding.layout.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
         }
+        ringLayout = !usesBda && (dynamicSets[0] || dynamicSets[1]) && std::none_of(bindings.begin(), bindings.end(), [](const Binding& binding) { return binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; });
         timing.bindingsMs = phase(BuildPhase::Bindings);
         // For every build, locked ones included: their stage B then takes the fast path too, and the
         // collects cost the same wherever they run.
@@ -1496,7 +1493,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
             std::vector<VkDescriptorPoolSize> sizes;
-            if (storageBuffers != 0) sizes.push_back({ringLayout ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
+            if (storageBuffers != 0) sizes.push_back({dynamicSets[0] ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
             if (plannedSampledImages != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, plannedSampledImages});
             if (plannedStorageImages != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, plannedStorageImages});
             if (!samplers.empty()) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, static_cast<std::uint32_t>(samplers.size())});
@@ -1531,6 +1528,29 @@ bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders)
     return std::any_of(shaders.begin(), shaders.end(), fragmentSet) || (context.graphicsPipelineLibrary && std::any_of(shaders.begin(), shaders.end(), fragmentStage));
 }
 
+std::array<bool, 2> DynamicBufferSets(const Context& context, std::span<const CompiledShader> shaders, bool updateAfterBind) {
+    static const bool noDrawRing = std::getenv("APS5_NO_DRAW_RING") != nullptr;
+    if (noDrawRing || updateAfterBind || context.descriptorCache == nullptr) return {};
+    std::array<std::uint64_t, 2> buffers{};
+    // A set with a BDA page table keeps plain bindings: draws that read through addresses do not
+    // take the ring.
+    std::array<bool, 2> tables{};
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return {};
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers) continue;
+            const auto set = binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet ? 1u : 0u;
+            buffers[set] += binding.count;
+            if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) tables[set] = true;
+        }
+    }
+    // The device limit counts the dynamic buffers of a whole pipeline layout: each set of a split
+    // layout may take half of it, whatever the other set turns out to hold.
+    const std::uint64_t limit = context.limits.maxDescriptorSetStorageBuffersDynamic;
+    const auto room = SplitsSets(context, shaders) ? limit / 2u : limit;
+    return {buffers[0] != 0 && buffers[0] <= room && !tables[0], buffers[1] != 0 && buffers[1] <= room && !tables[1]};
+}
+
 DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const CompiledShader> shaders) {
     Require(context.descriptorCache != nullptr, "described set layouts need the descriptor cache");
     DescribedSetLayouts result;
@@ -1556,6 +1576,13 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
         }
     }
     if (storageBuffers > context.limits.maxDescriptorSetStorageBuffers) updateAfterBind = true;
+    const auto dynamicSets = DynamicBufferSets(context, shaders, updateAfterBind);
+    for (std::size_t set = 0; set < descriptions.size(); ++set) {
+        if (!dynamicSets[set]) continue;
+        for (auto& binding : descriptions[set]) {
+            if (binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        }
+    }
     for (std::size_t set = 0; set < descriptions.size(); ++set) {
         auto& key = set == 0 ? result.mainKey : result.fragmentKey;
         for (const auto& binding : descriptions[set]) key.insert(key.end(), {binding.binding, static_cast<std::uint32_t>(binding.descriptorType), binding.descriptorCount, binding.stageFlags});
@@ -1654,18 +1681,22 @@ void ShaderResources::buildComplete() {
                 writes.push_back(write);
             }
             context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-            if (ringLayout) {
+            for (std::uint32_t which = 0; which < dynamicSets.size(); ++which) {
+                if (!dynamicSets[which]) continue;
                 // Dynamic offsets go by binding number, then array element.
                 std::vector<const Binding*> ordered;
                 for (const auto& binding : bindings) {
-                    if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) ordered.push_back(&binding);
+                    if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && setOf(binding) == which) ordered.push_back(&binding);
                 }
                 std::sort(ordered.begin(), ordered.end(), [](const Binding* a, const Binding* b) { return a->layout.binding < b->layout.binding; });
+                std::size_t count = 0;
                 for (const auto* binding : ordered) {
+                    count += binding->layout.descriptorCount;
+                    if (!ringLayout) continue;
                     Require(binding->allocations.size() == binding->layout.descriptorCount, "buffer allocations disagree with the binding count");
-                    dynamicOrder.insert(dynamicOrder.end(), binding->allocations.begin(), binding->allocations.end());
+                    dynamicOrder[which].insert(dynamicOrder[which].end(), binding->allocations.begin(), binding->allocations.end());
                 }
-                zeroOffsets.assign(dynamicOrder.size(), 0u);
+                zeroOffsets[which].assign(count, 0u);
             }
         }
         for (const auto& allocation : allocations) {
@@ -3449,8 +3480,10 @@ ShaderResources::~ShaderResources() {
 void ShaderResources::release() noexcept {
     // A set from the cache's pool chain goes back to it; a dedicated pool dies with its set.
     if (cacheAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(cacheAllocation);
-    if (ringAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(ringAllocation);
-    ringAllocation = {};
+    for (auto& allocation : ringAllocations) {
+        if (allocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(allocation);
+        allocation = {};
+    }
     if (pool) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (_layout && ownsLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, _layout, nullptr);
     if (fragment.cacheAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(fragment.cacheAllocation);
@@ -3612,9 +3645,9 @@ DrawRingCounters& RingCounters() {
 
 }
 
-void ShaderResources::BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set, std::span<const std::uint32_t> offsets) const {
-    if (offsets.empty()) offsets = zeroOffsets;
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &set, static_cast<std::uint32_t>(offsets.size()), offsets.empty() ? nullptr : offsets.data());
+void ShaderResources::BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t which, VkDescriptorSet set, std::span<const std::uint32_t> offsets) const {
+    if (offsets.empty()) offsets = zeroOffsets[which];
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, which == 0 ? 0u : ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &set, static_cast<std::uint32_t>(offsets.size()), offsets.empty() ? nullptr : offsets.data());
 }
 
 // Runs under the GPU mutex, like every recorded draw. Null when this draw must take a set of its
@@ -3764,19 +3797,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
             return refuse(DrawRingCounters::Full);
         }
     }
-    if (ringAllocation.set == VK_NULL_HANDLE) {
-        std::map<VkDescriptorType, std::uint32_t> counts;
-        for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
-        std::vector<VkDescriptorPoolSize> sizes;
-        for (const auto& [type, count] : counts) sizes.push_back({type, count});
-        ringAllocation = context.descriptorCache->Allocate(_layout, sizes);
-        Require(ringAllocation.set != VK_NULL_HANDLE, "draw ring descriptor allocation failed");
+    if (ringAllocations[0].set == VK_NULL_HANDLE && ringAllocations[1].set == VK_NULL_HANDLE) {
+        std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
+        for (const auto& binding : bindings) descriptions[setOf(binding)].push_back(binding.layout);
+        if (!descriptions[0].empty() || splitSets) {
+            ringAllocations[0] = context.descriptorCache->Allocate(_layout, PoolSizes(descriptions[0]));
+            Require(ringAllocations[0].set != VK_NULL_HANDLE, "draw ring descriptor allocation failed");
+        }
+        if (!descriptions[1].empty() || splitSets) {
+            ringAllocations[1] = context.descriptorCache->Allocate(fragment.layout, PoolSizes(descriptions[1]));
+            Require(ringAllocations[1].set != VK_NULL_HANDLE, "draw ring descriptor allocation failed");
+        }
         auto buffers = descriptorBuffers;
         auto writes = descriptorWrites;
         for (std::size_t index = 0; index < bindings.size(); ++index) {
             const auto& binding = bindings[index];
             auto& write = writes[index];
-            write.dstSet = ringAllocation.set;
+            write.dstSet = ringAllocations[setOf(binding)].set;
             if (binding.allocations.empty()) continue;
             const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
             write.pBufferInfo = buffers.data() + offset;
@@ -3789,8 +3826,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
         ++counters.sets;
     }
     auto result = std::make_shared<DrawBindings>();
-    result->allocation.set = ringAllocation.set;
-    result->dynamicOffsets.assign(dynamicOrder.size(), 0u);
+    result->allocation.set = ringAllocations[0].set;
+    result->fragmentAllocation.set = ringAllocations[1].set;
+    result->dynamicOffsets.assign(dynamicOrder[0].size(), 0u);
+    result->fragmentDynamicOffsets.assign(dynamicOrder[1].size(), 0u);
     auto* bytes = ring->buffer->Bytes().data();
     std::array<std::uint32_t, 64> placed;
     for (std::size_t copy = 0; copy < copyCount; ++copy) {
@@ -3813,9 +3852,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
         placed[copy] = static_cast<std::uint32_t>(position);
         position += (range + alignment - 1) / alignment * alignment;
     }
-    for (std::size_t slot = 0; slot < dynamicOrder.size(); ++slot) {
-        for (std::size_t copy = 0; copy < copyCount; ++copy) {
-            if (copies[copy].allocation == dynamicOrder[slot]) result->dynamicOffsets[slot] = placed[copy];
+    for (std::uint32_t which = 0; which < dynamicOrder.size(); ++which) {
+        auto& offsets = which == 0 ? result->dynamicOffsets : result->fragmentDynamicOffsets;
+        for (std::size_t slot = 0; slot < dynamicOrder[which].size(); ++slot) {
+            for (std::size_t copy = 0; copy < copyCount; ++copy) {
+                if (copies[copy].allocation == dynamicOrder[which][slot]) offsets[slot] = placed[copy];
+            }
         }
     }
     ++counters.ring;
@@ -3917,8 +3959,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    if (_set != VK_NULL_HANDLE) BindSet(commands, bindPoint, layout, _set, {});
-    if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
+    if (_set != VK_NULL_HANDLE) BindSet(commands, bindPoint, layout, 0, _set, {});
+    if (fragment.set != VK_NULL_HANDLE) BindSet(commands, bindPoint, layout, 1, fragment.set, {});
 }
 
 namespace {

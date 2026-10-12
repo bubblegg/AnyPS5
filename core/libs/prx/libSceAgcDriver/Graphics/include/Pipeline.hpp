@@ -109,6 +109,11 @@ struct DescribedSetLayouts {
 };
 DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const CompiledShader> shaders);
 bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders);
+// Whether the storage buffer bindings of the main set (0) and of the fragment set (1) are dynamic,
+// for the draw ring (ShaderResources::prepareRingBindings). Each set is judged by the bindings of
+// its own stages, so a library prebuilt for one stage has the layout the set of a draw has.
+// APS5_NO_DRAW_RING=1 keeps plain bindings.
+std::array<bool, 2> DynamicBufferSets(const Context& context, std::span<const CompiledShader> shaders, bool updateAfterBind);
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.

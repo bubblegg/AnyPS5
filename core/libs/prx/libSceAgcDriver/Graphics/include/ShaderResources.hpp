@@ -141,14 +141,16 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
-        // A set of the draw ring (see prepareRingBindings): the offsets its bind passes. Empty
-        // for a set of its own, which binds with BindSet's zero offsets.
+        // The sets of the draw ring (see prepareRingBindings): the offsets their binds pass. Empty
+        // for sets of its own, which bind with BindSet's zero offsets.
         std::vector<std::uint32_t> dynamicOffsets;
+        std::vector<std::uint32_t> fragmentDynamicOffsets;
         ~DrawBindings();
     };
     // Binds `set` (this object's or a DrawBindings one of the same layout) with the dynamic offsets
     // the layout needs: `offsets`, or zeros when empty.
-    void BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set, std::span<const std::uint32_t> offsets) const;
+    // `which`: 0 for the main set, 1 for the fragment set of a split layout.
+    void BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t which, VkDescriptorSet set, std::span<const std::uint32_t> offsets) const;
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
@@ -462,16 +464,20 @@ private:
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
-    // The draw ring (ShaderResources.cpp, DrawRing). `ringLayout`: the set's buffer bindings are
-    // dynamic, so a draw whose read-only buffers moved copies them into the ring and binds
-    // `ringAllocation`'s set, written once with those elements pointing at the ring, with offsets.
-    // `dynamicOrder` names the allocation of each dynamic descriptor in bind order; `ringRanges`
-    // the descriptor range of each allocation the ring serves (0: bound as the template has it).
+    // The draw ring (ShaderResources.cpp, DrawRing). `dynamicSets`: the buffer bindings of the main
+    // set (0) or the fragment set (1) are dynamic (DynamicBufferSets), and every bind of that set
+    // passes offsets (`zeroOffsets` for its own). `ringLayout`: every buffer binding is dynamic,
+    // so a draw whose read-only buffers moved copies them into the ring and binds the sets of
+    // `ringAllocations`, written once with those elements pointing at the ring, with offsets.
+    // `dynamicOrder` names the allocation of each dynamic descriptor of a set in bind order;
+    // `ringRanges` the descriptor range of each allocation the ring serves (0: bound as the
+    // template has it).
     bool ringLayout = false;
-    std::vector<std::size_t> dynamicOrder;
-    std::vector<std::uint32_t> zeroOffsets;
+    std::array<bool, 2> dynamicSets{};
+    std::array<std::vector<std::size_t>, 2> dynamicOrder;
+    std::array<std::vector<std::uint32_t>, 2> zeroOffsets;
     mutable std::vector<std::uint32_t> ringRanges;
-    mutable DescriptorCache::SetAllocation ringAllocation;
+    mutable std::array<DescriptorCache::SetAllocation, 2> ringAllocations;
     mutable bool ringUnusable = false;
     mutable bool ringTooLarge = false;
     std::shared_ptr<DrawBindings> prepareRingBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
