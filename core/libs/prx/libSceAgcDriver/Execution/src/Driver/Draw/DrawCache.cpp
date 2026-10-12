@@ -92,6 +92,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         drawOrder.push_front(key);
         replacement->order = drawOrder.begin();
         drawCache.emplace(key, std::move(replacement));
+        ++drawKeyFilter[drawKeySlot(key)];
     } else {
         replacement->order = found->second->order;
         drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
@@ -103,6 +104,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
             for (const auto& variant : variants) accountDrawVariant(*variant, false);
         }
         drawOrder.erase(last->second->order);
+        --drawKeyFilter[drawKeySlot(last->first)];
         drawCache.erase(last);
         ++drawCacheEvictions;
     }
@@ -114,6 +116,7 @@ void Driver::eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>&
     for (const auto& variants : found->second->stages) {
         for (const auto& variant : variants) accountDrawVariant(*variant, false);
     }
+    --drawKeyFilter[drawKeySlot(key)];
     drawOrder.erase(found->second->order);
     drawCache.erase(found);
 }

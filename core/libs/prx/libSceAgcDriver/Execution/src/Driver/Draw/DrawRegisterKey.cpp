@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -69,9 +70,58 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     const auto userWord = [&](std::uint32_t offset) {
         return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.first && offset < user.second; });
     };
+    // The context ranges hash on their own and are kept with a copy of the bank they came from: a
+    // draw of the same context (most draws of a pass differ in their shader user data words only)
+    // takes the hash after one comparison of the bank's words instead of walking some 400 registers.
+    // APS5_NO_CONTEXT_KEY_MEMO=1 walks them every time; APS5_VERIFY_CONTEXT_KEY_MEMO=N walks them
+    // for every Nth taken hash as well and compares.
+    struct ContextKeyMemo {
+        Registers context;
+        std::uint64_t hash = 0;
+        bool valid = false;
+        std::uint64_t taken = 0;
+    };
+    struct ContextKeyMemoTag {};
+    static const bool contextMemo = std::getenv("APS5_NO_CONTEXT_KEY_MEMO") == nullptr;
+    static const std::uint64_t verifyEvery = [] {
+        const char* text = std::getenv("APS5_VERIFY_CONTEXT_KEY_MEMO");
+        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
+    }();
+    const auto contextHash = [&] {
+        std::array<std::uint64_t, drawKeyWordCapacity()> words;
+        std::size_t count = 0;
+        for (const auto& range : Graphics::DrawKeyRegisters) {
+            if (range.bank != Graphics::RegisterBank::Context) continue;
+            words[count++] = range.first;
+            const auto end = range.first + range.count;
+            for (auto it = queue.context.lower_bound(range.first); it != queue.context.end() && it->first < end; ++it) words[count++] = (static_cast<std::uint64_t>(it->first) << 32u) | it->second;
+        }
+        return hashDrawKeyWords(std::span(words).first(count), 0);
+    };
+    auto& memo = HostThreadLocal<ContextKeyMemo, ContextKeyMemoTag>();
+    std::uint64_t context = 0;
+    if (contextMemo && memo.valid && memo.context.SameWords(queue.context)) {
+        context = memo.hash;
+        if (verifyEvery != 0 && ++memo.taken % verifyEvery == 0) {
+            static std::atomic<std::uint64_t> compared{0}, differences{0};
+            const bool differs = contextHash() != context;
+            const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (differs) differences.fetch_add(1, std::memory_order_relaxed);
+            if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[context-key] verify: %llu kept hashes walked again, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
+        }
+    } else {
+        context = contextHash();
+        if (contextMemo) {
+            memo.context = queue.context;
+            memo.hash = context;
+            memo.valid = true;
+        }
+    }
     shared[sharedWords++] = deviceSerial;
+    shared[sharedWords++] = context;
     for (const auto& range : Graphics::DrawKeyRegisters) {
-        const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+        if (range.bank == Graphics::RegisterBank::Context) continue;
+        const auto& bank = range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
         shared[sharedWords++] = (static_cast<std::uint64_t>(range.bank) << 32u) | range.first;
         const auto end = range.first + range.count;
         const bool shader = range.bank == Graphics::RegisterBank::Shader;

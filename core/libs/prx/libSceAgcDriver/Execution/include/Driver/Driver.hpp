@@ -340,6 +340,12 @@ private:
     std::unordered_map<std::uint64_t, std::deque<ValueSet>> priorValueSets;
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
+    // How many keys of drawCache fall in each slot (the key's top bits): a draw whose slot is empty
+    // skips the map, which most draws miss (entries are kept only for shapes that find them again).
+    // Under drawCacheMutex.
+    static constexpr std::size_t DrawKeySlots = 1u << 15u;
+    std::vector<std::uint16_t> drawKeyFilter = std::vector<std::uint16_t>(DrawKeySlots);
+    static std::size_t drawKeySlot(std::uint64_t key) { return static_cast<std::size_t>(key >> 49u); }
     std::list<std::uint64_t> drawOrder;
     HostMutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;

@@ -115,6 +115,9 @@ public:
         --entries;
         return 1;
     }
+    // Whether the two hold the same registers with the same values (and the same stale values of
+    // erased ones): two comparisons of contiguous words, where operator== walks register by register.
+    bool SameWords(const Registers& other) const { return entries == other.entries && present == other.present && values == other.values; }
     bool operator==(const Registers& other) const {
         auto a = begin();
         auto b = other.begin();

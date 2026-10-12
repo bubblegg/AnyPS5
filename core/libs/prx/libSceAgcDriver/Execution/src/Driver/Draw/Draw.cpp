@@ -326,7 +326,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
-        const auto found = drawCache.find(drawKey);
+        const auto found = drawKeyFilter[drawKeySlot(drawKey)] != 0 ? drawCache.find(drawKey) : drawCache.end();
         if (found != drawCache.end()) {
             entry = found->second;
             decode = entry->decode;
