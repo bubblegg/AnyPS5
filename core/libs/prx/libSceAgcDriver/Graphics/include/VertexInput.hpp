@@ -195,11 +195,13 @@ struct VertexCopyPlan {
     std::vector<std::uint32_t> alignments;
 };
 
-inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
-    VertexCopyPlan plan;
+// Fills `plan` in place (its vectors keep their storage); `order` is scratch.
+inline void PlanVertexCopies(std::span<const VertexFetch> fetches, VertexCopyPlan& plan, std::vector<std::size_t>& order) {
+    plan.copies.clear();
+    plan.alignments.clear();
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    std::vector<std::size_t> order(fetches.size());
+    order.resize(fetches.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];
@@ -224,6 +226,12 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
         plan.copyOf[i] = plan.copies.size() - 1;
         plan.offsets[i] = fetch.begin - copy.first;
     }
+}
+
+inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
+    VertexCopyPlan plan;
+    std::vector<std::size_t> order;
+    PlanVertexCopies(fetches, plan, order);
     return plan;
 }
 

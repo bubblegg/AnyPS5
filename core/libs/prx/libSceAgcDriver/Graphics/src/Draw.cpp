@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -917,11 +918,46 @@ namespace {
 // DrawWithRecipe.
 struct DrawTimer {
     bool profile;
+    // APS5_DRAW_PHASES=1: only the phase times, summed over the draws and printed every 10 s as a
+    // [draw-phases] line (us per draw), without the rest of APS5_PROFILE_DRAW's accounting.
+    bool phases = phasesOnly();
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
+    DrawTimer(const DrawTimer&) = delete;
+    DrawTimer& operator=(const DrawTimer&) = delete;
+    ~DrawTimer() {
+        if (!phases) return;
+        const auto now = std::chrono::steady_clock::now();
+        struct Totals {
+            std::array<double, PhaseCount> us{};
+            double afterUs = 0;
+            std::uint64_t draws = 0;
+            std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+        };
+        // Under GuestMemory::GpuMutex, as every draw.
+        static Totals totals;
+        for (std::size_t i = 0; i < PhaseCount; ++i) totals.us[i] += us[i];
+        totals.afterUs += std::chrono::duration<double, std::micro>(now - phaseStart).count();
+        ++totals.draws;
+        if (now - totals.since < std::chrono::seconds(10)) return;
+        char line[640];
+        int n = std::snprintf(line, sizeof(line), "[draw-phases] %llu draws, us per draw:", static_cast<unsigned long long>(totals.draws));
+        double sum = totals.afterUs;
+        for (std::size_t i = 0; i < PhaseCount; ++i) sum += totals.us[i];
+        for (std::size_t i = 0; i < PhaseCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+            if (totals.us[i] > 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f", DrawPhaseNames[i], totals.us[i] / static_cast<double>(totals.draws));
+        }
+        std::fprintf(stderr, "%s, after %.2f, total %.2f\n", line, totals.afterUs / static_cast<double>(totals.draws), sum / static_cast<double>(totals.draws));
+        totals = Totals{};
+        totals.since = now;
+    }
+    static bool phasesOnly() {
+        static const bool enabled = std::getenv("APS5_DRAW_PHASES") != nullptr;
+        return enabled;
+    }
     void phase(DrawPhase which) {
-        if (!profile) return;
+        if (!profile && !phases) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
@@ -1220,6 +1256,28 @@ void rememberResources(DrawShapeMemo& memo, const ResourceCache::Key& key, const
     memo.resources = resources;
 }
 
+bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
+    return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.componentMapping == b.componentMapping && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.packing == b.packing && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.cmaskAddress == b.cmaskAddress && a.cmaskBytes == b.cmaskBytes && a.cmaskFastClear == b.cmaskFastClear && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.clearWords == b.clearWords && a.slot == b.slot && a.depth == b.depth && a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.exportIndex == b.exportIndex && a.uintExport == b.uintExport && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples;
+}
+
+// The resident image the shape's last draw attached for `color` at `index`, while the storage
+// cache still holds it for its surface and its DCC keys; null otherwise (the lookup runs).
+std::shared_ptr<StorageTexture> memoTarget(const Context& context, const DrawShapeMemo* memo, std::size_t index, const ColorTarget& color) {
+    if (memo == nullptr || memo->refresh || index >= memo->targets.size() || !sameColorTarget(memo->targetColors[index], color)) return nullptr;
+    auto stored = memo->targets[index].lock();
+    if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, color.dccAddress)) return nullptr;
+    return stored;
+}
+
+void rememberTarget(DrawShapeMemo& memo, std::size_t count, std::size_t index, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident) {
+    if (memo.targets.size() != count) {
+        memo.targets.assign(count, {});
+        memo.targetColors.assign(count, ColorTarget{});
+    }
+    memo.targets[index] = resident;
+    memo.targetColors[index] = color;
+}
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, DrawShapeMemo* memo = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1357,12 +1415,32 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
+    // The plan's working vectors are the thread's, kept from draw to draw (a dozen allocations per
+    // draw otherwise). APS5_NO_VERTEX_SCRATCH=1 makes them per draw as before.
+    struct VertexScratch {
+        std::vector<VertexFetch> fetches, plannedFetches;
+        std::vector<std::size_t> fetchValid, fetchOf, plannedOf, soloFetches, order;
+        std::vector<std::shared_ptr<Buffer>> zeroed;
+        std::vector<bool> isSolo;
+        std::vector<VkBuffer> rangeHandles, soloHandles;
+        std::vector<VkDeviceSize> rangeOffsets;
+        VertexCopyPlan plan;
+    };
+    struct VertexScratchTag {};
+    static const bool vertexScratch = std::getenv("APS5_NO_VERTEX_SCRATCH") == nullptr;
+    std::optional<VertexScratch> ownScratch;
+    auto& scratch = vertexScratch ? HostThreadLocal<VertexScratch, VertexScratchTag>() : ownScratch.emplace();
+    auto& fetches = scratch.fetches;
+    auto& fetchValid = scratch.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
     fetches.reserve(attributes.size());
     fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    auto& fetchOf = scratch.fetchOf;
+    fetchOf.assign(attributes.size(), 0);
+    auto& zeroed = scratch.zeroed;
+    zeroed.clear();
+    zeroed.resize(attributes.size());
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
         if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
@@ -1380,22 +1458,29 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
-    const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
+    auto& soloFetches = scratch.soloFetches;
+    soloFetches.clear();
+    for (std::size_t f = 0; f < fetches.size(); ++f) {
+        if (fetchValid[f] < fetches[f].end - fetches[f].begin) soloFetches.push_back(f);
+    }
+    auto& isSolo = scratch.isSolo;
+    isSolo.assign(fetches.size(), false);
     for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
-    plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    auto& plannedFetches = scratch.plannedFetches;
+    plannedFetches.clear();
+    auto& plannedOf = scratch.plannedOf;
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
-    const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
-    rangeHandles.reserve(plan.copies.size());
-    rangeOffsets.reserve(plan.copies.size());
+    auto& plan = scratch.plan;
+    PlanVertexCopies(plannedFetches, plan, scratch.order);
+    auto& rangeHandles = scratch.rangeHandles;
+    auto& rangeOffsets = scratch.rangeOffsets;
+    rangeHandles.clear();
+    rangeOffsets.clear();
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1412,7 +1497,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    auto& soloHandles = scratch.soloHandles;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -2169,7 +2255,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            const auto lookup = [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -2182,7 +2268,20 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
+            };
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+                auto stored = memoTarget(context, memo, index, color);
+                if (stored == nullptr) return lookup();
+                if (memo->verify) {
+                    auto looked = lookup();
+                    shapeMemoVerified(looked != stored ? "resident target" : nullptr);
+                    if (looked != stored) return looked;
+                }
+                stored->Refresh();
+                DrawShapeMemoCounters().targets.fetch_add(1, std::memory_order_relaxed);
+                return stored;
             });
+            if (memo != nullptr && binding.resident != nullptr) rememberTarget(*memo, state.colors.size(), index, color, binding.resident);
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);

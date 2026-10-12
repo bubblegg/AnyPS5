@@ -55,10 +55,15 @@ struct DrawShapeMemo {
     // template while the cache still holds it, and proves it current as after a lookup.
     ResourceCache::Key resourceKey;
     std::weak_ptr<ShaderResources> resources;
+    // The resident image of each color attachment of the shape's last draw and the target it was
+    // looked up for: a draw with the same target takes the image while the storage cache still holds
+    // it for its surface, and refreshes it as the lookup would (as DrawWithRecipe does).
+    std::vector<std::weak_ptr<StorageTexture>> targets;
+    std::vector<ColorTarget> targetColors;
 };
 
 struct DrawShapeMemoCounts {
-    std::atomic<std::uint64_t> draws{0}, outputs{0}, layouts{0}, pipelines{0}, resources{0};
+    std::atomic<std::uint64_t> draws{0}, outputs{0}, layouts{0}, pipelines{0}, resources{0}, targets{0};
 };
 DrawShapeMemoCounts& DrawShapeMemoCounters();
 

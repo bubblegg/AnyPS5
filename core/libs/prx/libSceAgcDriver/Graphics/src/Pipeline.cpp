@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <string_view>
@@ -602,7 +603,49 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
+namespace {
+
+// The graphics state last recorded into the open pass, for its next draw: a continued draw recorded
+// the pipeline bind, the viewport, the scissor and (with pipeline libraries) seventeen dynamic
+// states again, about twenty calls into the Vulkan driver, though the draws of one pass mostly
+// repeat them. Every graphics pipeline bind goes through Pipeline, and a pass is begun by Begin,
+// which forgets it all. Recorded under GuestMemory::GpuMutex. APS5_NO_STATE_FILTER=1 records all of
+// it for every draw as before.
+struct RecordedState {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool viewport = false;
+    VkViewport viewportValue{};
+    VkRect2D scissor{};
+    // Valid only while every pipeline bound since it was recorded had these states dynamic.
+    bool library = false;
+    VkCullModeFlags cullMode = 0;
+    VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    std::array<float, 5> depthValues{};
+    std::array<VkBool32, 5> enables{};
+    VkCompareOp depthCompare = VK_COMPARE_OP_ALWAYS;
+    std::array<VkStencilOpState, 2> stencil{};
+};
+
+RecordedState& recordedState() {
+    static RecordedState recorded;
+    return recorded;
+}
+
+bool stateFilter() {
+    static const bool filter = std::getenv("APS5_NO_STATE_FILTER") == nullptr;
+    return filter;
+}
+
+template <typename T>
+bool sameBits(const T& a, const T& b) {
+    return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
+
+}
+
 void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+    recordedState() = RecordedState{};
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -651,47 +694,76 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
 }
 
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
+    auto& recorded = recordedState();
+    if (!stateFilter() || recorded.commands != commands) {
+        recorded = RecordedState{};
+        recorded.commands = commands;
+    }
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
-    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    const auto bound = best != VK_NULL_HANDLE ? best : pipeline;
+    if (!stateFilter() || recorded.pipeline != bound) context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bound);
+    recorded.pipeline = bound;
+    if (!stateFilter() || !recorded.viewport || !sameBits(recorded.viewportValue, state.viewport)) context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
+    if (!stateFilter() || !recorded.viewport || !sameBits(recorded.scissor, state.scissor)) context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    recorded.viewport = true;
+    recorded.viewportValue = state.viewport;
+    recorded.scissor = state.scissor;
     if (libraries) {
         setLibraryState(commands, state);
         return;
     }
+    // A pipeline without the library states binds them statically: they must be set again.
+    recorded.library = false;
     if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
     context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
 }
 
 void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state) const {
+    auto& recorded = recordedState();
+    const bool all = !stateFilter() || !recorded.library;
     const bool depth = state.depth.has_value();
-    context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, state.cullMode);
-    context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, state.frontFace);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, depthBias ? state.depthBiasConstant : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, depth && state.depthTest);
-    context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, depth && state.depthWrite);
-    context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, depthBounds);
-    context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, depth && state.stencilTest);
-    const auto stencil = [&](VkStencilFaceFlags face, const VkStencilOpState& op) {
-        context.Resolved(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
-        context.Resolved(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, face, op.compareMask);
-        context.Resolved(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, face, op.writeMask);
-        context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, face, op.reference);
+    const std::array<float, 5> depthValues{depthBias ? state.depthBiasConstant : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f};
+    const std::array<VkBool32, 5> enables{depth && state.depthTest, depth && state.depthWrite, static_cast<VkBool32>(depthBounds), depth && state.stencilTest, 0};
+    const auto depthCompare = depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS;
+    const std::array<VkStencilOpState, 2> stencil{depth ? state.stencilFront : VkStencilOpState{}, depth ? state.stencilBack : VkStencilOpState{}};
+    if (all || recorded.cullMode != state.cullMode) context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, state.cullMode);
+    if (all || recorded.frontFace != state.frontFace) context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, state.frontFace);
+    if (all || !sameBits(recorded.depthValues[0], depthValues[0]) || !sameBits(recorded.depthValues[1], depthValues[1]) || !sameBits(recorded.depthValues[2], depthValues[2])) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, depthValues[0], depthValues[1], depthValues[2]);
+    if (all || !sameBits(recorded.depthValues[3], depthValues[3]) || !sameBits(recorded.depthValues[4], depthValues[4])) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, depthValues[3], depthValues[4]);
+    if (all || recorded.enables[0] != enables[0]) context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, enables[0]);
+    if (all || recorded.enables[1] != enables[1]) context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, enables[1]);
+    if (all || recorded.depthCompare != depthCompare) context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, depthCompare);
+    if (all || recorded.enables[2] != enables[2]) context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, enables[2]);
+    if (all || recorded.enables[3] != enables[3]) context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, enables[3]);
+    const auto setStencil = [&](std::size_t index, VkStencilFaceFlags face) {
+        const auto& op = stencil[index];
+        const auto& was = recorded.stencil[index];
+        if (all || op.failOp != was.failOp || op.passOp != was.passOp || op.depthFailOp != was.depthFailOp || op.compareOp != was.compareOp) context.Resolved(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
+        if (all || op.compareMask != was.compareMask) context.Resolved(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, face, op.compareMask);
+        if (all || op.writeMask != was.writeMask) context.Resolved(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, face, op.writeMask);
+        if (all || op.reference != was.reference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, face, op.reference);
     };
-    stencil(VK_STENCIL_FACE_FRONT_BIT, depth ? state.stencilFront : VkStencilOpState{});
-    stencil(VK_STENCIL_FACE_BACK_BIT, depth ? state.stencilBack : VkStencilOpState{});
+    setStencil(0, VK_STENCIL_FACE_FRONT_BIT);
+    setStencil(1, VK_STENCIL_FACE_BACK_BIT);
+    recorded.library = true;
+    recorded.cullMode = state.cullMode;
+    recorded.frontFace = state.frontFace;
+    recorded.depthValues = depthValues;
+    recorded.enables = enables;
+    recorded.depthCompare = depthCompare;
+    recorded.stencil = stencil;
 }
 
 void Pipeline::ContinueSecondChannel(VkCommandBuffer commands) const {
     Require(secondChannel != VK_NULL_HANDLE, "the pipeline blends every channel in one pass");
+    recordedState() = RecordedState{};
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, secondChannel);
 }
 
 void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) const {
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
+    recordedState() = RecordedState{};
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, backFaces);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
