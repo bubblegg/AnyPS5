@@ -1,6 +1,6 @@
 # Phasmophobia port
 
-This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyPS5) `main` as of 12 October 2026 plus the changes that run Phasmophobia (PPSA09030) on Windows. It is a working branch, not a release: it is not in a form upstream can merge, and its fixes go upstream one pull request at a time. The upstream thread for the title is [Game bring-up discussion #4680](https://github.com/boykopovar/AnyPS5/discussions/4680).
+This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyPS5) `main` as of 12 October 2026 plus the changes that run Phasmophobia (PPSA09030) on Windows. It is a working branch, not a release: The upstream thread for the title is [Game bring-up discussion #4680](https://github.com/boykopovar/AnyPS5/discussions/4680).
 
 ## What works
 
