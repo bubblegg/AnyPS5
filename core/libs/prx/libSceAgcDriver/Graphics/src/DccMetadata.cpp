@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -838,6 +839,41 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
     return mixed || (value >= 0 && EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value))) == DccKeys::Uncompressed);
 }
 
+// Measuring aid: the GPU waits WaitForKeyWriters makes, and the pending writes over the keys that
+// caused them (by size and how they lie over the keys), printed every 10 s as [key-writer-sync].
+void noteKeyWriterSync(const Recorder& recorder, std::uint64_t keys, std::size_t count) {
+    struct Totals {
+        std::uint64_t syncs = 0, writes = 0, exact = 0, covering = 0, inside = 0, partial = 0, filled = 0;
+        std::array<std::uint64_t, 6> sizes{};
+        std::uint64_t printed = 0;
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    };
+    static Totals totals;
+    ++totals.syncs;
+    const auto end = keys + count;
+    for (const auto& write : recorder.PendingWritesOver(keys, count)) {
+        const auto size = write.end - write.begin;
+        ++totals.writes;
+        if (write.begin == keys && write.end == end) ++totals.exact;
+        else if (write.begin <= keys && end <= write.end) ++totals.covering;
+        else if (keys <= write.begin && write.end <= end) ++totals.inside;
+        else ++totals.partial;
+        if (write.value >= 0) ++totals.filled;
+        ++totals.sizes[size <= 4096 ? 0 : size <= 65536 ? 1 : size <= 1048576 ? 2 : size <= 16777216 ? 3 : size <= 268435456 ? 4 : 5];
+        if (totals.printed < 12) {
+            ++totals.printed;
+            std::fprintf(stderr, "[key-writer-sync] wait for keys 0x%llx+0x%zx: pending write 0x%llx+0x%llx (value %d, note %llu)\n", static_cast<unsigned long long>(keys), count, static_cast<unsigned long long>(write.begin), static_cast<unsigned long long>(size), write.value, static_cast<unsigned long long>(write.note));
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - totals.since < std::chrono::seconds(10)) return;
+    std::fprintf(stderr, "[key-writer-sync] %.1f s: %llu GPU waits for DCC keys; pending writes over the keys %llu: exactly the keys %llu, covering them %llu, inside them %llu, partly %llu, fills %llu; by size <=4K %llu, <=64K %llu, <=1M %llu, <=16M %llu, <=256M %llu, larger %llu\n", std::chrono::duration<double>(now - totals.since).count(), static_cast<unsigned long long>(totals.syncs), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.exact), static_cast<unsigned long long>(totals.covering), static_cast<unsigned long long>(totals.inside), static_cast<unsigned long long>(totals.partial), static_cast<unsigned long long>(totals.filled), static_cast<unsigned long long>(totals.sizes[0]), static_cast<unsigned long long>(totals.sizes[1]), static_cast<unsigned long long>(totals.sizes[2]), static_cast<unsigned long long>(totals.sizes[3]), static_cast<unsigned long long>(totals.sizes[4]), static_cast<unsigned long long>(totals.sizes[5]));
+    const auto printed = totals.printed;
+    totals = {};
+    totals.printed = printed;
+    totals.since = now;
+}
+
 }
 
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -847,6 +883,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    noteKeyWriterSync(*recorder, metaAddress, count);
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;
