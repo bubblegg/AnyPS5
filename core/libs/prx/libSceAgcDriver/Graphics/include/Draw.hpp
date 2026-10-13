@@ -64,6 +64,15 @@ struct DrawShapeMemo {
         std::uint32_t stage = 0;
     };
     std::vector<KeyStamp> keyStamps;
+    // Earlier keys of the shape with their templates and stamps, most recent first (draws of a shape
+    // alternate between materials): a draw whose key is one of them swaps it with the one above
+    // instead of building and hashing its key. APS5_NO_SPARE_RESOURCE_KEYS=1 keeps one key only.
+    struct SpareResources {
+        ResourceCache::Key key;
+        std::weak_ptr<ShaderResources> resources;
+        std::vector<KeyStamp> stamps;
+    };
+    std::array<SpareResources, 3> spareResources;
     // The resident image of each color attachment of the shape's last draw and the target it was
     // looked up for: a draw with the same target takes the image while the storage cache still holds
     // it for its surface, and refreshes it as the lookup would (as DrawWithRecipe does).

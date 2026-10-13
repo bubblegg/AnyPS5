@@ -1229,28 +1229,56 @@ void rememberPipeline(const Context&, const ShaderResources& resources, VkImageL
 // ranges) is the remembered one and the cache still holds the object: what Find would return for
 // the key, without building or hashing it. Every 64th draw of the shape finds it the long way,
 // which keeps the cache's order of use current.
-std::shared_ptr<ShaderResources> memoResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, DrawShapeMemo& memo) {
-    const std::span<const std::uint32_t> key(memo.resourceKey);
-    if (memo.refresh || key.size() < 5) return nullptr;
+bool spareResourceKeys() {
+    static const bool spare = std::getenv("APS5_NO_SPARE_RESOURCE_KEYS") == nullptr;
+    return spare;
+}
+
+// Whether `key` is the draw's resource cache key (DrawResourceKey without the ranges), compared
+// stage by stage; `stamps` are the key's (see DrawShapeMemo::keyStamps).
+bool rememberedKeyMatches(const Context& context, std::span<const CompiledShader> shaders, std::uint32_t colorAttachments, std::span<const std::uint32_t> key, std::vector<DrawShapeMemo::KeyStamp>& stamps) {
+    if (key.size() < 5) return false;
     const auto device = reinterpret_cast<std::uint64_t>(context.device);
-    if (key[0] != 0xffffffffu || key[1] != static_cast<std::uint32_t>(device) || key[2] != static_cast<std::uint32_t>(device >> 32u) || key[3] != shaders.size()) return nullptr;
+    if (key[0] != 0xffffffffu || key[1] != static_cast<std::uint32_t>(device) || key[2] != static_cast<std::uint32_t>(device >> 32u) || key[3] != shaders.size()) return false;
     // APS5_NO_KEY_STAMPS=1 compares every stage's whole part of the key, as before.
     static const bool keyStamps = std::getenv("APS5_NO_KEY_STAMPS") == nullptr;
-    if (memo.keyStamps.size() != shaders.size()) memo.keyStamps.assign(shaders.size(), {});
+    if (stamps.size() != shaders.size()) stamps.assign(shaders.size(), {});
     std::size_t at = 4;
     for (std::size_t index = 0; index < shaders.size(); ++index) {
         const auto& shader = shaders[index];
-        if (at >= key.size() || shader.program == nullptr) return nullptr;
+        if (at >= key.size() || shader.program == nullptr) return false;
         const std::size_t words = key[at++];
-        if (words > key.size() - at) return nullptr;
-        const DrawShapeMemo::KeyStamp stamp{shader.program->bindingPlan.Plan(), shader.program->PipelineVariantId(), static_cast<std::uint32_t>(shader.stage)};
-        auto& known = memo.keyStamps[index];
+        if (words > key.size() - at) return false;
+        const auto variant = shader.program->PipelineVariantId();
+        // A stage's part starts with the data flag, the stage and the variant (VisitContentKey):
+        // another variant fails here, before the walk over its bindings.
+        if (words < 4 || key[at + 1] != static_cast<std::uint32_t>(shader.stage) || key[at + 2] != static_cast<std::uint32_t>(variant) || key[at + 3] != static_cast<std::uint32_t>(variant >> 32u)) return false;
+        const DrawShapeMemo::KeyStamp stamp{shader.program->bindingPlan.Plan(), variant, static_cast<std::uint32_t>(shader.stage)};
+        auto& known = stamps[index];
         const bool fixedKnown = keyStamps && stamp.plan != nullptr && known.plan == stamp.plan && known.variant == stamp.variant && known.stage == stamp.stage;
-        if (!ShaderResources::ContentKeyIs(shader, true, MovableBuffers(), key.subspan(at, words), fixedKnown)) return nullptr;
+        if (!ShaderResources::ContentKeyIs(shader, true, MovableBuffers(), key.subspan(at, words), fixedKnown)) return false;
         known = stamp;
         at += words;
     }
-    if (at + 1 != key.size() || key[at] != colorAttachments) return nullptr;
+    return at + 1 == key.size() && key[at] == colorAttachments;
+}
+
+std::shared_ptr<ShaderResources> memoResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, DrawShapeMemo& memo) {
+    if (memo.refresh) return nullptr;
+    if (!rememberedKeyMatches(context, shaders, colorAttachments, memo.resourceKey, memo.keyStamps)) {
+        if (!spareResourceKeys()) return nullptr;
+        auto& spares = memo.spareResources;
+        std::size_t hit = spares.size();
+        for (std::size_t index = 0; index < spares.size() && hit == spares.size(); ++index) {
+            if (!spares[index].key.empty() && rememberedKeyMatches(context, shaders, colorAttachments, spares[index].key, spares[index].stamps)) hit = index;
+        }
+        if (hit == spares.size()) return nullptr;
+        // The matching key becomes the remembered one and the remembered one the most recent spare.
+        std::swap(memo.resourceKey, spares[hit].key);
+        std::swap(memo.resources, spares[hit].resources);
+        std::swap(memo.keyStamps, spares[hit].stamps);
+        std::rotate(spares.begin(), spares.begin() + static_cast<std::ptrdiff_t>(hit), spares.begin() + static_cast<std::ptrdiff_t>(hit) + 1);
+    }
     auto resources = memo.resources.lock();
     if (resources == nullptr || !resources->InResourceCache()) return nullptr;
     if (memo.verify) {
@@ -1264,7 +1292,17 @@ std::shared_ptr<ShaderResources> memoResources(const Context& context, std::span
 }
 
 void rememberResources(DrawShapeMemo& memo, std::span<const CompiledShader> shaders, const ResourceCache::Key& key, const std::shared_ptr<ShaderResources>& resources) {
-    if (&memo.resourceKey != &key) memo.resourceKey = key;
+    if (&memo.resourceKey != &key && memo.resourceKey != key) {
+        // The remembered key moves to the spares (the oldest spare's storage takes the new key).
+        if (spareResourceKeys() && !memo.resourceKey.empty()) {
+            auto& spares = memo.spareResources;
+            std::rotate(spares.rbegin(), spares.rbegin() + 1, spares.rend());
+            std::swap(spares.front().key, memo.resourceKey);
+            std::swap(spares.front().resources, memo.resources);
+            std::swap(spares.front().stamps, memo.keyStamps);
+        }
+        memo.resourceKey = key;
+    }
     memo.resources = resources;
     memo.keyStamps.resize(shaders.size());
     for (std::size_t index = 0; index < shaders.size(); ++index) {
