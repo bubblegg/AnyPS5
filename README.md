@@ -1,12 +1,12 @@
 # Phasmophobia port
 
-This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyPS5) `main` as of 12 October 2026 plus the changes that run Phasmophobia (PPSA09030) on Windows. It is a working branch, not a release: The upstream thread for the title is [Game bring-up discussion #4680](https://github.com/boykopovar/AnyPS5/discussions/4680).
+This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyPS5) `main` as of 13 October 2026 plus the changes that run Phasmophobia (PPSA09030) on Windows. It is a working branch, not a release: The upstream thread for the title is [Game bring-up discussion #4680](https://github.com/boykopovar/AnyPS5/discussions/4680).
 
 ## What works
 
 - The title starts, reaches the lobby, loads saves and plays a contract.
 - Voice recognition works with the default Windows microphone.
-- Measured on Windows 11 with pipelined draws on: about 25 presents a second in the lobby (about 1,700 draws a frame) and about 10 in the truck (about 6,400 draws a frame).
+- Measured on Windows 11 with an RTX 5070 Ti and pipelined draws on: about 26 to 30 presents a second in the lobby (1,500 to 1,900 draws a frame) and about 11 in the truck (about 6,300 draws a frame).
 
 ## Known problems
 
@@ -17,9 +17,9 @@ This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyP
 
 ## What is in here
 
-- Fixes the title needs to run: kernel waits and module loading, network, SSL and entitlement functions, depth and DCC handling.
+- Fixes the title needs to run: kernel waits and module loading, network, SSL and entitlement functions, save data sizes, depth and DCC handling.
 - A port of the pipelined draws draft ([#1201](https://github.com/boykopovar/AnyPS5/pull/1201)): one thread prepares draws while another records them. Off unless `APS5_PIPELINED_DRAWS=1` is set.
-- Draw path speed work on top of it: an allocator cache for the driver, a compiled resource walk, per-shape reuse of what a draw prepares and records, pooled per-draw storage. Each has an environment switch that turns it off, and most have one that checks it against the original path.
+- Draw path speed work on top of it: an allocator cache for the driver, a compiled resource walk, per-shape reuse of what a draw prepares and records, pooled per-draw storage, a cached draw key and only the changed Vulkan state recorded per draw. Each has an environment switch that turns it off, and most have one that checks it against the original path.
 
 ## Building and running
 
