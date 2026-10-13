@@ -1,9 +1,83 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <condition_variable>
 #include <cstdlib>
+#include <iterator>
+#include <mutex>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Evicted draw entries and dropped variants are destroyed on a thread of their own, a batch at a
+// time: their results free large blocks through the system heap, which cost the preparing thread
+// ~8% of its time in busy scenes (under the cache lock). APS5_NO_DRAW_REAPER=1 destroys them on the
+// inserting thread right after the lock, as before but outside it.
+struct DrawReaper {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<std::shared_ptr<const void>> pending;
+};
+
+constexpr std::size_t ReapBatch = 64;
+
+bool drawReaper() {
+    static const bool reaper = std::getenv("APS5_NO_DRAW_REAPER") == nullptr;
+    return reaper;
+}
+
+// Never destroyed: the thread runs until the process ends.
+DrawReaper& reaper() {
+    static auto* instance = [] {
+        auto* created = new DrawReaper();
+        std::thread([created] {
+            std::vector<std::shared_ptr<const void>> batch;
+            for (;;) {
+                {
+                    std::unique_lock lock(created->mutex);
+                    created->wake.wait(lock, [&] { return !created->pending.empty(); });
+                    batch.swap(created->pending);
+                }
+                batch.clear();
+            }
+        }).detach();
+        return created;
+    }();
+    return *instance;
+}
+
+struct ReapTag {};
+
+std::vector<std::shared_ptr<const void>>& reapBatch() {
+    return HostThreadLocal<std::vector<std::shared_ptr<const void>>, ReapTag>();
+}
+
+// Declared before the cache lock, so it runs after the lock is released.
+struct ReapAfter {
+    ~ReapAfter() {
+        auto& batch = reapBatch();
+        if (!drawReaper()) {
+            batch.clear();
+            return;
+        }
+        if (batch.size() < ReapBatch) return;
+        auto& target = reaper();
+        {
+            std::lock_guard lock(target.mutex);
+            if (target.pending.empty()) target.pending.swap(batch);
+            else {
+                std::move(batch.begin(), batch.end(), std::back_inserter(target.pending));
+                batch.clear();
+            }
+        }
+        target.wake.notify_one();
+    }
+};
+
+}
 
 bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const {
     if (stages.size() != variants.size()) return false;
@@ -57,6 +131,8 @@ void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
 }
 
 void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode) {
+    const ReapAfter reapAfter;
+    auto& garbage = reapBatch();
     std::lock_guard cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
     ++counters.inserts;
@@ -83,6 +159,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         ++counters.variantsInserted;
         while (variants.size() > dispatchVariants()) {
             accountDrawVariant(*variants.back(), false);
+            garbage.push_back(std::move(variants.back()));
             variants.pop_back();
             ++counters.variantsEvicted;
         }
@@ -96,6 +173,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     } else {
         replacement->order = found->second->order;
         drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
+        garbage.push_back(std::move(found->second));
         found->second = std::move(replacement);
     }
     while (drawCache.size() > drawCacheEntries()) {
@@ -105,6 +183,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         }
         drawOrder.erase(last->second->order);
         --drawKeyFilter[drawKeySlot(last->first)];
+        garbage.push_back(std::move(last->second));
         drawCache.erase(last);
         ++drawCacheEvictions;
     }
