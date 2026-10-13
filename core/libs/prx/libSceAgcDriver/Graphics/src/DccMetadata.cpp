@@ -19,6 +19,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -890,6 +891,28 @@ void noteKeyWriterSync(const Recorder& recorder, std::uint64_t keys, std::size_t
     totals.since = now;
 }
 
+// What a recognised kernel of the title is expected to leave in the DCC keys it is given: one byte
+// throughout (NoteKeyKernelDispatch). Measured against the keys after each wait before anything
+// relies on it.
+struct KeyPrediction {
+    std::uint64_t bytes = 0;
+    int value = -1;
+    char kernel = '?';
+    std::uint32_t input = 0;
+};
+
+struct KeyPredictions {
+    std::mutex mutex;
+    std::map<std::uint64_t, KeyPrediction> byAddress;
+    // (kernel, input, the keys' value or -1 for mixed) -> waits, and how many were predicted right.
+    std::map<std::tuple<char, std::uint32_t, int>, std::pair<std::uint64_t, std::uint64_t>> outcomes;
+};
+
+KeyPredictions& keyPredictions() {
+    static KeyPredictions predictions;
+    return predictions;
+}
+
 // Measuring aid: what the keys hold once the wait is over (one value throughout, by value, or
 // mixed), printed every 10 s: whether the work that wrote them is a plain fill.
 void noteKeysAfterSync(std::uint64_t keys, std::size_t count) {
@@ -900,11 +923,34 @@ void noteKeysAfterSync(std::uint64_t keys, std::size_t count) {
         ++unreadable;
     } else {
         const auto* bytes = reinterpret_cast<const std::uint8_t*>(keys);
-        if (AllKeysEqual(bytes + 1, count - 1, bytes[0])) ++uniform[bytes[0]];
+        const bool one = AllKeysEqual(bytes + 1, count - 1, bytes[0]);
+        if (one) ++uniform[bytes[0]];
         else ++mixed;
+        auto& predictions = keyPredictions();
+        std::lock_guard lock(predictions.mutex);
+        const auto found = predictions.byAddress.find(keys);
+        const auto actual = one ? static_cast<int>(bytes[0]) : -1;
+        const bool known = found != predictions.byAddress.end() && found->second.bytes >= count;
+        if (predictions.outcomes.size() < 64 || predictions.outcomes.contains({known ? found->second.kernel : '-', known ? found->second.input : 0u, actual})) {
+            auto& outcome = predictions.outcomes[{known ? found->second.kernel : '-', known ? found->second.input : 0u, actual}];
+            ++outcome.first;
+            if (known && found->second.value == actual && actual >= 0) ++outcome.second;
+        }
     }
     const auto now = std::chrono::steady_clock::now();
     if (now - since < std::chrono::seconds(10)) return;
+    {
+        auto& predictions = keyPredictions();
+        std::lock_guard lock(predictions.mutex);
+        std::string table;
+        for (const auto& [key, outcome] : predictions.outcomes) {
+            char text[112];
+            std::snprintf(text, sizeof(text), " kernel %c input 0x%08x -> keys %s0x%02x: %llu waits, %llu predicted;", std::get<0>(key), std::get<1>(key), std::get<2>(key) < 0 ? "mixed " : "", std::get<2>(key) < 0 ? 0u : static_cast<unsigned>(std::get<2>(key)), static_cast<unsigned long long>(outcome.first), static_cast<unsigned long long>(outcome.second));
+            table += text;
+        }
+        std::fprintf(stderr, "[key-writer-sync] predictions:%s\n", table.empty() ? " none" : table.c_str());
+        predictions.outcomes.clear();
+    }
     std::string values;
     for (std::size_t value = 0; value < uniform.size(); ++value) {
         if (uniform[value] == 0) continue;
@@ -918,6 +964,38 @@ void noteKeysAfterSync(std::uint64_t keys, std::size_t count) {
     since = now;
 }
 
+}
+
+void NoteKeyKernelDispatch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+    static constexpr std::array<std::uint32_t, 292> kernelA{0xbfa00003u, 0xd746000au, 0x0405060au, 0xd7460004u, 0x04010609u, 0xbe8c0301u, 0xbe8d0302u, 0xbe8e0303u, 0x34121483u, 0xd5480000u, 0x025d0d0au, 0xd7460007u, 0x02210d04u, 0x34101484u, 0xd548000du, 0x025d0704u, 0x2c161281u, 0x2c041282u, 0xd569000cu, 0x00020000u, 0x34061485u, 0x340c1486u, 0x361e1688u, 0x361c04a0u, 0x3400088au, 0x34021488u, 0x2c0a0e89u, 0xd771000fu, 0x043e0482u, 0xd771000eu, 0x043a148au, 0x2c140e83u, 0xd7470002u, 0x0232190du, 0xd7470005u, 0x02321905u, 0xbe8f0304u, 0xd771000du, 0x043a16ffu, 0x00000080u, 0xd771000eu, 0x043e12a0u, 0x2c160e84u, 0xd7710009u, 0x03fe1491u, 0x00000300u, 0xd771000cu, 0x03fe1491u, 0x00000900u, 0xd7710010u, 0x03fe1491u, 0x00000100u, 0x2c0e0e82u, 0xd7710001u, 0x043602ffu, 0x00000f00u, 0xd771000du, 0x043a10ffu, 0x00000080u, 0xd7710008u, 0x03fe1491u, 0x00000b00u, 0x34140886u, 0xd7710009u, 0x04261684u, 0xd771000eu, 0x04321684u, 0xd771000cu, 0x043606ffu, 0x00000200u, 0xd771000fu, 0x04221684u, 0x2c1a1483u, 0xd771000bu, 0x04421684u, 0xd7710010u, 0x04260ec0u, 0xd771000eu, 0x043a0ec0u, 0xd771000fu, 0x043e0ec0u, 0xd7710008u, 0x04320cffu, 0x00000800u, 0x34060887u, 0xd771000cu, 0x03fe1a90u, 0x00000a00u, 0x34080888u, 0xd7710011u, 0x043e00ffu, 0x00000400u, 0xd7710006u, 0x042e0ec0u, 0x2c0e1484u, 0xd771000bu, 0x03fe1a90u, 0x00000800u, 0xbe800305u, 0xbe810306u, 0xd7710009u, 0x041a00ffu, 0x00000400u, 0x361e0e84u, 0xd7710006u, 0x043a00ffu, 0x00000400u, 0xd771000eu, 0x044200ffu, 0x00000400u, 0xd7710010u, 0x03fe1a90u, 0x00000200u, 0xd7450009u, 0x04161301u, 0xd7710012u, 0x043e1a90u, 0x2c1a1482u, 0xd7450007u, 0x04161d01u, 0x361c14c0u, 0xd771000au, 0x042214c0u, 0xd7450006u, 0x04160d01u, 0xd7710012u, 0x044a1ac0u, 0xd7450005u, 0x04162301u, 0x36221ac0u, 0xd771000au, 0x042a06ffu, 0x00000100u, 0xd772000du, 0x043a1090u, 0xbe820307u, 0xbe830308u, 0xd7720013u, 0x04461f10u, 0xd772000bu, 0x04461f0bu, 0xd772000cu, 0x04461f0cu, 0xd772000fu, 0x043a1084u, 0xd771000au, 0x042a08ffu, 0x00000400u, 0xd7710011u, 0x044a00ffu, 0x00000400u, 0xd7710010u, 0x042e00ffu, 0x00000400u, 0xd771000cu, 0x043200ffu, 0x00000400u, 0xd7710000u, 0x044e00ffu, 0x00000400u, 0xd7720012u, 0x043a1094u, 0xd771000eu, 0x043e06ffu, 0x00000100u, 0xd745000bu, 0x040a2301u, 0xd7450008u, 0x040a2101u, 0xd7450000u, 0x040a0101u, 0xd745000cu, 0x040a1901u, 0xd7710001u, 0x043606ffu, 0x00000100u, 0xd771000du, 0x044a06ffu, 0x00000100u, 0xe0002000u, 0x80030309u, 0xe0002000u, 0x80030000u, 0xe0002000u, 0x80030505u, 0xd7710001u, 0x040608ffu, 0x00000400u, 0xd7710009u, 0x043608ffu, 0x00000400u, 0xd7710004u, 0x043a08ffu, 0x00000400u, 0x4a1a0302u, 0x4a1c1302u, 0x4a120902u, 0xe0002000u, 0x80030107u, 0xe0002000u, 0x8003040cu, 0x4a0e1502u, 0x2c141a81u, 0x2c121281u, 0x2c180e81u, 0xe0002000u, 0x8003020bu, 0xe0002000u, 0x80030706u, 0xe0002000u, 0x80030608u, 0x2c161c81u, 0xbf8c3f72u, 0xe0142000u, 0x8000020cu, 0xe0142000u, 0x80000009u, 0xbf8c3f70u, 0xe0142000u, 0x8000060au, 0xe0142000u, 0x8000040bu, 0xbf810000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x30306c73u, 0x00000085u, 0x000000a0u, 0x00000000u, 0x00102557u, 0x0401a600u, 0x0b100a10u, 0x40100c10u, 0x4b204240u, 0x4d104c10u, 0x6f104e10u, 0x7a107960u, 0x00108510u, 0x00006e00u, 0x21200f64u, 0x25402410u, 0x65000010u, 0x40241021u, 0x21640000u, 0x00402410u, 0x10296100u, 0x28600000u, 0x00102950u, 0x1da08100u, 0x80200100u, 0x2117acfdu, 0x00560100u, 0x4a006a51u, 0x6f436a14u, 0x6c106c04u, 0x0a382472u, 0x10087600u, 0x35247a76u, 0x0183157fu, 0x01080802u, 0xa80b017fu, 0x00049846u, 0x80800d5du, 0xee2040e0u, 0x0bc198fbu, 0x65726162u, 0x746f6f66u, 0x9fe61901u, 0x00000000u, 0x00000001u, 0x000003b4u, 0x00000000u, 0x000000a0u, 0xb3e3c624u, 0xb8263deeu, 0x00000000u, 0x00000000u};
+    static constexpr std::array<std::uint32_t, 12> kernelB{0xd7460004u, 0x04010c08u, 0xf4280302u, 0xfa000000u, 0xbf8cc07fu, 0x7e00020cu, 0x7e02020du, 0x7e04020eu, 0x7e06020fu, 0xe01c2000u, 0x80000004u, 0xbf810000u};
+    static_cast<void>(groups);
+    KeyPrediction prediction;
+    std::uint64_t address = 0;
+    if (userData.size() >= 9 && numThreads == std::array<std::uint32_t, 3>{8u, 8u, 1u} && code.size() >= kernelA.size() && std::equal(kernelA.begin(), kernelA.end(), code.begin())) {
+        // The value in user word 0, the keys as a byte buffer in words 1-4.
+        const auto stride = (userData[2] >> 16u) & 0x3fffu;
+        address = userData[1] | (static_cast<std::uint64_t>(userData[2] & 0xffffu) << 32u);
+        prediction = {static_cast<std::uint64_t>(stride == 0 ? 1u : stride) * userData[3], static_cast<int>((userData[0] << 4u) & 0xffu), 'A', userData[0]};
+    } else if (userData.size() >= 8 && numThreads == std::array<std::uint32_t, 3>{64u, 1u, 1u} && code.size() >= kernelB.size() && std::equal(kernelB.begin(), kernelB.end(), code.begin())) {
+        // A fill of 16-byte elements (words 0-3) from a one-element source (words 4-7).
+        const auto stride = (userData[1] >> 16u) & 0x3fffu;
+        const auto sourceStride = (userData[5] >> 16u) & 0x3fffu;
+        address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+        const auto source = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+        if (stride != 16 || sourceStride != 16 || userData[6] != 1 || !GuestMemory::Accessible(reinterpret_cast<const void*>(source), 16)) return;
+        std::array<std::uint8_t, 16> element{};
+        std::memcpy(element.data(), reinterpret_cast<const void*>(source), element.size());
+        std::uint32_t first = 0;
+        std::memcpy(&first, element.data(), sizeof(first));
+        const bool uniform = AllKeysEqual(element.data() + 1, element.size() - 1, element[0]);
+        prediction = {static_cast<std::uint64_t>(stride) * userData[2], uniform ? static_cast<int>(element[0]) : -1, 'B', first};
+    } else {
+        return;
+    }
+    auto& predictions = keyPredictions();
+    std::lock_guard lock(predictions.mutex);
+    if (predictions.byAddress.size() < 256 || predictions.byAddress.contains(address)) predictions.byAddress[address] = prediction;
 }
 
 void ReportKeyWriterDispatch(std::uint64_t codeAddress, std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {

@@ -106,6 +106,11 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
 // Measuring aid: reports the first few compute dispatches whose user data names DCC keys that
 // WaitForKeyWriters had to wait for (the title's kernel that writes them), with their code words.
 void ReportKeyWriterDispatch(std::uint64_t codeAddress, std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups);
+// A compute dispatch of one of the title's two kernels that write DCC keys (its clear kernel with
+// the value in user word 0, and a 16-byte element fill from a one-element source): notes the byte
+// the keys are expected to hold afterwards. For now only compared with the keys after each wait
+// ([key-writer-sync] predictions); nothing relies on it.
+void NoteKeyKernelDispatch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups);
 
 }
 
