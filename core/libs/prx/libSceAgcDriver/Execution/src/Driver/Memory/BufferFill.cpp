@@ -17,11 +17,37 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// The fill kernel below with its 16-byte element loaded from a one-element source buffer (user
+// words 4-7) instead of given in the user data: Unity's clear of a target's DCC keys, some hundred
+// times a second (as a compute dispatch its result was unknown until the GPU had run it, and every
+// draw into the target waited for it: WaitForKeyWriters). APS5_NO_SOURCE_FILL_HLE=1 dispatches it
+// as before.
+bool matchesSourceFillKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData) {
+    static const bool enabled = std::getenv("APS5_NO_SOURCE_FILL_HLE") == nullptr;
+    static constexpr std::array<std::uint32_t, 12> kernel{0xd7460004u, 0x04010c08u, 0xf4280302u, 0xfa000000u, 0xbf8cc07fu, 0x7e00020cu, 0x7e02020du, 0x7e04020eu, 0x7e06020fu, 0xe01c2000u, 0x80000004u, 0xbf810000u};
+    if (!enabled || userData.size() != 8 || code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return false;
+    const auto sourceStride = (userData[5] >> 16u) & 0x3fffu;
+    const bool sourceSwizzled = ((userData[5] >> 31u) & 1u) != 0;
+    const bool sourceAddTid = ((userData[7] >> 23u) & 1u) != 0;
+    const auto source = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+    return (userData[7] >> 30u) == 0 && sourceStride == 16 && !sourceSwizzled && !sourceAddTid && userData[6] >= 1 && source != 0 && source % 4 == 0;
+}
+
+}
+
 bool Driver::matchesFillKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
     static const bool enabled = std::getenv("APS5_NO_FILL_HLE") == nullptr;
     static const bool patternEnabled = std::getenv("APS5_NO_PATTERN_FILL_HLE") == nullptr;
     if (!enabled || userData.size() < 8 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1) return false;
     if (patternEnabled && MatchesPatternFillKernel(code, userData, compute)) return true;
+    if (matchesSourceFillKernel(code, userData)) {
+        const auto stride = (userData[1] >> 16u) & 0x3fffu;
+        const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
+        const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
+        return (userData[3] >> 30u) == 0 && stride == 16 && !swizzled && !addTid && (userData[3] & 0xfffu) == 0xfacu && ((userData[3] >> 12u) & 0x7fu) == 0x4bu;
+    }
     static constexpr std::array<std::uint32_t, 9> fillKernel{0xd7460004u, 0x04010c08u, 0x7e000204u, 0x7e020205u, 0x7e040206u, 0x7e060207u, 0xe01c2000u, 0x80000004u, 0xbf810000u};
     if (code.size() < fillKernel.size() || !std::equal(fillKernel.begin(), fillKernel.end(), code.begin())) return false;
 
@@ -169,7 +195,19 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto records = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, numRecords);
         base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
         bytes = static_cast<std::size_t>(records * 16u);
-        pattern = {userData[4], userData[5], userData[6], userData[7]};
+        if (matchesSourceFillKernel(code, userData)) {
+            // The element is read now, in packet order, as the pattern kernel's source is.
+            const auto source = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+            if (bytes != 0 && source < base + bytes && base < source + 16) return false;
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
+            inputLock.lock();
+            recordLabelsForPacket(localDevice.get(), queueId);
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), 16)) return false;
+            GuestMemory::Read(source, std::as_writable_bytes(std::span(pattern)), 4);
+            inputLock.unlock();
+        } else {
+            pattern = {userData[4], userData[5], userData[6], userData[7]};
+        }
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<std::uint64_t> fills{0}, filledBytes{0}, cpuFills{0};
