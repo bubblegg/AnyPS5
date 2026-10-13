@@ -874,6 +874,34 @@ void noteKeyWriterSync(const Recorder& recorder, std::uint64_t keys, std::size_t
     totals.since = now;
 }
 
+// Measuring aid: what the keys hold once the wait is over (one value throughout, by value, or
+// mixed), printed every 10 s: whether the work that wrote them is a plain fill.
+void noteKeysAfterSync(std::uint64_t keys, std::size_t count) {
+    static std::array<std::uint64_t, 256> uniform{};
+    static std::uint64_t mixed = 0, unreadable = 0;
+    static auto since = std::chrono::steady_clock::now();
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(keys), count)) {
+        ++unreadable;
+    } else {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(keys);
+        if (AllKeysEqual(bytes + 1, count - 1, bytes[0])) ++uniform[bytes[0]];
+        else ++mixed;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since < std::chrono::seconds(10)) return;
+    std::string values;
+    for (std::size_t value = 0; value < uniform.size(); ++value) {
+        if (uniform[value] == 0) continue;
+        char text[48];
+        std::snprintf(text, sizeof(text), " 0x%02zx x %llu,", value, static_cast<unsigned long long>(uniform[value]));
+        values += text;
+    }
+    std::fprintf(stderr, "[key-writer-sync] keys after the waits: one value throughout:%s mixed x %llu, unreadable x %llu\n", values.empty() ? " none," : values.c_str(), static_cast<unsigned long long>(mixed), static_cast<unsigned long long>(unreadable));
+    uniform = {};
+    mixed = unreadable = 0;
+    since = now;
+}
+
 }
 
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -886,6 +914,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     noteKeyWriterSync(*recorder, metaAddress, count);
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
+    noteKeysAfterSync(metaAddress, count);
     return std::nullopt;
 }
 
