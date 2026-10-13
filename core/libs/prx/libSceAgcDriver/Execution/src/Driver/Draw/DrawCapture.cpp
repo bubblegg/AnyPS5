@@ -72,12 +72,14 @@ ShaderRecompiler::PreparedShaderInvocation ShapeInvocation(ShapeStage& recall, c
         recall.handle = resolved.Handle();
         recall.memo = ShaderRecompiler::MakeStageMemo();
         recall.replayResult.reset();
+        recall.replayCapture.reset();
         return resolved;
     }
     auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
     counts.resolved.fetch_add(1, std::memory_order_relaxed);
     // The stage is resolved from something else: its replay record is another stage's.
     recall.replayResult.reset();
+    recall.replayCapture.reset();
     recall.snapshot = program.snapshot;
     recall.codeOffset = program.codeOffset;
     recall.stage = request.shader.stage;
@@ -125,8 +127,17 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         const char* text = std::getenv("APS5_VERIFY_STAGE_REPLAY");
         return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
     }();
-    const bool replayable = stageReplay && recall != nullptr && program.binary.stage == Stage::Fragment && dumpTarget == 0 && dumpSlot1 == 0 && !traceCapSync();
+    // Capture replay, for every stage: the record keeps the stage's last capture, and a draw whose
+    // user words differ only where the walk passes a buffer's address through takes that capture
+    // with the addresses changed (PreparedShaderInvocation::Recapture) instead of walking, as long
+    // as the dwords the walk read are unchanged. The result is materialized from it as from a walk.
+    // APS5_NO_CAPTURE_REPLAY=1 walks as before; APS5_VERIFY_STAGE_REPLAY=N also walks for every
+    // Nth such stage and compares the two captures.
+    static const bool captureReplay = std::getenv("APS5_NO_CAPTURE_REPLAY") == nullptr;
+    const bool recorded = stageReplay && recall != nullptr && dumpTarget == 0 && dumpSlot1 == 0 && !traceCapSync();
+    const bool replayable = recorded && program.binary.stage == Stage::Fragment;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> replayed;
+    bool memoryChanged = false;
     if (replayable && recall->replayResult != nullptr) {
         auto& counts = StageMemoCounters();
         if (recall->replayUser.size() != program.userData.size() || !std::equal(program.userData.begin(), program.userData.end(), recall->replayUser.begin())) {
@@ -135,6 +146,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             const SampledReadScope sampling(evidenceReads);
             if (shaderMemory.StillHolds(recall->replayRuns, recall->replayWords)) replayed = recall->replayResult;
             else counts.replayOtherMemory.fetch_add(1, std::memory_order_relaxed);
+            memoryChanged = replayed == nullptr;
         }
     }
     bool verifyReplay = false;
@@ -155,7 +167,21 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             return replayed;
         }
     }
-    const auto capture = [&] {
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> recaptured;
+    bool verifyRecapture = false;
+    if (replayed == nullptr && captureReplay && recorded && !memoryChanged && recall->replayCapture != nullptr) {
+        recaptured = invocation.Recapture(recall->replayCapture);
+        if (recaptured != nullptr) {
+            const SampledReadScope sampling(evidenceReads);
+            if (!shaderMemory.StillHolds(recall->replayRuns, recall->replayWords)) recaptured.reset();
+        }
+        if (recaptured != nullptr) {
+            const auto recaptures = StageMemoCounters().recaptured.fetch_add(1, std::memory_order_relaxed);
+            verifyRecapture = verifyReplayEvery != 0u && recaptures % verifyReplayEvery == 0u;
+        }
+    }
+    const bool walked = recaptured == nullptr || verifyRecapture;
+    const auto capture = !walked ? recaptured : [&] {
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
     }();
@@ -203,7 +229,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     timing.Mark("capture_resources");
     stageCapture.compiled = invocation.Materialize(*capture, recall != nullptr ? recall->memo.get() : nullptr);
     timing.Mark("materialize");
-    if (replayable) {
+    if (recorded) {
         const auto readsInto = [&](std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::vector<std::uint32_t>& words) {
             runs.clear();
             words.clear();
@@ -227,10 +253,23 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             if (difference != nullptr && differences.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[stage-replay] verify: program 0x%llx: a replayed result differs in its %s from the one captured now\n", static_cast<unsigned long long>(program.binary.codeAddress), difference);
             if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[stage-replay] verify: %llu replayed stages captured again, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
         }
-        if (CacheableResult(*stageCapture.compiled)) {
+        if (verifyRecapture) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+            std::vector<std::uint32_t> words;
+            readsInto(runs, words);
+            const auto& kept = recaptured->snapshot;
+            const auto& fresh = capture->snapshot;
+            const char* difference = kept.buffers != fresh.buffers ? "buffers" : kept.images != fresh.images ? "images" : kept.samplers != fresh.samplers ? "samplers" : kept.flattenedSrt != fresh.flattenedSrt ? "flattened SRT" : kept.userData != fresh.userData ? "user data" : !(kept.uniformFill == fresh.uniformFill) ? "uniform fill" : kept.srtPoison != fresh.srtPoison || kept.nullRootReads != fresh.nullRootReads ? "poison" : runs != recall->replayRuns || words != recall->replayWords ? "capture reads" : nullptr;
+            static std::atomic<std::uint64_t> compared{0}, differences{0};
+            const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (difference != nullptr && differences.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[stage-replay] verify: program 0x%llx (stage %u): a capture taken from the shape differs in its %s from the one walked now\n", static_cast<unsigned long long>(program.binary.codeAddress), static_cast<unsigned>(program.binary.stage), difference);
+            if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[stage-replay] verify: %llu captures taken from their shape walked again, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
+        }
+        if (walked) readsInto(recall->replayRuns, recall->replayWords);
+        recall->replayCapture = captureReplay ? capture : nullptr;
+        if (replayable && CacheableResult(*stageCapture.compiled)) {
             recall->replayResult = stageCapture.compiled;
             recall->replayUser.assign(program.userData.begin(), program.userData.end());
-            readsInto(recall->replayRuns, recall->replayWords);
         } else {
             recall->replayResult.reset();
         }

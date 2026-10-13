@@ -93,9 +93,63 @@ public:
             const auto words = std::min<std::size_t>(_plan.uniformFill.fill.words, _plan.uniformFill.values.size());
             for (std::size_t index = 0; index < words; ++index) _walk.uniformValues[index] = Node(_plan.uniformFill.values[index]);
         }
+        ClassifyUserWords();
     }
 
 private:
+    // See CompiledWalk::structuralWords. A buffer's dword is passed when its node is a user word
+    // through nothing but aliases; every other root, and everything it reaches, is structural.
+    void ClassifyUserWords() {
+        if (!_plan.controlFlow.empty() || _plan.info.buffers.size() > _plan.materializationSources.size()) return;
+        for (const auto& source : _plan.descriptorSources) {
+            if (source.indirectImage.has_value()) return;
+        }
+        std::vector<std::uint8_t> passedSource(_plan.descriptorSources.size(), 0u);
+        for (std::size_t buffer = 0; buffer < _plan.info.buffers.size(); ++buffer) passedSource.at(_plan.materializationSources[buffer]) = 1u;
+        std::vector<std::uint8_t> reached(_walk.nodes.size(), 0u);
+        std::vector<std::uint32_t> pending;
+        const auto reach = [&](std::uint32_t node) {
+            if (node == NoWalkNode || reached[node] != 0u) return;
+            reached[node] = 1u;
+            pending.push_back(node);
+        };
+        const auto passed = [&](std::uint32_t node) {
+            while (node != NoWalkNode && _walk.nodes[node].op == WalkOp::Alias) node = _walk.nodes[node].args[0];
+            return node != NoWalkNode && _walk.nodes[node].op == WalkOp::UserData ? node : NoWalkNode;
+        };
+        for (std::size_t source = 0; source < _walk.sources.size(); ++source) {
+            for (const auto node : _walk.sources[source]) {
+                if (passedSource[source] == 0u || passed(node) == NoWalkNode) reach(node);
+            }
+        }
+        for (const auto node : _walk.reads) reach(node);
+        for (const auto node : _walk.conditions) reach(node);
+        for (const auto node : _walk.uniformValues) reach(node);
+        while (!pending.empty()) {
+            const auto& node = _walk.nodes[pending.back()];
+            pending.pop_back();
+            for (const auto argument : node.args) reach(argument);
+        }
+        for (std::size_t index = 0; index < _walk.nodes.size(); ++index) {
+            const auto& node = _walk.nodes[index];
+            if (node.op != WalkOp::UserData) continue;
+            if (node.immediate >= _plan.userDataCount) return;
+            if (reached[index] != 0u) _walk.structuralWords.push_back(static_cast<std::uint32_t>(node.immediate));
+        }
+        std::sort(_walk.structuralWords.begin(), _walk.structuralWords.end());
+        _walk.structuralWords.erase(std::unique(_walk.structuralWords.begin(), _walk.structuralWords.end()), _walk.structuralWords.end());
+        for (std::size_t buffer = 0; buffer < _plan.info.buffers.size(); ++buffer) {
+            const auto& dwords = _walk.sources[_plan.materializationSources[buffer]];
+            for (std::uint32_t dword = 0; dword < dwords.size(); ++dword) {
+                const auto node = passed(dwords[dword]);
+                if (node == NoWalkNode) continue;
+                const auto word = static_cast<std::uint32_t>(_walk.nodes[node].immediate);
+                if (!std::binary_search(_walk.structuralWords.begin(), _walk.structuralWords.end(), word)) _walk.passedWords.push_back({static_cast<std::uint32_t>(buffer), dword, word});
+            }
+        }
+        _walk.replayable = true;
+    }
+
     static IrValue* Resolved(const IrValue& inst, std::size_t index) {
         IrValue* argument = inst.Argument(index);
         if (argument == nullptr) throw std::runtime_error("null argument");

@@ -1405,6 +1405,31 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
     return capture;
 }
 
+std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::shared_ptr<const ResourceCapture>& previous) const {
+    if (previous == nullptr || previous->source != handle->source || previous->plan != handle->source->plan) return nullptr;
+    const auto* walk = handle->source->walk.get();
+    if (walk == nullptr || !walk->replayable) return nullptr;
+    const auto& plan = *previous->plan;
+    const auto& was = previous->snapshot;
+    const auto user = request.context.userData;
+    if (user.size() < plan.userDataCount || was.userData.size() != plan.userDataCount || was.buffers.size() != plan.info.buffers.size() || !was.srtPoison.empty() || was.nullRootReads != 0u) return nullptr;
+    for (const auto word : walk->structuralWords) {
+        if (user[word] != was.userData[word]) return nullptr;
+    }
+    // A passed word may move its buffer, nothing else: the other descriptor fields are validated
+    // after a walk (the buffer's type, ADD_TID), which then has to run.
+    for (const auto& passed : walk->passedWords) {
+        const auto changed = user[passed.word] ^ was.userData[passed.word];
+        if (passed.dword == 1u ? (changed & 0xffff0000u) != 0u : passed.dword != 0u && changed != 0u) return nullptr;
+    }
+    auto capture = previous.use_count() == 1 ? std::const_pointer_cast<ResourceCapture>(std::move(previous)) : std::make_shared<ResourceCapture>(*previous);
+    previous.reset();
+    auto& snapshot = capture->snapshot;
+    for (const auto& passed : walk->passedWords) snapshot.buffers[passed.buffer].dwords[passed.dword] = user[passed.word];
+    snapshot.userData.assign(user.begin(), user.begin() + plan.userDataCount);
+    return capture;
+}
+
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
     if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);

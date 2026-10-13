@@ -66,6 +66,22 @@ struct CompiledWalk {
     std::vector<std::uint32_t> reads;
     std::vector<std::uint32_t> conditions;
     std::array<std::uint32_t, 4> uniformValues {NoWalkNode, NoWalkNode, NoWalkNode, NoWalkNode};
+    // What the walk does with the user data, for a caller that has the snapshot of one walk and
+    // wants the snapshot of a walk with other user data (PreparedShaderInvocation::Recapture).
+    // `structuralWords` (sorted) are the user words some evaluated value is computed from: a read's
+    // address, a condition, a flat slot, an image or sampler word. `passedWords` are the user words
+    // that are a buffer descriptor's dword as they are, and nothing else; a word that is both is
+    // only listed as structural. With the structural words and the memory the walk read unchanged,
+    // a walk differs from the last one in the passed words alone. `replayable` is false for a plan
+    // this is not worked out for (control flow, an image table, a user word beyond the plan's count).
+    struct PassedWord {
+        std::uint32_t buffer;
+        std::uint32_t dword;
+        std::uint32_t word;
+    };
+    bool replayable = false;
+    std::vector<std::uint32_t> structuralWords;
+    std::vector<PassedWord> passedWords;
 };
 
 // The compiled walk of `plan`, which must outlive it and no longer change; null when the plan has

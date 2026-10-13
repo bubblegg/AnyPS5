@@ -67,6 +67,13 @@ public:
     const RecompileRequest& Request() const { return request; }
     const std::shared_ptr<const SourceHandle>& Handle() const { return handle; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
+    // What Capture would return for this invocation's user data, made from `previous`, an earlier
+    // capture of the same prepared shader, without the walk: only where the walk provably differs
+    // from the earlier one in nothing but buffer addresses taken as they are from the user data
+    // (CompiledWalk::passedWords), and only as long as the guest memory the earlier walk read is
+    // unchanged, which the caller checks. `previous` is taken over (and changed in place when the
+    // caller is its only holder); null, with `previous` kept, when the walk has to run.
+    std::shared_ptr<const ResourceCapture> Recapture(std::shared_ptr<const ResourceCapture>& previous) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
     // The same result without the result memo's hash of the whole snapshot (APS5_VERIFY_STAGE_MEMO=N
     // compares every Nth with a result materialized without the memo).

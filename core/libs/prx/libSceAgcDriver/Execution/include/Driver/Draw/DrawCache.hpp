@@ -15,6 +15,7 @@
 namespace ShaderRecompiler {
 struct SourceHandle;
 struct StageMemo;
+struct ResourceCapture;
 }
 
 namespace AgcDriver::DriverDetail {
@@ -117,6 +118,10 @@ struct ShapeStage {
     std::vector<std::uint32_t> replayUser;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> replayRuns;
     std::vector<std::uint32_t> replayWords;
+    // Capture replay (every stage): the stage's last capture, whose walk read `replayRuns`. A draw
+    // that differs from it only in buffer addresses the walk passes through from the user words
+    // takes it with those changed instead of walking (APS5_NO_CAPTURE_REPLAY=1 walks as before).
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> replayCapture;
     // The replayed result's part of the draw's resource cache key (Graphics::DrawStageContentKey),
     // built once for the result it names and shared with the draws that replay it.
     std::shared_ptr<const std::vector<std::uint32_t>> replayKey;
@@ -152,6 +157,8 @@ struct StageMemoCounts {
     // Stage replay: results taken from the shape, and fragment stages that could not (other user
     // words; the same words over changed memory).
     std::atomic<std::uint64_t> replayed{0}, replayOtherWords{0}, replayOtherMemory{0};
+    // Capture replay: stages (of any kind) whose capture was taken from the shape without a walk.
+    std::atomic<std::uint64_t> recaptured{0};
 };
 StageMemoCounts& StageMemoCounters();
 
