@@ -674,7 +674,7 @@ bool CompiledEvaluator::RunRawRead(const WalkNode& node, std::uint64_t& result) 
         result = 0;
         return true;
     }
-    if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && node.loadedFromMemory) {
+    if (_inaccessible != nullptr && node.loadedFromMemory && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t))) {
         *_inaccessible = {node.inst, address};
         return false;
     }

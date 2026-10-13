@@ -3913,7 +3913,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::prepareRingBindi
             counters.bytes += entry.fresh ? range : 0;
             continue;
         }
-        if (item.guest) static_cast<void>(GuestMemory::CollectWrites(entry.collect, range));
+        // No collect of the range first: the copy is this draw's alone and is kept under no
+        // generation, so the walk (about half of this function, and it armed write tracking on the
+        // pages the title writes its constants to every frame) bought nothing. A write it would
+        // have stamped is stamped by the next collect of the range instead, as newer, which only
+        // ever reads as "changed". APS5_RING_COLLECT=1 collects as before.
+        static const bool collectFirst = std::getenv("APS5_RING_COLLECT") != nullptr;
+        if (collectFirst && item.guest) static_cast<void>(GuestMemory::CollectWrites(entry.collect, range));
         std::memcpy(bytes + position, entry.source, range);
         if (!item.guest) {
             for (const auto& patch : dataPatches) {
