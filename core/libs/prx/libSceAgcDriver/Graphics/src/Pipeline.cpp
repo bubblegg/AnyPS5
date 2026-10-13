@@ -96,7 +96,13 @@ void ValidateDepthBounds(const Context& context, const State& state) {
 
 void ValidateProvokingVertex(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
     Require(state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT || state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT, "invalid provoking vertex mode");
-    if (state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT) return;
+    if (state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT) {
+        for (const auto& shader : shaders) {
+            if (shader.stage != ShaderRecompiler::ShaderStage::Fragment || shader.program == nullptr) continue;
+            Require(std::none_of(shader.program->fragmentParameters.begin(), shader.program->fragmentParameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flatP10; }), "v_interp_mov p10 of a flat input with the first provoking vertex is not measured");
+        }
+        return;
+    }
     Require(context.provokingVertexLast, "last provoking vertex requires VK_EXT_provoking_vertex with provokingVertexLast enabled");
     Require(!state.rectList && state.stages.path == ShaderPath::Vertex && !state.stages.mesh && !state.stages.tessellation, "last provoking vertex is unsupported for generated primitive pipelines");
     Require(state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, "last provoking vertex is unsupported for this primitive topology");
@@ -111,7 +117,7 @@ void ValidateProvokingVertex(const Context& context, const State& state, std::sp
 bool ValidateSampleLocations(const Context& context, const State& state) {
     const bool extensionSupportsSamples = (context.sampleLocationSampleCounts & state.samples) != 0;
     Require(!state.customSampleLocations || extensionSupportsSamples, "custom sample locations require VK_EXT_sample_locations support for the draw's sample count");
-    const bool enabled = extensionSupportsSamples && (!state.depth || SampleLocationsCompatibleDepth(context, state.depth->format, state.depth->samples));
+    const bool enabled = extensionSupportsSamples && (!state.depth || SampleLocationsCompatibleDepth(context, HostDepthFormat(context, state.depth->format), state.depth->samples));
     Require(!state.customSampleLocations || enabled, "custom sample locations require a compatible depth format and sample count");
     return enabled;
 }
@@ -177,6 +183,13 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         appendKey(key, shader.stage);
         appendKey(key, shader.program->PipelineVariantId());
         appendKey(key, shader.pushConstantOffset);
+        if (resources.split) {
+            auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
+            for (const auto& binding : shader.program->bindings) {
+                Require(binding.descriptorSet < 2u, "split pipeline library descriptor set exceeds two slots");
+                sets |= 1u << binding.descriptorSet;
+            }
+        }
     }
     for (const auto& binding : input.bindings) {
         appendKey(keys.vertexInput, binding.binding);
@@ -241,8 +254,8 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         }
     };
     splitKey(keys.layout, 3u);
-    splitKey(keys.preRasterizationLayout, 1u);
-    splitKey(keys.fragmentLayout, 2u);
+    splitKey(keys.preRasterizationLayout, keys.preRasterizationSets);
+    splitKey(keys.fragmentLayout, keys.fragmentSets);
     return true;
 }
 
@@ -338,7 +351,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         const VkAttachmentReference depthReference{static_cast<std::uint32_t>(colors.size()), VK_IMAGE_LAYOUT_GENERAL};
         if (state.depth) {
             VkAttachmentDescription depth{};
-            depth.format = state.depth->format;
+            depth.format = HostDepthFormat(context, state.depth->format);
             depth.samples = static_cast<VkSampleCountFlagBits>(state.samples);
             depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -355,11 +368,11 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         rendering.colorAttachmentCount = static_cast<std::uint32_t>(renderingColors.size());
         rendering.pColorAttachmentFormats = renderingColors.empty() ? nullptr : renderingColors.data();
         if (state.depth) {
-            rendering.depthAttachmentFormat = state.depth->format;
-            if (HasStencil(state.depth->format)) rendering.stencilAttachmentFormat = state.depth->format;
+            rendering.depthAttachmentFormat = HostDepthFormat(context, state.depth->format);
+            if (HasStencil(state.depth->format)) rendering.stencilAttachmentFormat = rendering.depthAttachmentFormat;
         }
         if (dynamicRendering) {
-            depthFormat = state.depth ? state.depth->format : VK_FORMAT_UNDEFINED;
+            depthFormat = state.depth ? HostDepthFormat(context, state.depth->format) : VK_FORMAT_UNDEFINED;
             colorSlots.assign(state.blends.size(), ~0u);
             for (std::uint32_t index = 0; index < state.colors.size(); ++index) colorSlots.at(state.colors[index].exportIndex) = index;
             this->attachmentLayout = attachmentLayout;
@@ -479,13 +492,13 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             return;
         }
         if (prebuilding) {
-            static_cast<void>(LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, true));
+            static_cast<void>(LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, true, _modules));
             for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
             _modules.clear();
             prebuilt = true;
             return;
         }
-        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized);
+        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
         else Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
@@ -714,7 +727,7 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     }
     // A pipeline without the library states binds them statically: they must be set again.
     recorded.library = false;
-    if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope);
+    if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
     context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
 }
@@ -723,7 +736,7 @@ void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state) con
     auto& recorded = recordedState();
     const bool all = !stateFilter() || !recorded.library;
     const bool depth = state.depth.has_value();
-    const std::array<float, 5> depthValues{depthBias ? state.depthBiasConstant : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f};
+    const std::array<float, 5> depthValues{depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f};
     const std::array<VkBool32, 5> enables{depth && state.depthTest, depth && state.depthWrite, static_cast<VkBool32>(depthBounds), depth && state.stencilTest, 0};
     const auto depthCompare = depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS;
     const std::array<VkStencilOpState, 2> stencil{depth ? state.stencilFront : VkStencilOpState{}, depth ? state.stencilBack : VkStencilOpState{}};
@@ -767,7 +780,7 @@ void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) c
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, backFaces);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.backDepthBiasConstant, state.depthBiasClamp, state.backDepthBiasSlope);
+    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
     if (depthBounds) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
 }
 

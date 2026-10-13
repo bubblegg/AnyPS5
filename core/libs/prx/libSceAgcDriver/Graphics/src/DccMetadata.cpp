@@ -64,6 +64,18 @@ DccKeys ByteKeys(std::uint8_t key) {
     }
 }
 
+bool SingleKeysReadable(const GuestTextureResource& resource) {
+    return KeyBytes % BytesPerElement(resource.format) == 0;
+}
+
+void ExpandSingleBlocks(std::span<std::byte> bytes, std::size_t elementBytes) {
+    for (std::size_t block = 0; block < bytes.size(); block += KeyBytes) {
+        const auto blockBytes = std::min<std::size_t>(KeyBytes, bytes.size() - block);
+        auto* first = bytes.data() + block;
+        for (auto filled = std::min(elementBytes, blockBytes); filled < blockBytes; filled *= 2) std::memcpy(first + filled, first, std::min(filled, blockBytes - filled));
+    }
+}
+
 // APS5_PROFILE_DRAW: key scans, their bytes and time, printed as [dcc] every 10 s, with the hits of
 // the GPU-store memo below and the "uncompressed" key stores by where they were made. Flush syncs
 // stay 0 (no key read syncs the recorder); the field is kept so the line's shape does not change.
@@ -485,7 +497,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
     memoized = false;
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
     const auto keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
-    if (keys == DccKeys::Uncompressed) return keys;
+    if (keys == DccKeys::Uncompressed || (keys == DccKeys::ClearSingle && SingleKeysReadable(resource))) return keys;
     if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) throw std::runtime_error(std::string("AGC graphics: DCC clear code ") + DccKeysName(keys) + " of converted texture format " + std::to_string(resource.format) + " is not implemented");
     std::byte probe[16]{};
     if (!IsDccClear(keys) || !FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, std::span(probe, std::min<std::size_t>(sizeof(probe), BytesPerElement(resource.format))))) {
@@ -751,23 +763,30 @@ DccKeys ProvedCurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceByt
 void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std::span<std::byte> bytes) {
     // Named for the [hooksync] attribution: the read goes through the flush hook.
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
-    if (keys != DccKeys::Uncompressed) {
+    if (keys != DccKeys::Uncompressed && keys != DccKeys::ClearSingle) {
         FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, bytes);
         return;
     }
     GuestMemory::ReadCommitted(resource.baseAddress, bytes);
+    if (keys == DccKeys::ClearSingle) {
+        ExpandSingleBlocks(bytes, BytesPerElement(resource.format));
+        return;
+    }
     // Mixed keys: part of the surface is fast-cleared and part holds texels. The cleared parts hold
     // whatever was in memory (an HDR target shows it as blocks of noise), so each 256 bytes whose key
-    // is a clear code get that clear color and the rest stay as stored. The keys are taken in
-    // surface-memory order, one per 256 bytes. APS5_NO_MIXED_DCC_CLEAR=1 reads everything as stored.
+    // is a clear code get that clear color, each whose key is comp-to-single gets its first element
+    // repeated, and the rest stay as stored. The keys are taken in surface-memory order, one per 256
+    // bytes. APS5_NO_MIXED_DCC_CLEAR=1 reads everything as stored.
     static const bool mixedClear = std::getenv("APS5_NO_MIXED_DCC_CLEAR") == nullptr;
     const auto count = bytes.size() / KeyBytes;
     if (!mixedClear || resource.dccAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(resource.dccAddress), count)) return;
     const auto* stored = reinterpret_cast<const std::uint8_t*>(resource.dccAddress);
     if (AllKeysEqual(stored, count, 0xffu)) return;
     const auto format = ResolveTextureFormat(resource.format);
+    const bool singleReadable = SingleKeysReadable(resource);
     for (std::size_t key = 0; key < count; ++key) {
         const auto code = ByteKeys(stored[key]);
+        if (code == DccKeys::ClearSingle && singleReadable) ExpandSingleBlocks(bytes.subspan(key * KeyBytes, KeyBytes), BytesPerElement(resource.format));
         if (!IsDccClear(code)) continue;
         FillDccClear(format, code, resource.dccAlphaOnMsb, bytes.subspan(key * KeyBytes, KeyBytes));
     }
@@ -776,6 +795,7 @@ void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std:
 namespace {
 
 DccKeys EncodedKeys(const GuestTextureResource& resource, DccKeys keys) {
+    if (keys == DccKeys::ClearSingle && SingleKeysReadable(resource)) return keys;
     std::byte probe[16]{};
     if (!IsDccClear(keys) || !FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, std::span(probe, std::min<std::size_t>(sizeof(probe), BytesPerElement(resource.format))))) return DccKeys::Uncompressed;
     return keys;

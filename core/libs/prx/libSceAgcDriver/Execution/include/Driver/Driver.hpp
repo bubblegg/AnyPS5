@@ -52,6 +52,7 @@ struct DrawTail;
 class Driver {
 public:
     static Driver& Get();
+    static std::uint64_t GpuMapImportThreads();
     ~Driver();
     void Shutdown();
     void WaitIdle();

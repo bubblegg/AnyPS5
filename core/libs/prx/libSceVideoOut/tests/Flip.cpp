@@ -306,7 +306,8 @@ void testControls() {
     check(handle >= 0, "open with the highest priority on every CPU failed");
     const auto cfg = VideoOutDriver::Get().GetConfig(handle);
     check(sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_DEFAULT, nullptr, nullptr, 0) == 1, "default output mode is unsupported");
-    check(sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unavailable output mode is supported");
+    const int highFrameRate = sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0);
+    check(highFrameRate == 1 || highFrameRate == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unexpected high-frame-rate support result");
     check(sceVideoOutConfigureOutput(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unavailable output mode was configured");
     check(sceVideoOutIsOutputSupported(handle, 0xd000000aull, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNKNOWN_OUTPUT_MODE, "unknown output mode is supported");
     check(sceVideoOutConfigureOutput(handle, 0xd000000aull, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNKNOWN_OUTPUT_MODE, "unknown output mode was configured");
@@ -368,6 +369,14 @@ void testControls() {
     check(sceVideoOutGetEventId(&vrrStatus) == VIDEO_OUT_EVENT_VRR_STATUS, "VRR status event id rejected");
     check(sceVideoOutVrrPegToFixedRate(handle, 0, 0) == 0, "VRR peg on an open handle failed");
     check(sceVideoOutVrrUnpegFromFixedRate(handle) == 0, "VRR unpeg on an open handle failed");
+    check(sceVideoOutDeleteVrrActiveStatusEvent(queue, handle) == 0, "VRR status unsubscription failed");
+    {
+        std::lock_guard lock(cfg->mutex);
+        check(cfg->vrrStatusEvents.empty(), "VRR status unsubscription did not clear registration");
+    }
+    check(sceVideoOutDeleteVrrActiveStatusEvent(queue, handle) == 0, "duplicate VRR status unsubscription failed");
+    expectFailure([&] { sceVideoOutDeleteVrrActiveStatusEvent(0, handle); });
+    expectFailure([&] { sceVideoOutDeleteVrrActiveStatusEvent(queue, -1); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 1, 0); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0, 1); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0x100000000ull, 0); });

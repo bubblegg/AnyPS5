@@ -53,12 +53,6 @@ struct ThreadArgs {
 static std::atomic<thread_dtors_func_t> threadDtors{nullptr};
 static std::atomic<get_thread_atexit_count_func_t> threadAtexitCount{nullptr};
 static std::atomic<thread_atexit_report_func_t> threadAtexitReport{nullptr};
-struct CleanupHandler {
-    CleanupHandler* previous;
-    void (APS5_VABI* routine)(void*);
-    void* argument;
-    int onHeap;
-};
 
 struct GuestThreadState {
     PthreadPrivate* current = nullptr;
@@ -250,6 +244,16 @@ KernelCpumask LiveGuestThreadsAffinity() {
     return mask;
 }
 
+bool GuestThreadIsLive(const PthreadPrivate* thread) {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    for (const auto& [id, live] : registry.threads) {
+        if (live != thread) continue;
+        return !live->_finished.load(std::memory_order_acquire);
+    }
+    return false;
+}
+
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos) {
     auto& registry = CpuClocks();
     std::lock_guard lock(registry.lock);
@@ -369,6 +373,14 @@ bool ThreadCancel::Requested() {
 
 void ThreadCancel::Check() {
     if (Requested()) scePthreadExit(GUEST_CANCELED);
+}
+
+void* ThreadCancel::CleanupMark() {
+    return CurrentGuestState().cleanupHandlers;
+}
+
+void ThreadCancel::CleanupRestore(void* mark) {
+    CurrentGuestState().cleanupHandlers = static_cast<CleanupHandler*>(mark);
 }
 
 void ThreadCancel::BeginWait(TimedWait::Condition* condition) {
@@ -624,7 +636,7 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
 }
 
 int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
-    if (!thread) throw std::runtime_error("scePthreadJoin: null thread");
+    if (!thread) return SCE_KERNEL_ERROR_EINVAL;
     if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
     if (thread == CurrentGuestState().current) return SCE_KERNEL_ERROR_EDEADLK;
     ThreadCancel::Check();
@@ -647,7 +659,7 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
 }
 
 int APS5_VABI scePthreadDetach(Pthread thread) {
-    if (!thread) throw std::runtime_error("scePthreadDetach: null thread");
+    if (!thread) return SCE_KERNEL_ERROR_EINVAL;
     if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
     thread->_detached = true;
 #ifdef _WIN32
@@ -819,20 +831,36 @@ int APS5_VABI scePthreadSetprio(Pthread thread, int prio) {
     return SCE_OK;
 }
 
+static void APS5_VABI ResetOnce(void* once) {
+    constexpr int32_t Never = 0;
+    std::atomic_ref<int32_t> state(*static_cast<int32_t*>(once));
+    state.store(Never, std::memory_order_release);
+    state.notify_all();
+}
+
 int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void)) {
     if (!once || !init) return SCE_KERNEL_ERROR_EINVAL;
     constexpr int32_t Never = 0;
     constexpr int32_t Done = 1;
     constexpr int32_t Running = 2;
     std::atomic_ref<int32_t> state(*once);
-    int32_t expected = Never;
-    if (state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel)) {
-        init();
-        state.store(Done, std::memory_order_release);
-        state.notify_all();
-        return SCE_OK;
+    for (int32_t expected = Never; !state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel); expected = Never) {
+        if (expected != Running) return SCE_OK;
+        state.wait(Running, std::memory_order_acquire);
     }
-    while ((expected = state.load(std::memory_order_acquire)) == Running) state.wait(Running, std::memory_order_acquire);
+    CleanupHandler reset{};
+    void* const mark = ThreadCancel::CleanupMark();
+    __pthread_cleanup_push_imp_nid_postfix(ResetOnce, once, &reset);
+    try {
+        init();
+    } catch (...) {
+        ThreadCancel::CleanupRestore(mark);
+        ResetOnce(once);
+        throw;
+    }
+    ThreadCancel::CleanupRestore(mark);
+    state.store(Done, std::memory_order_release);
+    state.notify_all();
     return SCE_OK;
 }
 

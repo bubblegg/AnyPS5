@@ -167,6 +167,23 @@ bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset
     return used;
 }
 
+std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl) {
+    constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
+    const auto bits = paClVsOutCntl & Graphics::PositionExportLayoutBits;
+    if (bits == 0) return 0;
+    const bool cached = snapshot != nullptr && codeOffset == 0;
+    if (cached) {
+        const auto use = snapshot->positionVectorUse->load(std::memory_order_acquire);
+        if (use != Unknown) return use == Used ? bits : 0;
+    }
+    const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    const bool used = std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& instruction) {
+        return instruction.family == ShaderRecompiler::RdnaInstructionFamily::EXP && instruction.exportTarget >= 0x0du && instruction.exportTarget <= 0x0fu && instruction.exportEnableMask != 0;
+    });
+    if (cached) snapshot->positionVectorUse->store(used ? Used : Unused, std::memory_order_release);
+    return used ? bits : 0;
+}
+
 
 bool VertexWorkgroupRequired(const QueueState& queue, const ShaderRegistry& registry) {
     Graphics::NoteRegisterRead(Graphics::RegisterBank::Context, 0x2d5);
@@ -299,6 +316,13 @@ bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& 
     return true;
 }
 
+static Shader GuestShaderFields(const Shader* shader) {
+    GuestMemory::CheckRange(shader, sizeof(Shader), 1);
+    Shader fields;
+    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    return fields;
+}
+
 bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     if (snapshot.headerAddress == reinterpret_cast<std::uintptr_t>(shader)) return true;
     if (snapshot.header.size() < sizeof(Shader)) return false;
@@ -312,7 +336,7 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
 }
 
 std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& registry, const Shader* shader) {
-    const auto found = registry.find(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code)));
+    const auto found = registry.find(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(GuestShaderFields(shader).code)));
     if (found == registry.end()) return {};
     for (const auto& snapshot : found->second) {
         if (snapshot->headerAddress == reinterpret_cast<std::uintptr_t>(shader)) return snapshot;
@@ -669,7 +693,11 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         if (firstUser == 0) userCount += 8;
     }
     plan->userData.resize(userCount);
-    if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, plan->userData, nullptr, true, 8u - firstUser);
+    if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) {
+        vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, plan->userData, nullptr, true, 8u - firstUser);
+        const auto outputs = state.context.find(0x207u);
+        if (vertex && outputs != state.context.end()) vertex->paClVsOutCntl = PositionExportLayout(&snapshot, codeOffset, std::span(snapshot.code).subspan(codeOffset), outputs->second);
+    }
     plan->swappc = {vertex.has_value(), firstUser, userCount};
     if (deferred != nullptr) {
         if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(plan->decoded, &plan->swappc)) {
@@ -793,6 +821,7 @@ private:
 
     static void* Main(void* argument) {
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
+        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("shader prepare", TraceThread::DefaultCapacity / 8);
         for (;;) {
             std::function<void()> task;
             {
@@ -902,6 +931,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto wave = fragment ? decoded.state.stages.fragmentWaveSize : decoded.state.stages.vertexWaveSize;
         std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
         if (!fragment) vertex = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, nullptr, true, 8u - program.firstUserSgpr);
+        if (vertex) vertex->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, decoded.state.paClVsOutCntl);
         pushOffset = Graphics::StagePushOffset(pushOffset, program.binary.stage, fixedSlots);
         const auto offset = pushOffset;
         const auto room = (fixedSlots && fragment ? Graphics::PipelinePushSlotBytes : capacity) - pushOffset % Graphics::PipelinePushSlotBytes;
@@ -949,8 +979,8 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         std::lock_guard lock(mutex);
         registry = shaders;
         for (const auto* shader : stages) {
-            GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
-            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+            const auto fields = GuestShaderFields(shader);
+            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
             require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
             const auto selected = RegisteredHeader(*registry, shader);
             require(selected != nullptr, "graphics ABI refers to a replaced shader header");
@@ -961,10 +991,10 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             registered.shader.ForEach([&](std::uint32_t offset, std::uint32_t value) { state.shader.insert_or_assign(offset, value); });
             registered.context.ForEach([&](std::uint32_t offset, std::uint32_t value) { state.context.insert_or_assign(offset, value); });
             registered.userConfig.ForEach([&](std::uint32_t offset, std::uint32_t value) { state.userConfig.insert_or_assign(offset, value); });
-            if (shader->type != snapshot.type) {
-                const std::size_t count = shader->num_sh_registers;
-                GuestMemory::CheckRange(shader->sh_registers, count * sizeof(ShaderRegister), alignof(ShaderRegister));
-                for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(shader->sh_registers[index].offset, shader->sh_registers[index].value);
+            if (fields.type != snapshot.type) {
+                const std::size_t count = fields.num_sh_registers;
+                GuestMemory::CheckRange(fields.sh_registers, count * sizeof(ShaderRegister), alignof(ShaderRegister));
+                for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(fields.sh_registers[index].offset, fields.sh_registers[index].value);
             }
         }
     }
@@ -1017,8 +1047,8 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     PerformanceTimer timing("Shader.ResolveAbi");
     ShaderPreparationTransaction transaction;
     CheckFailure();
-    GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
-    if (shader->type != 0 && shader->type != 1) {
+    const auto fields = GuestShaderFields(shader);
+    if (fields.type != 0 && fields.type != 1) {
         const std::array<const Shader*, 1> stages{shader};
         ResolveGraphicsStagesAbi(stages, context, primitive);
         transaction.Commit();
@@ -1027,7 +1057,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     std::shared_ptr<const ShaderSnapshot> snapshot;
     {
         std::lock_guard lock(mutex);
-        const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+        const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
         require(shaders != nullptr && shaders->contains(address), "static ABI refers to an unregistered shader");
         snapshot = RegisteredHeader(*shaders, shader);
         require(snapshot != nullptr, "static ABI refers to a replaced shader header");
@@ -1094,10 +1124,8 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
     std::shared_ptr<const ShaderSnapshot> fragment;
     {
         std::lock_guard lock(mutex);
-        GuestMemory::CheckRange(vertex, sizeof(Shader), alignof(Shader));
-        GuestMemory::CheckRange(pixel, sizeof(Shader), alignof(Shader));
         const auto lookup = [&](const Shader* shader) {
-            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(GuestShaderFields(shader).code));
             require(shaders != nullptr && shaders->contains(address), "rectangle ABI refers to an unregistered shader");
             const auto snapshot = RegisteredHeader(*shaders, shader);
             require(snapshot != nullptr, "rectangle ABI refers to a replaced shader header");

@@ -174,6 +174,14 @@ int APS5_VABI sceNpWebApi2PushEventDeleteFilter() {
     return 0;
 }
 
+int APS5_VABI sceNpWebApi2PushEventSetHandleTimeout(int lib_ctx_id, int handle_id, uint32_t timeout) {
+    (void)handle_id;
+    (void)timeout;
+    std::lock_guard lock(g_poolsMutex);
+    if (!g_pools.contains(lib_ctx_id)) throw std::invalid_argument("sceNpWebApi2PushEventSetHandleTimeout: unknown context");
+    return 0;
+}
+
 int APS5_VABI sceNpWebApi2PushEventRegisterPushContextCallback() {
     return g_nextHandle.fetch_add(1, std::memory_order_relaxed);
 }

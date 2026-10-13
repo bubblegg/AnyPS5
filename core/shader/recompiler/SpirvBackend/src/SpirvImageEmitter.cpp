@@ -1474,10 +1474,10 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         operands.insert(operands.end() - ((operandMask & spv::ImageOperandsMinLodMask) != 0u ? 1 : 0), offset);
 
     }
-    const auto emitSample = [&](std::uint32_t coord, std::uint32_t mask, const std::vector<std::uint32_t>& arguments) {
+    const auto emitSample = [&](std::uint32_t coord, std::uint32_t mask, const std::vector<std::uint32_t>& arguments, std::uint32_t sampleOpcode) {
         const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler, access.slot);
         const auto sample = state.module.AllocateId();
-        std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, coord};
+        std::vector<std::uint32_t> words = {sampleOpcode, resultType, sample, sampled, coord};
         if (setup.dref) {
             words.push_back(drefValue);
         }
@@ -1489,10 +1489,19 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         return sample;
     };
     std::uint32_t sample = 0;
-    if (!foldOffset) {
-        sample = emitSample(setup.coord, operandMask, operands);
+    const bool baseLevelIfUnnormalized = !setup.dref && SamplesBaseLevelIfUnnormalized(state.program.Info().samplers.at(mem.sampler));
+    if (baseLevelIfUnnormalized) {
+        const auto selector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::UnnormalizedBaseLevelBase + mem.sampler, 0u);
+        const auto unnormalized = Binary(state, spv::OpINotEqual, TypeBool(state), selector, ConstantU32(state, 0u));
+        sample = EmitValueIfElse(state, unnormalized, resultType, [&] {
+            return emitSample(setup.coord, spv::ImageOperandsLodMask, {ZeroF32(state)}, spv::OpImageSampleExplicitLod);
+        }, [&] {
+            return emitSample(setup.coord, operandMask, operands, opcode);
+        });
+    } else if (!foldOffset) {
+        sample = emitSample(setup.coord, operandMask, operands, opcode);
     } else if (!offsetOperand) {
-        sample = emitSample(FoldedOffsetCoord(ctx, access, setup), foldedMask, foldedOperands);
+        sample = emitSample(FoldedOffsetCoord(ctx, access, setup), foldedMask, foldedOperands, opcode);
     } else {
         const auto selector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::FoldOffsetBase + mem.sampler, 0u);
         const auto folded = Binary(state, spv::OpINotEqual, TypeBool(state), selector, ConstantU32(state, 0u));
@@ -1502,11 +1511,11 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
         state.module.AddFunction(spv::OpBranchConditional, folded, foldLabel, operandLabel);
         EmitLabel(state, foldLabel);
-        const auto foldSample = emitSample(FoldedOffsetCoord(ctx, access, setup), foldedMask, foldedOperands);
+        const auto foldSample = emitSample(FoldedOffsetCoord(ctx, access, setup), foldedMask, foldedOperands, opcode);
         const auto foldEnd = state.currentLabel;
         state.module.AddFunction(spv::OpBranch, merge);
         EmitLabel(state, operandLabel);
-        const auto operandSample = emitSample(setup.coord, operandMask, operands);
+        const auto operandSample = emitSample(setup.coord, operandMask, operands, opcode);
         const auto operandEnd = state.currentLabel;
         state.module.AddFunction(spv::OpBranch, merge);
         EmitLabel(state, merge);

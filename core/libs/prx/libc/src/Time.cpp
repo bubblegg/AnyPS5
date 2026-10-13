@@ -5,6 +5,9 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
 #include <string>
 
 #ifdef _WIN32
@@ -17,8 +20,32 @@
 
 namespace {
 
+constexpr const char* WEEKDAY_NAMES[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+constexpr const char* MONTH_NAMES[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+constexpr std::size_t ASCTIME_SIZE = sizeof("Sun Jan-2147483648 -2147483648:-2147483648:-2147483648 -2147483648\n");
 constexpr std::int64_t SECONDS_PER_DAY = 86400;
 constexpr std::int64_t DAYS_FROM_MARCH_TO_YEAR_END = 306;
+#ifdef _WIN32
+constexpr std::int64_t CALENDAR_CYCLE_YEARS = 400;
+constexpr std::int64_t CALENDAR_CYCLE_SECONDS = 146097 * SECONDS_PER_DAY;
+constexpr std::int64_t HOST_LAST_SECOND = 32535215999;
+
+std::int64_t calendarCycles(std::int64_t value, std::int64_t cycle) {
+    return value >= 0 ? value / cycle : -((-(value + 1)) / cycle + 1);
+}
+
+std::int64_t utcSeconds(const std::tm& time) {
+    const std::int64_t years = calendarCycles(time.tm_mon, 12);
+    const std::int64_t month = time.tm_mon - years * 12 + 1;
+    const std::int64_t year = std::int64_t{time.tm_year} + 1900 + years - (month <= 2 ? 1 : 0);
+    const std::int64_t era = calendarCycles(year, CALENDAR_CYCLE_YEARS);
+    const std::int64_t yearOfEra = year - era * CALENDAR_CYCLE_YEARS;
+    const std::int64_t dayOfYear = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5;
+    const std::int64_t dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+    const std::int64_t days = era * 146097 + dayOfEra - 719468 + time.tm_mday - 1;
+    return days * SECONDS_PER_DAY + std::int64_t{time.tm_hour} * 3600 + std::int64_t{time.tm_min} * 60 + time.tm_sec;
+}
+#endif
 
 void copyCalendarFields(const std::tm& host, GuestTm& guest) {
     guest.tm_sec = host.tm_sec;
@@ -214,6 +241,9 @@ extern "C" {
 
 GuestTm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, GuestTm* result);
 GuestTm* APS5_VABI gmtime_s_nid_postfix(const int64_t* timer, GuestTm* result);
+std::size_t APS5_VABI wcsrtombs_nid_postfix(char* destination, const std::uint16_t** source, std::size_t capacity, void* state);
+std::size_t APS5_VABI mbsrtowcs_nid_postfix(std::uint16_t* destination, const char** source, std::size_t capacity, void* state);
+int APS5_VABI ___mb_cur_max_nid_postfix();
 
 void APS5_VABI tzset_nid_postfix(void) {
 #ifdef _WIN32
@@ -247,11 +277,12 @@ int64_t APS5_VABI _Xtime_get_ticks_nid_postfix() {
 }
 
 double APS5_VABI libc_difftime_nid_postfix(int64_t time1, int64_t time0) {
-    return std::difftime(static_cast<std::time_t>(time1), static_cast<std::time_t>(time0));
+    if (time1 >= time0) return static_cast<double>(static_cast<uint64_t>(time1) - static_cast<uint64_t>(time0));
+    return -static_cast<double>(static_cast<uint64_t>(time0) - static_cast<uint64_t>(time1));
 }
 
 double APS5_VABI difftime_nid_postfix(int64_t time1, int64_t time0) {
-    return std::difftime(static_cast<std::time_t>(time1), static_cast<std::time_t>(time0));
+    return libc_difftime_nid_postfix(time1, time0);
 }
 
 GuestTm* APS5_VABI libc_gmtime_nid_postfix(const int64_t* timer) {
@@ -270,10 +301,17 @@ GuestTm* APS5_VABI localtime_nid_postfix(const int64_t* timer) {
 
 GuestTm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, GuestTm* result) {
     if (timer == nullptr || result == nullptr) return nullptr;
-    const std::time_t t = static_cast<std::time_t>(*timer);
     std::tm host{};
 #ifdef _WIN32
+    const std::int64_t cycles = *timer >= 0 && *timer <= HOST_LAST_SECOND ? 0 : calendarCycles(*timer, CALENDAR_CYCLE_SECONDS);
+    const std::time_t t = static_cast<std::time_t>(*timer - cycles * CALENDAR_CYCLE_SECONDS);
     if (localtime_s(&host, &t) != 0) return nullptr;
+    const std::int64_t year = host.tm_year + cycles * CALENDAR_CYCLE_YEARS;
+    if (year < std::numeric_limits<int>::min() || year > std::numeric_limits<int>::max()) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    host.tm_year = static_cast<int>(year);
     copyCalendarFields(host, *result);
     long standardBias = 0;
     long daylightBias = 0;
@@ -283,6 +321,7 @@ GuestTm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, GuestTm* result
     result->tm_gmtoff = -static_cast<std::int64_t>(standardBias + (daylight ? daylightBias : 0));
     result->tm_zone = _tzname[daylight ? 1 : 0];
 #else
+    const std::time_t t = static_cast<std::time_t>(*timer);
     if (localtime_r(&t, &host) == nullptr) return nullptr;
     copyCalendarFields(host, *result);
     result->tm_gmtoff = host.tm_gmtoff;
@@ -305,10 +344,27 @@ GuestTm* APS5_VABI gmtime_nid_postfix(const int64_t* timer) {
 
 int64_t APS5_VABI libc_mktime_nid_postfix(GuestTm* timeptr) {
     std::tm host = toHostTm(*timeptr);
+    host.tm_wday = -1;
+    int64_t moved = 0;
+#ifdef _WIN32
+    const bool ordinary = host.tm_year > 70 && host.tm_year < 1100 && host.tm_mon >= 0 && host.tm_mon < 12 && host.tm_mday >= 1 && host.tm_mday <= 31
+        && host.tm_hour >= 0 && host.tm_hour < 24 && host.tm_min >= 0 && host.tm_min < 60 && host.tm_sec >= 0 && host.tm_sec <= 60;
+    const std::int64_t approximate = ordinary ? SECONDS_PER_DAY : utcSeconds(host);
+    if (approximate < SECONDS_PER_DAY || approximate > HOST_LAST_SECOND - SECONDS_PER_DAY) {
+        moved = calendarCycles(approximate - SECONDS_PER_DAY, CALENDAR_CYCLE_SECONDS) * CALENDAR_CYCLE_SECONDS;
+        GuestTm window{};
+        if (!utcCalendarFields(approximate - moved, window)) return -1;
+        window.tm_isdst = host.tm_isdst;
+        host = toHostTm(window);
+        host.tm_wday = -1;
+    }
+#endif
     const std::time_t t = std::mktime(&host);
-    if (t == static_cast<std::time_t>(-1)) return -1;
-    const int64_t time = static_cast<int64_t>(t);
-    localtime_s_nid_postfix(&time, timeptr);
+    if (t == static_cast<std::time_t>(-1) && host.tm_wday == -1) return -1;
+    const int64_t time = static_cast<int64_t>(t) + moved;
+    GuestTm normalized{};
+    if (localtime_s_nid_postfix(&time, &normalized) == nullptr) return -1;
+    *timeptr = normalized;
     return time;
 }
 
@@ -324,8 +380,12 @@ size_t APS5_VABI libc_strftime_nid_postfix(char* str, size_t count, const char* 
 }
 
 char* APS5_VABI asctime_nid_postfix(const GuestTm* timeptr) {
-    const std::tm host = toHostTm(*timeptr);
-    return std::asctime(&host);
+    static thread_local char result[ASCTIME_SIZE];
+    const char* weekday = timeptr->tm_wday >= 0 && timeptr->tm_wday < 7 ? WEEKDAY_NAMES[timeptr->tm_wday] : "???";
+    const char* month = timeptr->tm_mon >= 0 && timeptr->tm_mon < 12 ? MONTH_NAMES[timeptr->tm_mon] : "???";
+    std::snprintf(result, sizeof(result), "%s %s%3d %.2d:%.2d:%.2d %lld\n", weekday, month, timeptr->tm_mday,
+        timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec, 1900LL + timeptr->tm_year);
+    return result;
 }
 
 char* APS5_VABI ctime_nid_postfix(const int64_t* timer) {
@@ -338,6 +398,42 @@ char* APS5_VABI ctime_nid_postfix(const int64_t* timer) {
 
 size_t APS5_VABI strftime_nid_postfix(char* str, size_t count, const char* format, const GuestTm* timeptr) {
     return libc_strftime_nid_postfix(str, count, format, timeptr);
+}
+
+size_t APS5_VABI wcsftime_nid_postfix(std::uint16_t* str, size_t count, const std::uint16_t* format, const GuestTm* timeptr) {
+    constexpr int GuestEnomem = 12;
+    constexpr int GuestEinval = 22;
+    constexpr auto Failed = static_cast<std::size_t>(-1);
+    if (format == nullptr) throw std::invalid_argument("wcsftime: null format");
+    if (timeptr == nullptr) throw std::invalid_argument("wcsftime: null time");
+    const std::uint16_t* formatCursor = format;
+    const std::size_t formatLength = wcsrtombs_nid_postfix(nullptr, &formatCursor, 0, nullptr);
+    if (formatLength == Failed) return 0;
+    const std::unique_ptr<char[]> narrowFormat(new (std::nothrow) char[formatLength + 1]);
+    if (!narrowFormat) {
+        errno = GuestEnomem;
+        return 0;
+    }
+    wcsrtombs_nid_postfix(narrowFormat.get(), &formatCursor, formatLength + 1, nullptr);
+    const auto maxCharacterBytes = static_cast<std::size_t>(___mb_cur_max_nid_postfix());
+    if (std::numeric_limits<std::size_t>::max() / maxCharacterBytes <= count) {
+        errno = GuestEinval;
+        return 0;
+    }
+    const std::unique_ptr<char[]> narrow(new (std::nothrow) char[count * maxCharacterBytes]);
+    if (!narrow) {
+        errno = GuestEnomem;
+        return 0;
+    }
+    const int callerError = errno;
+    if (strftime_nid_postfix(narrow.get(), count, narrowFormat.get(), timeptr) == 0) {
+        errno = callerError;
+        return 0;
+    }
+    const char* narrowCursor = narrow.get();
+    const std::size_t length = mbsrtowcs_nid_postfix(str, &narrowCursor, count, nullptr);
+    if (length == static_cast<std::size_t>(-2) || length == Failed || narrowCursor != nullptr) return 0;
+    return length;
 }
 
 // The guest's CLOCKS_PER_SEC is 1000000: clock() reports process CPU time in microseconds.

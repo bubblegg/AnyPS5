@@ -38,6 +38,8 @@ using Key = std::vector<std::byte>;
 struct DeviceLibraries {
     PFN_vkDestroyPipeline destroyPipeline = nullptr;
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
+    PFN_vkDestroyShaderModule destroyModule = nullptr;
+    std::vector<VkShaderModule> modules;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
     PipelineLibraryCounters counters;
@@ -100,31 +102,35 @@ std::span<const VkDynamicState> PipelineLibraryDynamicStates() {
     return dynamicStates;
 }
 
-VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized, bool partsOnly) {
+VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized, bool partsOnly, std::span<VkShaderModule> modules) {
     Require(info.renderPass == VK_NULL_HANDLE && info.pDynamicState != nullptr, "pipeline library parts need dynamic rendering and the library dynamic states");
+    const bool split = (layout.flags & VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT) != 0;
+    Require(!split || (layout.setLayoutCount == 2u && layout.pSetLayouts != nullptr && ((keys.preRasterizationSets | keys.fragmentSets) & ~3u) == 0u), "split pipeline library layout requires two descriptor set slots and a valid mask");
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
     auto& device = store.devices[context.device];
     if (device.destroyPipeline == nullptr) {
         device.destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
         device.destroyLayout = context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+        device.destroyModule = context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
     }
-    const auto layoutFor = [&](const Key& key, std::optional<std::uint32_t> set) {
+    const auto layoutFor = [&](const Key& key, std::optional<std::uint32_t> mask) {
         auto found = device.layouts.find(key);
         if (found != device.layouts.end()) return found->second;
         auto info = layout;
         std::array<VkDescriptorSetLayout, 2> sets{VK_NULL_HANDLE, VK_NULL_HANDLE};
-        if (set) {
-            sets.at(*set) = layout.pSetLayouts[*set];
+        if (mask.has_value()) {
+            for (std::uint32_t set = 0; set < sets.size(); ++set) {
+                if ((*mask & (1u << set)) != 0u) sets[set] = layout.pSetLayouts[set];
+            }
             info.pSetLayouts = sets.data();
         }
         VkPipelineLayout handle = VK_NULL_HANDLE;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &info, nullptr, &handle), "vkCreatePipelineLayout library");
         return device.layouts.emplace(key, handle).first->second;
     };
-    const bool split = (layout.flags & VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT) != 0;
     const auto fullLayout = layoutFor(keys.layout, std::nullopt);
-    const std::array<VkPipelineLayout, 4> partLayouts{VK_NULL_HANDLE, split ? layoutFor(keys.preRasterizationLayout, 0u) : fullLayout, split ? layoutFor(keys.fragmentLayout, 1u) : fullLayout, VK_NULL_HANDLE};
+    const std::array<VkPipelineLayout, 4> partLayouts{VK_NULL_HANDLE, split ? layoutFor(keys.preRasterizationLayout, keys.preRasterizationSets) : fullLayout, split ? layoutFor(keys.fragmentLayout, keys.fragmentSets) : fullLayout, VK_NULL_HANDLE};
     std::vector<VkPipelineShaderStageCreateInfo> preRasterization;
     const VkPipelineShaderStageCreateInfo* fragment = nullptr;
     bool mesh = false;
@@ -143,8 +149,16 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     };
     const std::array<const Key*, 4> partKeys{&keys.vertexInput, &keys.preRasterization, &keys.fragmentShader, &keys.fragmentOutput};
     const Key none;
-    const std::array<const Key*, 4> contextKeys{&none, &keys.preRasterizationLayout, &keys.fragmentLayout, &keys.renderPass};
-    const VkPipelineRenderingCreateInfoKHR shaderRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    VkPipelineRenderingCreateInfoKHR shaderRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    shaderRendering.viewMask = rendering.viewMask;
+    shaderRendering.depthAttachmentFormat = rendering.depthAttachmentFormat;
+    shaderRendering.stencilAttachmentFormat = rendering.stencilAttachmentFormat;
+    const std::array<std::uint32_t, 3> attachments{shaderRendering.viewMask, static_cast<std::uint32_t>(shaderRendering.depthAttachmentFormat), static_cast<std::uint32_t>(shaderRendering.stencilAttachmentFormat)};
+    const auto attachmentBytes = std::as_bytes(std::span(attachments));
+    const Key attachmentKey(attachmentBytes.begin(), attachmentBytes.end());
+    const auto preRasterizationContext = Combined(keys.preRasterizationLayout, attachmentKey);
+    const auto fragmentContext = Combined(keys.fragmentLayout, attachmentKey);
+    const std::array<const Key*, 4> contextKeys{&none, &preRasterizationContext, &fragmentContext, &keys.renderPass};
     VkPipelineDepthStencilStateCreateInfo dynamicDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;
@@ -200,6 +214,15 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             continue;
         }
         cache.emplace(key, handle);
+        if (optimize) {
+            for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
+                for (auto& module : modules) {
+                    if (module == VK_NULL_HANDLE || module != create.pStages[stage].module) continue;
+                    device.modules.push_back(module);
+                    module = VK_NULL_HANDLE;
+                }
+            }
+        }
         ++device.counters.built[part];
         libraries.push_back(handle);
     }
@@ -264,6 +287,7 @@ void ClearPipelineLibraries(VkDevice device) {
         for (const auto& [key, handle] : part) libraries.destroyPipeline(device, handle, nullptr);
     }
     for (const auto& [key, handle] : libraries.layouts) libraries.destroyLayout(device, handle, nullptr);
+    for (const auto module : libraries.modules) libraries.destroyModule(device, module, nullptr);
     store.devices.erase(found);
 }
 

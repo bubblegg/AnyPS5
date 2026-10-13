@@ -9,12 +9,16 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
 int APS5_VABI sceAmprCommandBufferConstructor(Apr::CommandBufferObject*);
@@ -78,6 +82,7 @@ std::uint64_t APS5_VABI sceAmprMeasureCommandSizeReadFileScatter(void*, std::uin
 std::uint64_t APS5_VABI sceAmprMeasureCommandSizeReadFileGatherScatter(void*, std::uint64_t, std::uint64_t);
 std::uint64_t APS5_VABI sceAmprMeasureCommandSizeResetGatherScatterState();
 std::size_t APS5_VABI sceKernelGetDirectMemorySize();
+int APS5_VABI sceAmprAmmGetUsageStatsData(void*);
 int APS5_VABI sceAmprAmmCommandBufferConstructor(Apr::CommandBufferObject*);
 int APS5_VABI sceAmprAmmCommandBufferMap(Apr::CommandBufferObject*, std::uint64_t, std::uint64_t, std::int32_t, std::int32_t);
 int APS5_VABI sceAmprAmmCommandBufferMapWithGpuMaskId(Apr::CommandBufferObject*, std::uint64_t, std::uint64_t, std::int32_t, std::int32_t, std::uint8_t);
@@ -257,6 +262,36 @@ void TestFullBuffer() {
     Require(sceAmprCommandBufferConstructor(&unbound) == 0);
     Require(sceAmprCommandBufferPushMarker(&unbound, marker) == bufferFull);
     Require(sceAmprCommandBufferPopMarker(&unbound) == bufferFull);
+}
+
+void TestOffsetPastBuffer() {
+    constexpr std::array<std::uint32_t, 3> invalidOffsets{33u, 64u, 0xffffffffu};
+    for (const auto offset : invalidOffsets) {
+        Recorder recorder(32);
+        recorder.memory.fill(0xA5);
+        recorder.buffer.offset = offset;
+        recorder.buffer.numCommands = 7;
+        const auto before = recorder.buffer;
+        const auto memory = recorder.memory;
+        const auto rejected = [&](const auto& record) {
+            bool threw = false;
+            try {
+                record();
+            } catch (const std::invalid_argument&) {
+                threw = true;
+            }
+            Require(threw);
+            Require(recorder.memory == memory);
+            Require(recorder.buffer.base == before.base && recorder.buffer.size == before.size);
+            Require(recorder.buffer.offset == before.offset && recorder.buffer.numCommands == before.numCommands);
+            Require(recorder.buffer.type == before.type && recorder.buffer.recording == before.recording);
+        };
+        rejected([&] { sceAmprCommandBufferPopMarker(&recorder.buffer); });
+        rejected([&] { sceAmprCommandBufferNop(&recorder.buffer, 1); });
+        rejected([&] { sceAmprCommandBufferPushMarker(&recorder.buffer, "bounds"); });
+        rejected([&] { sceAmprAmmCommandBufferMap(&recorder.buffer, 0x4000, 0x4000, 0, 3); });
+        rejected([&] { sceAmprAmmCommandBufferMapAsPrt(&recorder.buffer, 0x4000, 0x4000); });
+    }
 }
 
 void TestSubmission() {
@@ -671,6 +706,31 @@ void TestMalformedCommandSizes() {
     Require(rejected);
 }
 
+void TestResolveSymbolicLink() {
+    const std::filesystem::path directory = "ampr_resolve_links";
+    std::filesystem::remove_all(directory);
+    Require(std::filesystem::create_directory(directory));
+    { std::ofstream file(directory / "target.bin", std::ios::binary); file << "linked data"; }
+    const auto link = directory / "link.bin";
+#ifdef _WIN32
+    if (CreateSymbolicLinkW(link.c_str(), L"target.bin", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) == 0) {
+        Require(GetLastError() == ERROR_PRIVILEGE_NOT_HELD);
+        std::fprintf(stderr, "APR symbolic link check skipped: creating symbolic links needs Developer Mode or administrator rights\n");
+        std::filesystem::remove_all(directory);
+        return;
+    }
+#else
+    std::filesystem::create_symlink("target.bin", link);
+#endif
+    const std::string linkPath = link.generic_string();
+    const char* path = linkPath.c_str();
+    std::uint32_t id = 0;
+    std::uint64_t size = 0;
+    std::uint32_t failed = 0;
+    Require(sceKernelAprResolveFilepathsToIdsAndFileSizes(&path, 1, &id, &size, &failed) == 0 && size == 11);
+    std::filesystem::remove_all(directory);
+}
+
 void TestGatherScatter() {
     const char* path = "ampr_gather_scatter.bin";
     {
@@ -792,6 +852,24 @@ void TestAmmRangesAboveHintedMaps() {
         Require(sceKernelMunmap(mapped, page) == 0);
     }
     Require(sceKernelMunmap(span, page) == 0);
+}
+
+void TestAmmUsageStats() {
+    std::array<std::uint64_t, 4> stats{};
+    Require(sceAmprAmmGetUsageStatsData(nullptr) == static_cast<int>(0x80020016));
+    stats[0] = 0x19;
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == static_cast<int>(0x80020016));
+    stats = {0x18, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == 0);
+    Require(stats[0] == 0x18);
+    Require((stats[1] & 0xffffu) == 512u && (stats[1] >> 16u) == 0u);
+    Require((stats[2] & 0xffffffffu) == 7u && (stats[2] >> 32u) == 0u);
+    stats = {0x8, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == 0);
+    Require(stats[0] == 0x8 && stats[1] == 0xdeadbeef && stats[2] == 0xdeadbeef);
+    stats = {0x0, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == 0);
+    Require(stats[0] == 0 && stats[1] == 0xdeadbeef);
 }
 
 void TestAmm() {
@@ -1215,6 +1293,7 @@ int main() {
     TestRecording(std::string(300, 'a'));
     TestRejectedArguments();
     TestFullBuffer();
+    TestOffsetPastBuffer();
     TestSubmission();
     TestKernelEventQueue();
     TestWaits();
@@ -1230,8 +1309,10 @@ int main() {
     TestZeroFilledBuffer();
     TestResolveFailures();
     TestMalformedCommandSizes();
+    TestResolveSymbolicLink();
     TestGatherScatter();
     TestAmmRangesAboveHintedMaps();
+    TestAmmUsageStats();
     TestAmm();
     TestAmmRemapAndProtect();
     TestAmmPrt();

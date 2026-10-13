@@ -77,7 +77,7 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
             const HANDLE find = FindFirstFileExW((path.parent_path() / L"*").c_str(), FindExInfoBasic, &entry, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
             if (find != INVALID_HANDLE_VALUE) {
                 do {
-                    if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+                    if ((entry.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) continue;
                     const auto size = (static_cast<std::uint64_t>(entry.nFileSizeHigh) << 32u) | entry.nFileSizeLow;
                     sizes.emplace(_foldCase(std::filesystem::path(entry.cFileName).string()), size);
                 } while (FindNextFileW(find, &entry));
@@ -101,8 +101,11 @@ bool _fileSize(const std::filesystem::path& path, std::uint64_t& bytes) {
     }
     // Not in the listing (created since, or an unusual name): ask the file system directly.
     std::error_code error;
-    bytes = std::filesystem::file_size(path, error);
-    return !error;
+    if (!std::filesystem::is_regular_file(path, error)) return false;
+    FileStat stat{};
+    File::FillFileStat(path, &stat);
+    bytes = static_cast<std::uint64_t>(stat.st_size);
+    return true;
 }
 
 int _fail(int guestErrno) {

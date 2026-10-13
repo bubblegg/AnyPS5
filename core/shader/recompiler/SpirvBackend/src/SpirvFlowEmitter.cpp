@@ -132,7 +132,7 @@ bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
 
 std::uint32_t EmitWaveAny(SpirvEmitterState& state, std::uint32_t predicate) {
     const auto ballot = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), ballot, ConstantU32(state, spv::ScopeSubgroup), predicate);
+    EmitSubgroupBallot(state, ballot, predicate);
     const auto wave = EmitWaveBallot(state, ballot);
     const auto low = state.module.AllocateId();
     const auto high = state.module.AllocateId();
@@ -216,6 +216,11 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
                 const std::string where = resolved->Parent() == nullptr ? std::string("no block") : "block " + std::to_string(resolved->Parent()->Id());
                 const std::string message = "branch condition " + std::string(IrOpcodeName(resolved->Opcode())) + " of block " + std::to_string(info.id) + " (defined in " + where + ") was not emitted before the branch";
                 ctx.Fail(message.c_str());
+            }
+            if (ctx.Label(trueBlock) == ctx.Label(falseBlock)) {
+                if (term.loopHeader) emitMerge();
+                state.module.AddFunction(spv::OpBranch, ctx.Label(trueBlock));
+                return;
             }
             auto condition = EmitBranchCondition(ctx, info);
             if (state.loopGuardLimit != 0 && term.trueBlock != term.falseBlock) {

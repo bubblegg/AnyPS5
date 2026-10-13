@@ -477,10 +477,12 @@ void Registration(bool indirect) {
     Shader copy = header.shader;
     copy.user_data = reinterpret_cast<ShaderUserData*>(&copy);
     AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {});
-    alignas(Shader) std::array<std::byte, sizeof(Shader)> padded{};
-    std::memcpy(padded.data(), &copy, sizeof(Shader));
+    alignas(Shader) std::array<std::byte, sizeof(Shader) + 4> padded{};
+    auto* unaligned = padded.data() + 4;
+    Require(reinterpret_cast<std::uintptr_t>(unaligned) % alignof(Shader) != 0, "shader ABI test header is unexpectedly aligned");
+    std::memcpy(unaligned, &copy, sizeof(Shader));
     padded.back() = std::byte{0x7d};
-    AgcDriverResolveShaderAbi_nid_postfix(reinterpret_cast<Shader*>(padded.data()), {}, {});
+    AgcDriverResolveShaderAbi_nid_postfix(reinterpret_cast<Shader*>(unaligned), {}, {});
     copy.target ^= 1u;
     ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {}); }, "replaced shader header");
     header.registers[1].value |= 0x100u;

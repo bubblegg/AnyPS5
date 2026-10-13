@@ -56,6 +56,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(vertex.fetchAttribReg);
                 mix(vertex.fetchBufferReg);
                 mix(vertex.fetchEmbedded);
+                mix(vertex.paClVsOutCntl);
                 for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) {
                     for (const auto field : vertex.resources[r].fields) mix(field);
                     const auto& destination = vertex.resourcesDst[r];
@@ -78,6 +79,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             for (const auto value : pixel.targetExportPacking) mix(static_cast<std::uint64_t>(value));
             mix(pixel.dualSourceBlend);
             mix(pixel.alphaToCoverage);
+            mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);

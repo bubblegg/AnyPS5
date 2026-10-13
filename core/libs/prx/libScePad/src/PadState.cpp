@@ -30,6 +30,8 @@ namespace {
     std::uint64_t lastFuseTime = 0;
     float biasIntegral[3] = {0.0f, 0.0f, 0.0f};
     bool tiltCorrection = true;
+    bool angularVelocityDeadband = false;
+    constexpr float kAngularVelocityDeadband = 0.017453292f;
     std::uint8_t nextTouchId = 0;
     bool prevTouchActive[2] = {false, false};
     std::uint8_t touchIds[2] = {0, 0};
@@ -126,7 +128,12 @@ PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uin
     const bool live = state.hasMotion && output.motionEnabled;
     const std::array<float, 3> rest{0.0f, 9.80665f, 0.0f};
     const std::array<float, 3>& accel = live ? state.accel : rest;
-    const std::array<float, 3> gyro = live ? state.gyro : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+    std::array<float, 3> gyro = live ? state.gyro : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+    if (angularVelocityDeadband) {
+        for (float& axis : gyro) {
+            if (axis < kAngularVelocityDeadband && axis > -kAngularVelocityDeadband) axis = 0.0f;
+        }
+    }
     if (live) {
         float dt = lastFuseTime != 0 && now > lastFuseTime ? static_cast<float>(now - lastFuseTime) * 1e-6f : 0.0f;
         dt = std::min(dt, 0.1f);
@@ -314,6 +321,11 @@ void Pad::SetTiltCorrection(bool enabled) {
     std::lock_guard lock(stateMutex);
     tiltCorrection = enabled;
     biasIntegral[0] = biasIntegral[1] = biasIntegral[2] = 0.0f;
+}
+
+void Pad::SetAngularVelocityDeadband(bool enabled) {
+    std::lock_guard lock(stateMutex);
+    angularVelocityDeadband = enabled;
 }
 
 void Pad::SetMotionEnabled(bool enabled) {

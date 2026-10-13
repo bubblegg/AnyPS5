@@ -66,7 +66,7 @@ static int RenamePath_nid_no_patch(const std::filesystem::path& source, const st
     return error ? FilesystemError(error) : 0;
 }
 
-extern "C" int APS5_VABI rename_nid_postfix(const char* from, const char* to) {
+extern "C" int RenameGuestPath_nid_no_patch(const char* from, const char* to) {
     if (!from || !to) { errno = 14; return -1; }
     if (!*from || !*to) { errno = 2; return -1; }
     try {
@@ -82,4 +82,8 @@ extern "C" int APS5_VABI rename_nid_postfix(const char* from, const char* to) {
         errno = FilesystemError(error.code());
         return -1;
     }
+}
+
+extern "C" int APS5_VABI rename_nid_postfix(const char* from, const char* to) {
+    return RenameGuestPath_nid_no_patch(from, to);
 }

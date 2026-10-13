@@ -113,6 +113,24 @@ static void CheckTiltCorrection(int handle) {
     PadPublishInput_nid_postfix(PadInputState{});
 }
 
+static void CheckAngularVelocityDeadband(int handle) {
+    PadInputState moving;
+    moving.hasMotion = true;
+    moving.accel = {0.0f, 9.80665f, 0.0f};
+    moving.gyro = {0.01f, 0.0175f, -0.017f};
+    PadPublishInput_nid_postfix(moving);
+    PadData data{};
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require(data.angular_velocity_x == 0.01f && data.angular_velocity_y == 0.0175f && data.angular_velocity_z == -0.017f);
+    Require(scePadSetAngularVelocityDeadbandState(handle, true) == PAD_OK);
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require(data.angular_velocity_x == 0.0f && data.angular_velocity_y == 0.0175f && data.angular_velocity_z == 0.0f);
+    Require(scePadSetAngularVelocityDeadbandState(handle, false) == PAD_OK);
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require(data.angular_velocity_x == 0.01f && data.angular_velocity_z == -0.017f);
+    PadPublishInput_nid_postfix(PadInputState{});
+}
+
 static void CheckTouchContact() {
     PadInputState touch;
     touch.buttons = static_cast<std::uint32_t>(Pad::PadButton::TouchPad);
@@ -253,6 +271,7 @@ int main() {
     Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
     Require(scePadGetHandle(user, 0, 0) == handle);
     CheckTiltCorrection(handle);
+    CheckAngularVelocityDeadband(handle);
     CheckTouchContact();
     CheckPartialTrigger();
     CheckReadQueue(handle);
@@ -272,6 +291,7 @@ int main() {
     Require(scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(true) == 0);
     Require(scePadSetAngularVelocityDeadbandState(handle, false) == 0);
     Require(scePadSetAngularVelocityDeadbandState(handle + 1, false) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadSetAngularVelocityDeadbandState(handle + 1, true) == PAD_ERROR_INVALID_HANDLE);
     Require(scePadSetAngularVelocityBiasCorrectionState(handle, false) == PAD_OK);
     Require(scePadSetAngularVelocityBiasCorrectionState(handle + 1, false) == PAD_ERROR_INVALID_HANDLE);
 }

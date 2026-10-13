@@ -87,6 +87,8 @@ namespace {
 // The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
 // addresses, comma separated, or "all"> keeps the listed programs at one guest lane per invocation.
 std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
+    const bool vertexStage = request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Local;
+    if (vertexStage && !request.target.vertexSubgroups) return 1u;
     static const std::string list = [] { const char* text = std::getenv("APS5_SINGLE_LANE"); return text ? std::string(text) : std::string(); }();
     if (!list.empty()) {
         if (list == "all") return 64u;
@@ -225,6 +227,19 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         }
 
         if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
+            const bool liveAncillary = std::ranges::any_of(program.Blocks(), [](const auto& block) {
+                return std::ranges::any_of(block->Instructions(), [](const IrValue* value) {
+                    return value->Opcode() == IrOpcode::GetBuiltin && value->HasUses() && value->Argument(0)->Resolve()->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::PackedAncillary);
+                });
+            });
+            if (liveAncillary) {
+                constantFolder.Fold(program);
+                ResolveControlFlowIdentities(program);
+                deadCodeEliminator.RemoveIdentities(program);
+            }
+            deadCodeEliminator.Eliminate(program);
+        }
+        if (constantFolder.ComposePackedAncillary(program)) {
             deadCodeEliminator.Eliminate(program);
         }
     };
@@ -419,7 +434,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     SpirvTargetOptions targetOptions {};
     targetOptions.vulkanVersion = request.target.vulkanVersion;
     targetOptions.spirvVersion = request.target.spirvVersion;
-    targetOptions.subgroupSize = request.target.subgroupSize;
+    targetOptions.subgroupSize = HostSubgroupSize(request) == 1u ? 1u : request.target.subgroupSize;
     targetOptions.bdaAbiVersion = request.target.bdaAbiVersion;
     targetOptions.supportedCapabilities = request.target.supportedCapabilities;
     targetOptions.supportedExtensions = request.target.supportedExtensions;
@@ -808,6 +823,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (request.context.pixel) {
         for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
+        if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
     }
     if (recycled != nullptr) {
         result.vertexAttributes = std::move(recycled->vertexAttributes);
@@ -863,6 +879,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (request.context.pixel) {
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
+                if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
             }
             if (!artifact.vertexInputPatches.empty()) {
                 for (const auto& input : result.vertexInputs) {
@@ -1072,6 +1089,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
+        mix(static_cast<std::uint64_t>(request.context.pixel->rasterPrimitive));
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;
