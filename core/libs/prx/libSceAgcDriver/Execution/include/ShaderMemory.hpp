@@ -90,6 +90,8 @@ private:
         std::bitset<PageWords> read;
         std::bitset<PageWords> recent;
         bool wordwise = false;
+        // Fetched whole (every word valid): the range check needs no scan of `valid`.
+        bool whole = false;
     };
     // Pages come from a pool and go back to it: a draw captures a handful, the preparing thread
     // made each (4.5 KiB, zeroed) and the recording thread freed it with the draw.
@@ -114,6 +116,11 @@ private:
     // rest are kept for the next one.
     std::vector<std::pair<std::uint64_t, PagePointer>> pages;
     std::size_t pagesUsed = 0;
+    // The page the last read or range check found (a walk reads word after word of one page).
+    std::uint64_t lastBase = ~std::uint64_t{0};
+    Page* lastPage = nullptr;
+    // The lowest start and the highest end of the initial regions: reads outside skip their lookup.
+    std::uint64_t initialLow = 0, initialHigh = 0;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
