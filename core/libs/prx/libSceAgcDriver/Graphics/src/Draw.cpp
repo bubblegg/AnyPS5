@@ -1234,11 +1234,20 @@ std::shared_ptr<ShaderResources> memoResources(const Context& context, std::span
     if (memo.refresh || key.size() < 5) return nullptr;
     const auto device = reinterpret_cast<std::uint64_t>(context.device);
     if (key[0] != 0xffffffffu || key[1] != static_cast<std::uint32_t>(device) || key[2] != static_cast<std::uint32_t>(device >> 32u) || key[3] != shaders.size()) return nullptr;
+    // APS5_NO_KEY_STAMPS=1 compares every stage's whole part of the key, as before.
+    static const bool keyStamps = std::getenv("APS5_NO_KEY_STAMPS") == nullptr;
+    if (memo.keyStamps.size() != shaders.size()) memo.keyStamps.assign(shaders.size(), {});
     std::size_t at = 4;
-    for (const auto& shader : shaders) {
-        if (at >= key.size()) return nullptr;
+    for (std::size_t index = 0; index < shaders.size(); ++index) {
+        const auto& shader = shaders[index];
+        if (at >= key.size() || shader.program == nullptr) return nullptr;
         const std::size_t words = key[at++];
-        if (words > key.size() - at || !ShaderResources::ContentKeyIs(shader, true, MovableBuffers(), key.subspan(at, words))) return nullptr;
+        if (words > key.size() - at) return nullptr;
+        const DrawShapeMemo::KeyStamp stamp{shader.program->bindingPlan.Plan(), shader.program->PipelineVariantId(), static_cast<std::uint32_t>(shader.stage)};
+        auto& known = memo.keyStamps[index];
+        const bool fixedKnown = keyStamps && stamp.plan != nullptr && known.plan == stamp.plan && known.variant == stamp.variant && known.stage == stamp.stage;
+        if (!ShaderResources::ContentKeyIs(shader, true, MovableBuffers(), key.subspan(at, words), fixedKnown)) return nullptr;
+        known = stamp;
         at += words;
     }
     if (at + 1 != key.size() || key[at] != colorAttachments) return nullptr;
@@ -1254,9 +1263,14 @@ std::shared_ptr<ShaderResources> memoResources(const Context& context, std::span
     return resources;
 }
 
-void rememberResources(DrawShapeMemo& memo, const ResourceCache::Key& key, const std::shared_ptr<ShaderResources>& resources) {
+void rememberResources(DrawShapeMemo& memo, std::span<const CompiledShader> shaders, const ResourceCache::Key& key, const std::shared_ptr<ShaderResources>& resources) {
     if (&memo.resourceKey != &key) memo.resourceKey = key;
     memo.resources = resources;
+    memo.keyStamps.resize(shaders.size());
+    for (std::size_t index = 0; index < shaders.size(); ++index) {
+        const auto* program = shaders[index].program;
+        memo.keyStamps[index] = program != nullptr ? DrawShapeMemo::KeyStamp{program->bindingPlan.Plan(), program->PipelineVariantId(), static_cast<std::uint32_t>(shaders[index].stage)} : DrawShapeMemo::KeyStamp{};
+    }
 }
 
 bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
@@ -1629,7 +1643,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             timer.phase(PhaseMoved);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
-                if (memo != nullptr && trimKey && !resolved.remembered) rememberResources(*memo, resolved.contentKey, cached);
+                if (memo != nullptr && trimKey && !resolved.remembered) rememberResources(*memo, shaders, resolved.contentKey, cached);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -2477,7 +2491,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // never reusable).
     if (cacheable && built != nullptr && recorded && resources->Reusable()) {
         SharedResourceCache().Insert(contentKey, resources);
-        if (memo != nullptr && resources->InResourceCache()) rememberResources(*memo, contentKey, resources);
+        if (memo != nullptr && resources->InResourceCache()) rememberResources(*memo, shaders, contentKey, resources);
     }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout

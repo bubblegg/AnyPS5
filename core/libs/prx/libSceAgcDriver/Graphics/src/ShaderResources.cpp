@@ -1809,16 +1809,27 @@ void ShaderResources::reportDescriptorCaches() const {
     AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
-template<typename TVisitor>
-void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
+// SkipFixed: the shader's fixed words (all but the guest descriptors and their sizes, which its
+// binding plan decides, see ShaderRecompiler::BindingPlanStamp) are known to be the key's, and
+// `skip` passes over them by count.
+template<bool SkipFixed, typename TVisitor, typename TSkip>
+void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit, const TSkip& skip) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
-    visit(dataWords ? 1u : 0u);
-    visit(static_cast<std::uint32_t>(shader.stage));
-    visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
-    visit(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
-    visit(static_cast<std::uint32_t>(program.bindings.size()));
+    const auto fixed = [&](std::uint32_t word) {
+        if constexpr (SkipFixed) skip(1u);
+        else visit(word);
+    };
+    fixed(dataWords ? 1u : 0u);
+    fixed(static_cast<std::uint32_t>(shader.stage));
+    fixed(static_cast<std::uint32_t>(program.PipelineVariantId()));
+    fixed(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
+    fixed(static_cast<std::uint32_t>(program.bindings.size()));
     const auto packBits = [&](const std::vector<bool>& bits) {
+        if constexpr (SkipFixed) {
+            skip(1u + (bits.size() + 31u) / 32u);
+            return;
+        }
         visit(static_cast<std::uint32_t>(bits.size()));
         std::uint32_t word = 0;
         for (std::size_t i = 0; i < bits.size(); ++i) {
@@ -1830,7 +1841,8 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         }
     };
     for (const auto& binding : program.bindings) {
-        for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
+        for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u}) fixed(word);
+        visit(static_cast<std::uint32_t>(binding.guestDescriptor.size()));
         if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
@@ -1853,8 +1865,12 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         // Read-only elements are bound without a write set: an object built for one written set
         // must not serve a build with another (the variant implies it, this makes it explicit).
         packBits(binding.bufferWritten);
-        visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
-        for (const auto sampler : binding.imageSamplers) visit(sampler);
+        if constexpr (SkipFixed) {
+            skip(1u + binding.imageSamplers.size());
+        } else {
+            visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
+            for (const auto sampler : binding.imageSamplers) visit(sampler);
+        }
     }
 }
 
@@ -1862,27 +1878,29 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
     Require(shader.program != nullptr, "missing compiled shader");
     std::vector<std::uint32_t> key;
     key.reserve(8u + shader.program->bindings.size() * 12u);
-    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
+    VisitContentKey<false>(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); }, [](std::size_t) {});
     return key;
 }
 
-bool ShaderResources::ContentKeyIs(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> key) {
+bool ShaderResources::ContentKeyIs(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> key, bool fixedKnown) {
     std::size_t cursor = 0;
     bool equal = true;
-    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) {
+    const auto compare = [&](std::uint32_t word) {
         equal &= cursor < key.size() && key[cursor] == word;
         ++cursor;
-    });
+    };
+    if (fixedKnown) VisitContentKey<true>(shader, dataWords, movableBuffers, compare, [&](std::size_t words) { cursor += words; });
+    else VisitContentKey<false>(shader, dataWords, movableBuffers, compare, [](std::size_t) {});
     return equal && cursor == key.size();
 }
 
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
     std::size_t cursor = 0;
     bool equal = true;
-    VisitContentKey(shader, false, true, [&](std::uint32_t word) {
+    VisitContentKey<false>(shader, false, true, [&](std::uint32_t word) {
         equal &= cursor < key.size() && key[cursor] == word;
         ++cursor;
-    });
+    }, [](std::size_t) {});
     return equal && cursor == key.size();
 }
 

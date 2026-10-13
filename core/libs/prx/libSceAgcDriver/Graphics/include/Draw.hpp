@@ -55,6 +55,15 @@ struct DrawShapeMemo {
     // template while the cache still holds it, and proves it current as after a lookup.
     ResourceCache::Key resourceKey;
     std::weak_ptr<ShaderResources> resources;
+    // Per stage, the binding plan, variant and stage of a shader whose part of `resourceKey` was
+    // proved equal (or that the key was built from): a stage with the same three compares only its
+    // guest descriptors against the key (ShaderResources::ContentKeyIs's `fixedKnown`).
+    struct KeyStamp {
+        const void* plan = nullptr;
+        std::uint64_t variant = 0;
+        std::uint32_t stage = 0;
+    };
+    std::vector<KeyStamp> keyStamps;
     // The resident image of each color attachment of the shape's last draw and the target it was
     // looked up for: a draw with the same target takes the image while the storage cache still holds
     // it for its surface, and refreshes it as the lookup would (as DrawWithRecipe does).

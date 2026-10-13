@@ -926,6 +926,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
+    if (artifact.variantId != 0) result.bindingPlan = BindingPlanStamp(bindingPlan);
     const auto& layout = variant.bindings.layout;
     if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {
         const auto first = layout.RuntimeStateDword() + RuntimeAbi::StateVertexSelectors;

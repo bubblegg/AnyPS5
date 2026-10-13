@@ -517,9 +517,33 @@ struct ShaderInvocation {
     std::uint32_t poisonedSrtReads = 0;
 };
 
+// The prepared binding plan a result's bindings were populated from (plans live as long as the
+// process): every field of those bindings but the guest descriptors is the plan's. A copy does not
+// carry it, since a copy may be changed; a move does.
+class BindingPlanStamp {
+public:
+    BindingPlanStamp() = default;
+    explicit BindingPlanStamp(const void* plan) : plan(plan) {}
+    BindingPlanStamp(const BindingPlanStamp&) {}
+    BindingPlanStamp(BindingPlanStamp&& other) noexcept : plan(std::exchange(other.plan, nullptr)) {}
+    BindingPlanStamp& operator=(const BindingPlanStamp& other) {
+        if (this != &other) plan = nullptr;
+        return *this;
+    }
+    BindingPlanStamp& operator=(BindingPlanStamp&& other) noexcept {
+        plan = std::exchange(other.plan, nullptr);
+        return *this;
+    }
+    [[nodiscard]] const void* Plan() const { return plan; }
+
+private:
+    const void* plan = nullptr;
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
+    BindingPlanStamp bindingPlan;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
 };
 
