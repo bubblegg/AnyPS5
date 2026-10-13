@@ -324,6 +324,20 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
     return true;
 }
 
+bool ShaderMemory::StillHolds(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    std::size_t next = 0;
+    for (const auto& [begin, end] : runs) {
+        if (end <= begin || begin % sizeof(std::uint32_t) != 0 || (end - begin) % sizeof(std::uint32_t) != 0 || (end - begin) / sizeof(std::uint32_t) > words.size() - next) return false;
+        if (!accessible(this, begin, end - begin)) return false;
+        for (auto address = begin; address < end; address += sizeof(std::uint32_t)) {
+            std::uint32_t value = 0;
+            if (!read(this, address, &value) || value != words[next++]) return false;
+        }
+    }
+    return next == words.size();
+}
+
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
     auto& totals = CaptureTotals();
     return {totals.wordsKnown.load(std::memory_order_relaxed), totals.wordsKnownVerified.load(std::memory_order_relaxed), totals.wordsKnownMismatches.load(std::memory_order_relaxed)};

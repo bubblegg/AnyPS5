@@ -5,7 +5,10 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
@@ -68,10 +71,13 @@ ShaderRecompiler::PreparedShaderInvocation ShapeInvocation(ShapeStage& recall, c
         if (!differs) return invocation;
         recall.handle = resolved.Handle();
         recall.memo = ShaderRecompiler::MakeStageMemo();
+        recall.replayResult.reset();
         return resolved;
     }
     auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
     counts.resolved.fetch_add(1, std::memory_order_relaxed);
+    // The stage is resolved from something else: its replay record is another stage's.
+    recall.replayResult.reset();
     recall.snapshot = program.snapshot;
     recall.codeOffset = program.codeOffset;
     recall.stage = request.shader.stage;
@@ -111,6 +117,44 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
+    // Stage replay (see ShapeStage): a fragment stage's result depends on its prepared shader (which
+    // ShapeInvocation just matched with the record's), its user words and the dwords its capture
+    // reads, so with all three unchanged the record's result is this draw's.
+    static const bool stageReplay = std::getenv("APS5_NO_STAGE_REPLAY") == nullptr;
+    static const std::uint64_t verifyReplayEvery = [] {
+        const char* text = std::getenv("APS5_VERIFY_STAGE_REPLAY");
+        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
+    }();
+    const bool replayable = stageReplay && recall != nullptr && program.binary.stage == Stage::Fragment && dumpTarget == 0 && dumpSlot1 == 0 && !traceCapSync();
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> replayed;
+    if (replayable && recall->replayResult != nullptr) {
+        auto& counts = StageMemoCounters();
+        if (recall->replayUser.size() != program.userData.size() || !std::equal(program.userData.begin(), program.userData.end(), recall->replayUser.begin())) {
+            counts.replayOtherWords.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const SampledReadScope sampling(evidenceReads);
+            if (shaderMemory.StillHolds(recall->replayRuns, recall->replayWords)) replayed = recall->replayResult;
+            else counts.replayOtherMemory.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    bool verifyReplay = false;
+    if (replayed != nullptr) {
+        const auto replays = StageMemoCounters().replayed.fetch_add(1, std::memory_order_relaxed);
+        verifyReplay = verifyReplayEvery != 0u && replays % verifyReplayEvery == 0u;
+        if (!verifyReplay) {
+            shaderMemory.TakeRecentRegions(stageCapture.regions);
+            recompiled[i] = true;
+            shaderMemory.Regions(memory);
+            if (drawHit) {
+                for (std::size_t j = 0; j < programs.size(); ++j) {
+                    if (matched[j] != nullptr && !recompiled[j]) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
+                }
+            }
+            stageCapture.compiled = replayed;
+            phaseTiming.Phase(DrawRowCapture);
+            return replayed;
+        }
+    }
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
@@ -159,6 +203,38 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     timing.Mark("capture_resources");
     stageCapture.compiled = invocation.Materialize(*capture, recall != nullptr ? recall->memo.get() : nullptr);
     timing.Mark("materialize");
+    if (replayable) {
+        const auto readsInto = [&](std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::vector<std::uint32_t>& words) {
+            runs.clear();
+            words.clear();
+            for (const auto& region : stageCapture.regions) {
+                runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                const auto count = region.bytes.size() / sizeof(std::uint32_t);
+                const auto offset = words.size();
+                words.resize(offset + count);
+                std::memcpy(words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
+            }
+        };
+        if (verifyReplay) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+            std::vector<std::uint32_t> words;
+            readsInto(runs, words);
+            const auto& fresh = *stageCapture.compiled;
+            const auto& kept = *replayed;
+            const char* difference = fresh.PipelineVariantId() != kept.PipelineVariantId() ? "variant" : fresh.spirv.data() != kept.spirv.data() ? "module" : fresh.bindings != kept.bindings ? "bindings" : fresh.pushConstants != kept.pushConstants ? "push constants" : fresh.vertexAttributes.size() != kept.vertexAttributes.size() ? "vertex attributes" : fresh.poisonedSrtReads != kept.poisonedSrtReads || fresh.workgroupMemoryDwords != kept.workgroupMemoryDwords ? "counts" : runs != recall->replayRuns || words != recall->replayWords ? "capture reads" : nullptr;
+            static std::atomic<std::uint64_t> compared{0}, differences{0};
+            const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (difference != nullptr && differences.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[stage-replay] verify: program 0x%llx: a replayed result differs in its %s from the one captured now\n", static_cast<unsigned long long>(program.binary.codeAddress), difference);
+            if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[stage-replay] verify: %llu replayed stages captured again, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
+        }
+        if (CacheableResult(*stageCapture.compiled)) {
+            recall->replayResult = stageCapture.compiled;
+            recall->replayUser.assign(program.userData.begin(), program.userData.end());
+            readsInto(recall->replayRuns, recall->replayWords);
+        } else {
+            recall->replayResult.reset();
+        }
+    }
     // Shared, not copied: a copy allocated every descriptor binding's vectors again for every stage
     // of every draw (after boykopovar/AnyPS5#1202).
     phaseTiming.Phase(DrawRowRecompile);

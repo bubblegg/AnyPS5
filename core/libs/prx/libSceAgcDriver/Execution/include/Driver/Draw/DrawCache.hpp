@@ -108,6 +108,15 @@ struct ShapeStage {
     std::unique_ptr<ShaderRecompiler::ShaderVertexStageInfo> vertex;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     std::shared_ptr<ShaderRecompiler::StageMemo> memo;
+    // Stage replay (fragment stages): the result last materialized for the stage, the user words it
+    // was captured with and the dwords its capture read. A draw that gives the stage the same
+    // prepared shader and user words, with those dwords unchanged, takes the result without the
+    // capture and the materialization (APS5_NO_STAGE_REPLAY=1 captures every stage as before;
+    // APS5_VERIFY_STAGE_REPLAY=N captures every Nth replayed stage as well and compares).
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> replayResult;
+    std::vector<std::uint32_t> replayUser;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> replayRuns;
+    std::vector<std::uint32_t> replayWords;
     // APS5_REPLAY_PROBE: the stage of the shape's previous draw (DrawReplayProbe.cpp).
     std::shared_ptr<ReplayProbeStage> probe;
 };
@@ -129,6 +138,9 @@ void ProbeReplay(ShapeStages& shape, const std::vector<DrawProgram>& programs, c
 
 struct StageMemoCounts {
     std::atomic<std::uint64_t> reused{0}, revalidated{0}, resolved{0};
+    // Stage replay: results taken from the shape, and fragment stages that could not (other user
+    // words; the same words over changed memory).
+    std::atomic<std::uint64_t> replayed{0}, replayOtherWords{0}, replayOtherMemory{0};
 };
 StageMemoCounts& StageMemoCounters();
 

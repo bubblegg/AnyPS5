@@ -74,6 +74,11 @@ public:
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
+    // Whether the dwords of `runs` ([begin, end) byte ranges, dword aligned) are still `words`, in
+    // order: read as a capture reads them (pending GPU writes included) and counted among the
+    // regions read, so a capture that would read exactly these dwords need not run. False at the
+    // first dword that differs or cannot be read.
+    [[nodiscard]] bool StillHolds(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words);
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
 
