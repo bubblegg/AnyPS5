@@ -85,6 +85,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (htileClear != 0) Graphics::NoteHtileDepthClear(htileClear);
         if (valueFill) Graphics::NoteMemoryValueFill(*valueFill);
         Graphics::ReportHtileDispatch(address, userData, compute.numThreads);
+        Graphics::ReportKeyWriterDispatch(address, std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]});
         // The first buffer a compute shader is given, as its user data describes it (records times stride).
         if (userData.size() >= 4) Graphics::TraceGuestFill("title dispatch, first buffer", userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u), static_cast<std::size_t>((userData[1] >> 16u) & 0x3fffu) * userData[2], static_cast<std::uint32_t>(address >> 8u));
         // A fill of a depth plane's HTILE from a one-element source buffer (Unity's fast depth clear),

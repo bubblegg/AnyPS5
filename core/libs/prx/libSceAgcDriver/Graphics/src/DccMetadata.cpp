@@ -841,7 +841,23 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
 
 // Measuring aid: the GPU waits WaitForKeyWriters makes, and the pending writes over the keys that
 // caused them (by size and how they lie over the keys), printed every 10 s as [key-writer-sync].
+// The key addresses whose pending writes made WaitForKeyWriters wait, for ReportKeyWriterDispatch.
+struct WaitedKeys {
+    std::mutex mutex;
+    std::set<std::uint64_t> addresses;
+};
+
+WaitedKeys& waitedKeys() {
+    static WaitedKeys keys;
+    return keys;
+}
+
 void noteKeyWriterSync(const Recorder& recorder, std::uint64_t keys, std::size_t count) {
+    {
+        auto& waited = waitedKeys();
+        std::lock_guard lock(waited.mutex);
+        if (waited.addresses.size() < 64) waited.addresses.insert(keys);
+    }
     struct Totals {
         std::uint64_t syncs = 0, writes = 0, exact = 0, covering = 0, inside = 0, partial = 0, filled = 0;
         std::array<std::uint64_t, 6> sizes{};
@@ -902,6 +918,27 @@ void noteKeysAfterSync(std::uint64_t keys, std::size_t count) {
     since = now;
 }
 
+}
+
+void ReportKeyWriterDispatch(std::uint64_t codeAddress, std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+    static std::atomic<unsigned> reports{0};
+    if (reports.load(std::memory_order_relaxed) >= 8 || userData.size() < 2) return;
+    auto& waited = waitedKeys();
+    std::lock_guard lock(waited.mutex);
+    if (waited.addresses.empty()) return;
+    static std::set<std::uint64_t> reported;
+    for (std::size_t i = 0; i + 1 < userData.size(); ++i) {
+        const auto address = userData[i] | (static_cast<std::uint64_t>(userData[i + 1] & 0xffffu) << 32u);
+        if (!waited.addresses.contains(address)) continue;
+        if (!reported.insert(codeAddress).second && reports.load(std::memory_order_relaxed) >= 3) return;
+        if (reports.fetch_add(1) >= 8) return;
+        std::fprintf(stderr, "[key-writer-sync] compute shader 0x%llx (%ux%ux%u threads, %ux%ux%u groups) is given the DCC keys 0x%llx in user data word %zu; user data:", static_cast<unsigned long long>(codeAddress), numThreads[0], numThreads[1], numThreads[2], groups[0], groups[1], groups[2], static_cast<unsigned long long>(address), i);
+        for (const auto word : userData) std::fprintf(stderr, " %08x", word);
+        std::fprintf(stderr, "\n[key-writer-sync]   code (%zu words):", code.size());
+        for (std::size_t word = 0; word < code.size() && word < 48; ++word) std::fprintf(stderr, " %08x", code[word]);
+        std::fprintf(stderr, "\n");
+        return;
+    }
 }
 
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {

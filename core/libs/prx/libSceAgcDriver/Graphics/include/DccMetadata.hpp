@@ -103,6 +103,9 @@ DccKeys ProvedCurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceByt
 void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std::span<std::byte> bytes);
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys);
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes);
+// Measuring aid: reports the first few compute dispatches whose user data names DCC keys that
+// WaitForKeyWriters had to wait for (the title's kernel that writes them), with their code words.
+void ReportKeyWriterDispatch(std::uint64_t codeAddress, std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups);
 
 }
 
