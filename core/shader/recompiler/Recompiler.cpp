@@ -688,7 +688,13 @@ std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t varian
     return entry->module;
 }
 
-std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet, StageMemo* memo = nullptr) {
+// `samePlan`: the caller knows the snapshot gives the key the memo's plan was found by (a capture
+// taken over from the one before with only buffer addresses moved, PreparedShaderInvocation::Recapture).
+std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet, StageMemo* memo = nullptr, bool samePlan = false) {
+    if (samePlan && memo != nullptr && memo->plan != nullptr && memo->plan->done.load(std::memory_order_acquire)) {
+        if (memo->plan->failure) std::rethrow_exception(memo->plan->failure);
+        return memo->plan;
+    }
     struct BindingPlanKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
     key.clear();
@@ -779,7 +785,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
 // `recycled`, when given, is a result nobody else holds any more: its bindings, push constants and
 // vertex attributes are taken over and overwritten, which saves the dozens of small allocations a
 // result of the same shader would make for them.
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, RecompileResult* recycled = nullptr, StageMemo* memo = nullptr, const DescriptorBindingPlan** populated = nullptr) {
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, RecompileResult* recycled = nullptr, StageMemo* memo = nullptr, const DescriptorBindingPlan** populated = nullptr, bool samePlan = false) {
     RecompileResult result;
     const auto& artifact = variant.artifact;
     // APS5_NO_HELD_BINDINGS=1 copies the artifact's part and assigns every binding's descriptor anew, as before.
@@ -813,7 +819,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             .variantId = artifact.variantId
         };
     }
-    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, memo);
+    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, memo, samePlan);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -1405,10 +1411,13 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
     return capture;
 }
 
-std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::shared_ptr<const ResourceCapture>& previous) const {
+std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::shared_ptr<const ResourceCapture>& previous, bool* samePlan, RecaptureRefusal* refusal) const {
+    if (samePlan != nullptr) *samePlan = false;
+    if (refusal != nullptr) *refusal = RecaptureRefusal::Plan;
     if (previous == nullptr || previous->source != handle->source || previous->plan != handle->source->plan) return nullptr;
     const auto* walk = handle->source->walk.get();
     if (walk == nullptr || !walk->replayable) return nullptr;
+    if (refusal != nullptr) *refusal = RecaptureRefusal::Words;
     const auto& plan = *previous->plan;
     const auto& was = previous->snapshot;
     const auto user = request.context.userData;
@@ -1425,8 +1434,18 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::
     auto capture = previous.use_count() == 1 ? std::const_pointer_cast<ResourceCapture>(std::move(previous)) : std::make_shared<ResourceCapture>(*previous);
     previous.reset();
     auto& snapshot = capture->snapshot;
-    for (const auto& passed : walk->passedWords) snapshot.buffers[passed.buffer].dwords[passed.dword] = user[passed.word];
+    // What the binding plan's key takes from a buffer's address (preparedBindingPlan).
+    const auto planBits = [](const DescriptorValue& descriptor) { return descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffffu) != 0u ? 4u | (descriptor.dwords[0] & 3u) : 0u; };
+    bool same = true;
+    for (const auto& passed : walk->passedWords) {
+        auto& descriptor = snapshot.buffers[passed.buffer];
+        const auto before = planBits(descriptor);
+        descriptor.dwords[passed.dword] = user[passed.word];
+        same = same && planBits(descriptor) == before;
+    }
     snapshot.userData.assign(user.begin(), user.begin() + plan.userDataCount);
+    if (samePlan != nullptr) *samePlan = same;
+    if (refusal != nullptr) *refusal = RecaptureRefusal::None;
     return capture;
 }
 
@@ -1471,7 +1490,7 @@ void verifyStageMemo(const CompiledVariant& variant, const RecompileRequest& req
 
 }
 
-std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture, StageMemo* memo) const {
+std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture, StageMemo* memo, bool samePlan) const {
     if (memo == nullptr || !request.useCache || !ResultMemo()) return Materialize(capture);
     if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     auto& held = memo->results;
@@ -1488,7 +1507,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     }
     if (memo->populated.size() < held.size()) memo->populated.resize(held.size(), nullptr);
     const DescriptorBindingPlan* populated = recycled != nullptr ? memo->populated[slot] : nullptr;
-    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, const_cast<RecompileResult*>(recycled.get()), memo, &populated));
+    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot, false, const_cast<RecompileResult*>(recycled.get()), memo, &populated, samePlan));
     recycled.reset();
     result->cacheHit = true;
     verifyStageMemo(*handle->artifact, request, capture.snapshot, *result);

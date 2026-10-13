@@ -157,8 +157,13 @@ struct StageMemoCounts {
     // Stage replay: results taken from the shape, and fragment stages that could not (other user
     // words; the same words over changed memory).
     std::atomic<std::uint64_t> replayed{0}, replayOtherWords{0}, replayOtherMemory{0};
-    // Capture replay: stages (of any kind) whose capture was taken from the shape without a walk.
+    // Capture replay: stages (of any kind) whose capture was taken from the shape without a walk,
+    // and the stages walked instead, vertex family then fragment, by why: the record had no capture,
+    // the shader's plan is not one a capture is taken over for, the user words differ in more than
+    // passed buffer addresses, the dwords the last walk read changed.
     std::atomic<std::uint64_t> recaptured{0};
+    enum Walked : std::size_t { WalkedFirst, WalkedPlan, WalkedWords, WalkedMemory, WalkedCount };
+    std::array<std::array<std::atomic<std::uint64_t>, WalkedCount>, 2> walked{};
 };
 StageMemoCounts& StageMemoCounters();
 

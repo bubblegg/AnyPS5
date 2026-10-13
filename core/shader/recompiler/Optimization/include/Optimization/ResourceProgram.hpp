@@ -56,6 +56,10 @@ struct SourceHandle {
 // One thread at a time.
 struct StageMemo;
 [[nodiscard]] std::shared_ptr<StageMemo> MakeStageMemo();
+// Why PreparedShaderInvocation::Recapture left a capture to the walk: the shader's plan is not one
+// it is worked out for (or the capture is another shader's), or the user words differ in more
+// than buffer addresses the walk passes through.
+enum class RecaptureRefusal : std::uint8_t { None, Plan, Words };
 class PreparedShaderInvocation {
 public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
@@ -72,12 +76,15 @@ public:
     // from the earlier one in nothing but buffer addresses taken as they are from the user data
     // (CompiledWalk::passedWords), and only as long as the guest memory the earlier walk read is
     // unchanged, which the caller checks. `previous` is taken over (and changed in place when the
-    // caller is its only holder); null, with `previous` kept, when the walk has to run.
-    std::shared_ptr<const ResourceCapture> Recapture(std::shared_ptr<const ResourceCapture>& previous) const;
+    // caller is its only holder); null, with `previous` kept, when the walk has to run. `samePlan`
+    // is set when the new capture also gives the binding plan the earlier one gave, for Materialize.
+    std::shared_ptr<const ResourceCapture> Recapture(std::shared_ptr<const ResourceCapture>& previous, bool* samePlan = nullptr, RecaptureRefusal* refusal = nullptr) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
     // The same result without the result memo's hash of the whole snapshot (APS5_VERIFY_STAGE_MEMO=N
     // compares every Nth with a result materialized without the memo).
-    std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture, StageMemo* memo) const;
+    // `samePlan`: the capture is Recapture's of the capture the memo's last result was made from,
+    // with its `samePlan` set; the binding plan is then the memo's, without its key.
+    std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture, StageMemo* memo, bool samePlan = false) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);

@@ -169,18 +169,36 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> recaptured;
     bool verifyRecapture = false;
-    if (replayed == nullptr && captureReplay && recorded && !memoryChanged && recall->replayCapture != nullptr) {
-        recaptured = invocation.Recapture(recall->replayCapture);
-        if (recaptured != nullptr) {
-            const SampledReadScope sampling(evidenceReads);
-            if (!shaderMemory.StillHolds(recall->replayRuns, recall->replayWords)) recaptured.reset();
+    // The memo's binding plan is the kept capture's only while every result of the record is
+    // materialized from the capture kept with it.
+    bool samePlan = false;
+    if (!recorded && recall != nullptr) recall->replayCapture.reset();
+    if (replayed == nullptr && captureReplay && recorded) {
+        auto& walks = StageMemoCounters().walked[program.binary.stage == Stage::Fragment ? 1 : 0];
+        auto reason = StageMemoCounts::WalkedFirst;
+        if (memoryChanged) {
+            reason = StageMemoCounts::WalkedMemory;
+        } else if (recall->replayCapture != nullptr) {
+            auto refusal = ShaderRecompiler::RecaptureRefusal::None;
+            recaptured = invocation.Recapture(recall->replayCapture, &samePlan, &refusal);
+            reason = refusal == ShaderRecompiler::RecaptureRefusal::Plan ? StageMemoCounts::WalkedPlan : StageMemoCounts::WalkedWords;
+            if (recaptured != nullptr) {
+                const SampledReadScope sampling(evidenceReads);
+                if (!shaderMemory.StillHolds(recall->replayRuns, recall->replayWords)) {
+                    recaptured.reset();
+                    reason = StageMemoCounts::WalkedMemory;
+                }
+            }
         }
         if (recaptured != nullptr) {
             const auto recaptures = StageMemoCounters().recaptured.fetch_add(1, std::memory_order_relaxed);
             verifyRecapture = verifyReplayEvery != 0u && recaptures % verifyReplayEvery == 0u;
+        } else {
+            walks[reason].fetch_add(1, std::memory_order_relaxed);
         }
     }
     const bool walked = recaptured == nullptr || verifyRecapture;
+    if (walked && recall != nullptr) recall->replayCapture.reset();
     const auto capture = !walked ? recaptured : [&] {
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
@@ -227,7 +245,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowCapture);
 
     timing.Mark("capture_resources");
-    stageCapture.compiled = invocation.Materialize(*capture, recall != nullptr ? recall->memo.get() : nullptr);
+    stageCapture.compiled = invocation.Materialize(*capture, recall != nullptr ? recall->memo.get() : nullptr, samePlan && !walked);
     timing.Mark("materialize");
     if (recorded) {
         const auto readsInto = [&](std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::vector<std::uint32_t>& words) {
