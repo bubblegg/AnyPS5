@@ -206,6 +206,8 @@ public:
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    // The same into a vector the caller keeps.
+    static void ContentKeyInto(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
     // Whether ContentKey would return `key`, without building it. `fixedKnown`: the words the
     // shader's binding plan decides are known to be the key's (the same plan stamped a shader that
     // matched it), so only the guest descriptors and their sizes are compared.

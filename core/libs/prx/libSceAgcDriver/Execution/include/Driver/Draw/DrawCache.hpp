@@ -117,6 +117,10 @@ struct ShapeStage {
     std::vector<std::uint32_t> replayUser;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> replayRuns;
     std::vector<std::uint32_t> replayWords;
+    // The replayed result's part of the draw's resource cache key (Graphics::DrawStageContentKey),
+    // built once for the result it names and shared with the draws that replay it.
+    std::shared_ptr<const std::vector<std::uint32_t>> replayKey;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> replayKeyOf;
     // APS5_REPLAY_PROBE: the stage of the shape's previous draw (DrawReplayProbe.cpp).
     std::shared_ptr<ReplayProbeStage> probe;
 };

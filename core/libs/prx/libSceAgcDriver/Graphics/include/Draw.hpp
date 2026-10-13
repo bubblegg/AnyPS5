@@ -80,6 +80,10 @@ struct DrawShapeMemo {
     std::vector<ColorTarget> targetColors;
 };
 
+// A stage's part of a draw's resource cache key (what CompiledShader::contentKey carries): a pure
+// function of the stage and its result, so the thread that prepares a draw can build it.
+void DrawStageContentKey(const CompiledShader& shader, std::vector<std::uint32_t>& key);
+
 struct DrawShapeMemoCounts {
     std::atomic<std::uint64_t> draws{0}, outputs{0}, layouts{0}, pipelines{0}, resources{0}, targets{0};
 };

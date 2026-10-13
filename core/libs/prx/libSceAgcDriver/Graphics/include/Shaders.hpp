@@ -38,6 +38,10 @@ struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
+    // The stage's part of a draw's resource cache key (DrawStageContentKey), when the caller built
+    // it ahead of the draw (the preparing thread of pipelined draws); empty otherwise. It must
+    // outlive the draw's recording.
+    std::span<const std::uint32_t> contentKey = {};
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {

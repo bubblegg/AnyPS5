@@ -799,7 +799,9 @@ bool MovableBuffers() {
     return enabled;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+// `fresh` builds every stage's part here even when the stage carries one (the verify switch's
+// independent answer).
+ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges, bool fresh = false) {
     ResourceCache::Key key{0xffffffffu};
     const auto append64 = [&](std::uint64_t value) {
         key.push_back(static_cast<std::uint32_t>(value));
@@ -808,6 +810,11 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     for (const auto& shader : shaders) {
+        if (!fresh && !shader.contentKey.empty()) {
+            key.push_back(static_cast<std::uint32_t>(shader.contentKey.size()));
+            key.insert(key.end(), shader.contentKey.begin(), shader.contentKey.end());
+            continue;
+        }
         const auto part = ShaderResources::ContentKey(shader, true, MovableBuffers());
         key.push_back(static_cast<std::uint32_t>(part.size()));
         key.insert(key.end(), part.begin(), part.end());
@@ -1249,6 +1256,12 @@ bool rememberedKeyMatches(const Context& context, std::span<const CompiledShader
         if (at >= key.size() || shader.program == nullptr) return false;
         const std::size_t words = key[at++];
         if (words > key.size() - at) return false;
+        // The stage's part came with it: the comparison is one of bytes.
+        if (!shader.contentKey.empty()) {
+            if (words != shader.contentKey.size() || std::memcmp(key.data() + at, shader.contentKey.data(), words * sizeof(std::uint32_t)) != 0) return false;
+            at += words;
+            continue;
+        }
         const auto variant = shader.program->PipelineVariantId();
         // A stage's part starts with the data flag, the stage and the variant (VisitContentKey):
         // another variant fails here, before the walk over its bindings.
@@ -1282,7 +1295,7 @@ std::shared_ptr<ShaderResources> memoResources(const Context& context, std::span
     auto resources = memo.resources.lock();
     if (resources == nullptr || !resources->InResourceCache()) return nullptr;
     if (memo.verify) {
-        const auto built = DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, false);
+        const auto built = DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, false, true);
         const auto found = built == memo.resourceKey ? SharedResourceCache().Find(built) : nullptr;
         shapeMemoVerified(built != memo.resourceKey ? "resource key" : found != resources ? "resource template" : nullptr);
         if (found != resources) return nullptr;
@@ -2268,6 +2281,10 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
 DrawShapeMemoCounts& DrawShapeMemoCounters() {
     static DrawShapeMemoCounts counts;
     return counts;
+}
+
+void DrawStageContentKey(const CompiledShader& shader, std::vector<std::uint32_t>& key) {
+    ShaderResources::ContentKeyInto(shader, true, MovableBuffers(), key);
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, DrawShapeMemo* memo) {

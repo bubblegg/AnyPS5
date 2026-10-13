@@ -41,6 +41,10 @@ struct DrawWork {
     std::vector<std::size_t> resultIndex;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    // Each stage's part of the draw's resource cache key (see prepareStageKeys): built here, or
+    // shared with the shape's replay record.
+    std::vector<std::vector<std::uint32_t>> stageKeys;
+    std::vector<std::shared_ptr<const std::vector<std::uint32_t>>> stageKeyRefs;
     // What only the commit reads.
     std::shared_ptr<VulkanDevice> localDevice;
     std::shared_ptr<const DrawDecode> decode;
@@ -100,6 +104,8 @@ void returnDrawWork(DrawWork* work) {
     work->matched.clear();
     work->fresh.clear();
     work->recipeStages.clear();
+    work->stageKeyRefs.clear();
+    for (auto& stage : work->stages) stage.contentKey = {};
     for (auto& capture : work->stageCaptures) capture.compiled.reset();
     work->localDevice.reset();
     work->decode.reset();
@@ -797,6 +803,37 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
     }
     if (t.helper || (pipelined && !drawParameters.indirect && deferredLabels().labels.empty())) {
         phaseTiming.Phase(DrawRowVectors);
+        // The stages' parts of the resource cache key are built here instead of on the recording
+        // thread, which then compares bytes (Graphics::CompiledShader::contentKey). A replayed
+        // fragment result's part is built once and shared. APS5_NO_PREPARED_RESOURCE_KEYS=1 leaves
+        // the key to the recording thread, as before.
+        static const bool preparedKeys = std::getenv("APS5_NO_PREPARED_RESOURCE_KEYS") == nullptr;
+        if (preparedKeys && std::all_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr; })) {
+            if (work.stageKeys.size() < stages.size()) work.stageKeys.resize(stages.size());
+            work.stageKeyRefs.assign(stages.size(), nullptr);
+            for (std::size_t k = 0; k < stages.size(); ++k) {
+                auto& stage = stages[k];
+                ShapeStage* recall = nullptr;
+                if (shapeHold.shape != nullptr && stage.stage == Stage::Fragment) {
+                    for (std::size_t i = 0; i < programs.size() && i < shapeHold.shape->stages.size(); ++i) {
+                        if (programResults[i] == stage.program && shapeHold.shape->stages[i].replayResult.get() == stage.program) recall = &shapeHold.shape->stages[i];
+                    }
+                }
+                if (recall == nullptr) {
+                    Graphics::DrawStageContentKey(stage, work.stageKeys[k]);
+                    stage.contentKey = work.stageKeys[k];
+                    continue;
+                }
+                if (recall->replayKey == nullptr || recall->replayKeyOf != recall->replayResult) {
+                    auto built = std::make_shared<std::vector<std::uint32_t>>();
+                    Graphics::DrawStageContentKey(stage, *built);
+                    recall->replayKey = std::move(built);
+                    recall->replayKeyOf = recall->replayResult;
+                }
+                work.stageKeyRefs[k] = recall->replayKey;
+                stage.contentKey = *recall->replayKey;
+            }
+        }
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = t.packetOpcode;

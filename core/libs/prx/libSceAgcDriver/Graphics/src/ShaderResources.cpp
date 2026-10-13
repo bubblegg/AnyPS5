@@ -1882,6 +1882,11 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
     return key;
 }
 
+void ShaderResources::ContentKeyInto(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key) {
+    key.clear();
+    VisitContentKey<false>(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); }, [](std::size_t) {});
+}
+
 bool ShaderResources::ContentKeyIs(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> key, bool fixedKnown) {
     std::size_t cursor = 0;
     bool equal = true;
