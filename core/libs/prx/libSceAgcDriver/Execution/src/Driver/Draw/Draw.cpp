@@ -617,6 +617,7 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
+    if (shapeHold.shape != nullptr && !drawHit && ReplayProbeEnabled()) ProbeReplay(*shapeHold.shape, programs, roles, stageCaptures, programResults, drawParameters, graphics);
 
     // Titles that move a draw's constant buffers every frame (Unity) never find most entries again;
     // building them, and their recipes, is skipped for such shapes.

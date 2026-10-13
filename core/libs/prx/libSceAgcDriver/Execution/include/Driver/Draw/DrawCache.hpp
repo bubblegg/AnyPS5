@@ -92,6 +92,9 @@ struct StageCapture {
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
 
+struct ReplayProbeStage;
+struct ReplayProbeDraw;
+
 // What a stage of a shape's last draw resolved to, and what it was resolved from: a draw of the
 // shape that gives the stage the same takes the prepared artifact from here (APS5_NO_STAGE_MEMO=1
 // resolves every stage as before; APS5_VERIFY_STAGE_MEMO=N resolves every Nth as well and compares).
@@ -105,6 +108,8 @@ struct ShapeStage {
     std::unique_ptr<ShaderRecompiler::ShaderVertexStageInfo> vertex;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     std::shared_ptr<ShaderRecompiler::StageMemo> memo;
+    // APS5_REPLAY_PROBE: the stage of the shape's previous draw (DrawReplayProbe.cpp).
+    std::shared_ptr<ReplayProbeStage> probe;
 };
 
 // Held by one draw at a time (`busy`); a draw that finds it taken resolves its stages as before.
@@ -113,7 +118,14 @@ struct ShapeStages {
     std::vector<ShapeStage> stages;
     // The recording side's memo of the shape; under the GPU mutex, not under `busy`.
     Graphics::DrawShapeMemo drawn;
+    std::shared_ptr<ReplayProbeDraw> probe;
 };
+
+// Measuring aid, APS5_REPLAY_PROBE=1: compares a draw of a shape with the shape's previous draw
+// (user words, the walk's reads, descriptors, vertex buffers, draw parameters) and prints the
+// outcomes every 10 s as [replay-probe] lines. Called with the shape's record held.
+bool ReplayProbeEnabled();
+void ProbeReplay(ShapeStages& shape, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<StageCapture>& captures, std::span<const ShaderRecompiler::RecompileResult* const> results, const Pm4::DrawParameters& draw, const Graphics::State& state);
 
 struct StageMemoCounts {
     std::atomic<std::uint64_t> reused{0}, revalidated{0}, resolved{0};
