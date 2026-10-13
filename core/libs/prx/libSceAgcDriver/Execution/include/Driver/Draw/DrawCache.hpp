@@ -121,6 +121,13 @@ struct ShapeStage {
     // built once for the result it names and shared with the draws that replay it.
     std::shared_ptr<const std::vector<std::uint32_t>> replayKey;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> replayKeyOf;
+    // The stage's last resource cache key part and the binding plan and variant of the result it
+    // was built from: a draw whose part is the same (a vertex stage's usually is: only its buffer
+    // addresses move, and they are not in the key) shares it instead of building its own.
+    std::shared_ptr<const std::vector<std::uint32_t>> lastKey;
+    const void* lastKeyPlan = nullptr;
+    std::uint64_t lastKeyVariant = 0;
+    ShaderRecompiler::ShaderStage lastKeyStage = ShaderRecompiler::ShaderStage::Vertex;
     // APS5_REPLAY_PROBE: the stage of the shape's previous draw (DrawReplayProbe.cpp).
     std::shared_ptr<ReplayProbeStage> probe;
 };

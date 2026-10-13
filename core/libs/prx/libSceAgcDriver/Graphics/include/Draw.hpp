@@ -83,6 +83,9 @@ struct DrawShapeMemo {
 // A stage's part of a draw's resource cache key (what CompiledShader::contentKey carries): a pure
 // function of the stage and its result, so the thread that prepares a draw can build it.
 void DrawStageContentKey(const CompiledShader& shader, std::vector<std::uint32_t>& key);
+// Whether DrawStageContentKey would give `key`, without building it. `fixedKnown`: `key` was built
+// from a result of the same stage, binding plan and variant (ShaderResources::ContentKeyIs).
+bool DrawStageContentKeyIs(const CompiledShader& shader, std::span<const std::uint32_t> key, bool fixedKnown);
 
 struct DrawShapeMemoCounts {
     std::atomic<std::uint64_t> draws{0}, outputs{0}, layouts{0}, pipelines{0}, resources{0}, targets{0};

@@ -813,10 +813,11 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
             work.stageKeyRefs.assign(stages.size(), nullptr);
             for (std::size_t k = 0; k < stages.size(); ++k) {
                 auto& stage = stages[k];
+                // The shape's record of the stage, when the stage is one of the draw's programs.
                 ShapeStage* recall = nullptr;
-                if (shapeHold.shape != nullptr && stage.stage == Stage::Fragment) {
+                if (shapeHold.shape != nullptr) {
                     for (std::size_t i = 0; i < programs.size() && i < shapeHold.shape->stages.size(); ++i) {
-                        if (programResults[i] == stage.program && shapeHold.shape->stages[i].replayResult.get() == stage.program) recall = &shapeHold.shape->stages[i];
+                        if (programResults[i] == stage.program) recall = &shapeHold.shape->stages[i];
                     }
                 }
                 if (recall == nullptr) {
@@ -824,14 +825,30 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
                     stage.contentKey = work.stageKeys[k];
                     continue;
                 }
-                if (recall->replayKey == nullptr || recall->replayKeyOf != recall->replayResult) {
+                if (recall->replayResult.get() == stage.program) {
+                    if (recall->replayKey == nullptr || recall->replayKeyOf != recall->replayResult) {
+                        auto built = std::make_shared<std::vector<std::uint32_t>>();
+                        Graphics::DrawStageContentKey(stage, *built);
+                        recall->replayKey = std::move(built);
+                        recall->replayKeyOf = recall->replayResult;
+                    }
+                    work.stageKeyRefs[k] = recall->replayKey;
+                    stage.contentKey = *recall->replayKey;
+                    continue;
+                }
+                const auto* plan = stage.program->bindingPlan.Plan();
+                const auto variant = stage.program->PipelineVariantId();
+                const bool fixedKnown = plan != nullptr && plan == recall->lastKeyPlan && variant == recall->lastKeyVariant && stage.stage == recall->lastKeyStage;
+                if (recall->lastKey == nullptr || !Graphics::DrawStageContentKeyIs(stage, *recall->lastKey, fixedKnown)) {
                     auto built = std::make_shared<std::vector<std::uint32_t>>();
                     Graphics::DrawStageContentKey(stage, *built);
-                    recall->replayKey = std::move(built);
-                    recall->replayKeyOf = recall->replayResult;
+                    recall->lastKey = std::move(built);
+                    recall->lastKeyPlan = plan;
+                    recall->lastKeyVariant = variant;
+                    recall->lastKeyStage = stage.stage;
                 }
-                work.stageKeyRefs[k] = recall->replayKey;
-                stage.contentKey = *recall->replayKey;
+                work.stageKeyRefs[k] = recall->lastKey;
+                stage.contentKey = *recall->lastKey;
             }
         }
         auto writes = drawWriteRanges(graphics, stages);

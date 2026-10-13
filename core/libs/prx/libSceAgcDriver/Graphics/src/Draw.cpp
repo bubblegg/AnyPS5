@@ -2287,6 +2287,10 @@ void DrawStageContentKey(const CompiledShader& shader, std::vector<std::uint32_t
     ShaderResources::ContentKeyInto(shader, true, MovableBuffers(), key);
 }
 
+bool DrawStageContentKeyIs(const CompiledShader& shader, std::span<const std::uint32_t> key, bool fixedKnown) {
+    return ShaderResources::ContentKeyIs(shader, true, MovableBuffers(), key, fixedKnown);
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, DrawShapeMemo* memo) {
     if (memo != nullptr && !beginShapeMemo(context, draw, *memo)) memo = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
