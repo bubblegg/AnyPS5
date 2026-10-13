@@ -31,6 +31,20 @@ static std::string save_root() {
     return std::string(SAVE_DIR);
 }
 
+// The blocks (32 KiB) a save's files take, each file rounded up to whole blocks; a native save has
+// SAVE_DATA_BLOCKS_MAX blocks, so what the files leave is its free space.
+static std::uint64_t used_blocks(const std::filesystem::path& path) {
+    constexpr std::uint64_t BlockBytes = 32768;
+    std::uint64_t blocks = 0;
+    std::error_code error;
+    for (auto it = std::filesystem::recursive_directory_iterator(path, error); !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+        if (!it->is_regular_file(error)) continue;
+        const auto bytes = it->file_size(error);
+        if (!error) blocks += (bytes + BlockBytes - 1) / BlockBytes;
+    }
+    return std::min(blocks, SAVE_DATA_BLOCKS_MAX);
+}
+
 // Events the title polls with sceSaveDataGetEventResult; a backup completes at once here.
 static std::mutex g_state_mutex;
 static std::deque<SaveDataEvent> g_events;
@@ -320,7 +334,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
             result->params[i] = sortByParam ? matches[i].param : load_param(matches[i].path);
         }
         if (result->infos != nullptr) {
-            result->infos[i] = SaveDataSearchInfo{SAVE_DATA_BLOCKS_MAX, SAVE_DATA_BLOCKS_MAX, {}};
+            result->infos[i] = SaveDataSearchInfo{SAVE_DATA_BLOCKS_MAX, SAVE_DATA_BLOCKS_MAX - used_blocks(matches[i].path), {}};
         }
     }
     result->hit_num = static_cast<std::uint32_t>(matches.size());
@@ -354,12 +368,13 @@ static int getMountInfo(const SaveDataMountPoint* mount_point, SaveDataMountInfo
         throw std::runtime_error("sceSaveDataGetMountInfo: null argument");
     }
     std::lock_guard lock(g_slots_mutex);
-    if (find_slot_by_mount_point(mount_point->data) == -1) {
+    const int slot = find_slot_by_mount_point(mount_point->data);
+    if (slot == -1) {
         return SAVE_DATA_ERROR_NOT_MOUNTED;
     }
     std::memset(info, 0, sizeof(*info));
     info->blocks = SAVE_DATA_BLOCKS_MAX;
-    info->free_blocks = SAVE_DATA_BLOCKS_MAX;
+    info->free_blocks = SAVE_DATA_BLOCKS_MAX - used_blocks(g_slots[slot].real_path);
     return SAVE_DATA_OK;
 }
 
