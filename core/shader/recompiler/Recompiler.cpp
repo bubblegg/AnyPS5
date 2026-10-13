@@ -1426,10 +1426,22 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::
         if (user[word] != was.userData[word]) return nullptr;
     }
     // A passed word may move its buffer, nothing else: the other descriptor fields are validated
-    // after a walk (the buffer's type, ADD_TID), which then has to run.
+    // after a walk (the buffer's type, ADD_TID), which then has to run. With control flow in the
+    // plan a buffer's source may be inactive, its descriptor all zero whatever the user words are;
+    // which blocks are active follows from the structural words and the memory read, so it is as in
+    // the walk before. A descriptor that differs from its user word was inactive and stays zero; an
+    // all-zero one over a zero user word may be either, so a change of that word needs the walk.
+    const auto inactive = [&](const auto& passed) { return was.buffers[passed.buffer].dwords[passed.dword] != was.userData[passed.word]; };
     for (const auto& passed : walk->passedWords) {
+        const auto& descriptor = was.buffers[passed.buffer];
         const auto changed = user[passed.word] ^ was.userData[passed.word];
-        if (passed.dword == 1u ? (changed & 0xffff0000u) != 0u : passed.dword != 0u && changed != 0u) return nullptr;
+        if (inactive(passed)) {
+            if (descriptor.dwords != DescriptorValue{}.dwords) return nullptr;
+            continue;
+        }
+        if (changed == 0u) continue;
+        if (descriptor.dwords == DescriptorValue{}.dwords) return nullptr;
+        if (passed.dword == 1u ? (changed & 0xffff0000u) != 0u : passed.dword != 0u) return nullptr;
     }
     auto capture = previous.use_count() == 1 ? std::const_pointer_cast<ResourceCapture>(std::move(previous)) : std::make_shared<ResourceCapture>(*previous);
     previous.reset();
@@ -1439,6 +1451,7 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::
     bool same = true;
     for (const auto& passed : walk->passedWords) {
         auto& descriptor = snapshot.buffers[passed.buffer];
+        if (descriptor.dwords[passed.dword] != snapshot.userData[passed.word]) continue;
         const auto before = planBits(descriptor);
         descriptor.dwords[passed.dword] = user[passed.word];
         same = same && planBits(descriptor) == before;

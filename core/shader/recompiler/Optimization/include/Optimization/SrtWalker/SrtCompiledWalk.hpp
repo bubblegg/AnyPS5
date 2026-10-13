@@ -72,8 +72,9 @@ struct CompiledWalk {
     // address, a condition, a flat slot, an image or sampler word. `passedWords` are the user words
     // that are a buffer descriptor's dword as they are, and nothing else; a word that is both is
     // only listed as structural. With the structural words and the memory the walk read unchanged,
-    // a walk differs from the last one in the passed words alone. `replayable` is false for a plan
-    // this is not worked out for (control flow, an image table, a user word beyond the plan's count).
+    // a walk differs from the last one in the passed words alone (of the buffers whose source is
+    // active, with control flow in the plan: the conditions are structural). `replayable` is false
+    // for a plan this is not worked out for (an image table, a user word beyond the plan's count).
     struct PassedWord {
         std::uint32_t buffer;
         std::uint32_t dword;

@@ -100,7 +100,7 @@ private:
     // See CompiledWalk::structuralWords. A buffer's dword is passed when its node is a user word
     // through nothing but aliases; every other root, and everything it reaches, is structural.
     void ClassifyUserWords() {
-        if (!_plan.controlFlow.empty() || _plan.info.buffers.size() > _plan.materializationSources.size()) return;
+        if (_plan.info.buffers.size() > _plan.materializationSources.size()) return;
         for (const auto& source : _plan.descriptorSources) {
             if (source.indirectImage.has_value()) return;
         }
