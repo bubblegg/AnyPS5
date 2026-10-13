@@ -125,6 +125,23 @@ void singleDccKeysTests() {
     Require(read(56) == DccKeys::Uncompressed, "comp-to-single keys mixed with uncompressed ones must read as stored");
 }
 
+void packedFloatDccClearTests() {
+    for (const bool alphaOnMsb : {false, true}) {
+        for (const auto keys : {DccKeys::Clear0000, DccKeys::Clear0001, DccKeys::Clear1110, DccKeys::Clear1111}) {
+            std::array<std::uint32_t, 4> texels{};
+            texels.fill(0xdeadbeefu);
+            Require(FillDccClear(VK_FORMAT_B10G11R11_UFLOAT_PACK32, keys, alphaOnMsb, std::as_writable_bytes(std::span(texels))), "packed float fast clear was not encoded");
+            const std::uint32_t expected = keys == DccKeys::Clear1110 || keys == DccKeys::Clear1111 ? 0x781e03c0u : 0u;
+            for (const auto texel : texels) Require(texel == expected, "packed float DCC clear did not encode RGB zero or one");
+        }
+    }
+    alignas(64) std::array<std::uint8_t, 4> keys{0xc0, 0xc0, 0xc0, 0xc0};
+    GuestTextureResource resource{};
+    resource.format = 36;
+    resource.dccAddress = reinterpret_cast<std::uint64_t>(keys.data());
+    Require(TextureClearKeys(resource, 1024) == DccKeys::Clear1111, "packed float texture discarded its white fast-clear keys");
+}
+
 }
 
 void RunTextureFormatTests() {
@@ -175,4 +192,5 @@ void RunTextureFormatTests() {
     for (const std::uint32_t format : {1u, 14u, 56u, 71u, 169u, 171u, 173u, 181u}) Require(!IsSrgbTextureFormat(format), "guest format " + std::to_string(format) + " must not be an sRGB texture format");
     convertedDccClearTests();
     singleDccKeysTests();
+    packedFloatDccClearTests();
 }

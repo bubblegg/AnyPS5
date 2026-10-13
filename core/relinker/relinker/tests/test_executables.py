@@ -36,7 +36,7 @@ def main():
             assert secondary.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), secondary
             assert "Executable: picker/picker.bin\n" in result.stdout, result.stdout
             assert f"Executable file: {secondary}\n" in result.stdout, result.stdout
-            assert f"app{suffix}\npicker.picker.bin{suffix}\nlibs/\n" in result.stdout, result.stdout
+            assert f"  |-- app{suffix}\n  |-- picker.picker.bin{suffix}\n  |-- libs/\n" in result.stdout, result.stdout
             assert (output.parent / "picker.picker.bin.registry.json").is_file()
             assert sorted(path.name for path in output.parent.rglob("*.guest.prx")) == ["bundled.prx.guest.prx"]
             if not windows:

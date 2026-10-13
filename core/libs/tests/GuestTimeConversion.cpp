@@ -317,6 +317,18 @@ int main() {
     const std::int64_t underflow = std::numeric_limits<std::int64_t>::min();
     GuestTm scratch{};
     Require(gmtime_s_nid_postfix(&underflow, &scratch) == nullptr, "Unrepresentable negative time was accepted");
+    const std::int64_t overflow = std::numeric_limits<std::int64_t>::max();
+    for (const std::int64_t* timer : {&underflow, &overflow}) {
+        *__error_nid_postfix() = 1234;
+        Require(gmtime_s_nid_postfix(timer, &scratch) == nullptr && *__error_nid_postfix() == 1234,
+            "gmtime_s of an unrepresentable time changed errno");
+        Require(gmtime_nid_postfix(timer) == nullptr && *__error_nid_postfix() == 1234,
+            "gmtime of an unrepresentable time changed errno");
+        Require(localtime_s_nid_postfix(timer, &scratch) == nullptr && *__error_nid_postfix() == 1234,
+            "localtime_s of an unrepresentable time changed errno");
+        Require(localtime_nid_postfix(timer) == nullptr && *__error_nid_postfix() == 1234,
+            "localtime of an unrepresentable time changed errno");
+    }
 
     CheckAsctime(UtcTime(0), "Thu Jan  1 00:00:00 1970\n");
     CheckAsctime(UtcTime(-2208988801), "Sun Dec 31 23:59:59 1899\n");

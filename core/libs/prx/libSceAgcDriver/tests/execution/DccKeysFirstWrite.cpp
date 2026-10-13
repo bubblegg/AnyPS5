@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -500,6 +501,63 @@ void RunSingleKeysOverPendingImage(AgcDriver::VulkanDevice& device, std::uint8_t
     }
 }
 
+void RunSampledKeysBehindKernel(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    auto* texels = block;
+    auto* keys = block + KeysOffset;
+    std::memset(texels, 0x55, SurfaceBytes);
+    for (std::size_t i = 0; i < KeyBytes; i += 4) {
+        keys[i] = 0x00;
+        keys[i + 1] = 0x00;
+        keys[i + 2] = 0x80;
+        keys[i + 3] = 0x3f;
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto texture = TextureDescriptor(texels, keys);
+    const auto resource = AgcDriver::Graphics::DecodeTextureResource(texture);
+    std::vector<std::uint32_t> clearData(16, 0u);
+    const auto head = BufferDescriptor(keys, KeyBytes / 2);
+    std::copy(head.begin(), head.end(), clearData.begin());
+    std::vector<std::uint32_t> clearTailData(16, 0u);
+    const auto tail = BufferDescriptor(keys + KeyBytes / 2, KeyBytes / 2);
+    std::copy(tail.begin(), tail.end(), clearTailData.begin());
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Require(AgcDriver::Graphics::TextureClearKeys(resource, SurfaceBytes) == DccKeys::Uncompressed, "sampled keys behind a kernel: key bytes that are no keys were not read as stored");
+    Dispatch(device, ClearKeysCode, clearData, false);
+    Dispatch(device, ClearKeysCode, clearTailData, false);
+    const auto read = AgcDriver::Graphics::TextureClearKeys(resource, SurfaceBytes);
+    char message[256];
+    std::snprintf(message, sizeof(message), "a sampled texture whose keys a recorded kernel stores 0000 over read %s before the kernel ran", AgcDriver::Graphics::DccKeysName(read));
+    Require(read == DccKeys::Clear0000, message);
+    device.WaitIdle();
+    RequireKeys(keys, 0x00, "sampled keys behind a kernel: the keys after the kernel");
+}
+
+void RunUniformKeysBehindKernel(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    auto* texels = block;
+    auto* keys = block + KeysOffset;
+    std::memset(texels, 0x55, SurfaceBytes);
+    std::memset(keys, 0xff, KeyBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto texture = TextureDescriptor(texels, keys);
+    const auto resource = AgcDriver::Graphics::DecodeTextureResource(texture);
+    std::vector<std::uint32_t> clearData(16, 0u);
+    const auto head = BufferDescriptor(keys, KeyBytes / 2);
+    std::copy(head.begin(), head.end(), clearData.begin());
+    std::vector<std::uint32_t> clearTailData(16, 0u);
+    const auto tail = BufferDescriptor(keys + KeyBytes / 2, KeyBytes / 2);
+    std::copy(tail.begin(), tail.end(), clearTailData.begin());
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Require(AgcDriver::Graphics::TextureClearKeys(resource, SurfaceBytes) == DccKeys::Uncompressed, "uniform sampled keys behind a kernel: the keys before the kernel were not read uncompressed");
+    Dispatch(device, ClearKeysCode, clearData, false);
+    Dispatch(device, ClearKeysCode, clearTailData, false);
+    const auto read = AgcDriver::Graphics::TextureClearKeys(resource, SurfaceBytes);
+    char message[256];
+    std::snprintf(message, sizeof(message), "a sampled texture whose uniform keys a recorded kernel stores 0000 over read %s before the kernel ran", AgcDriver::Graphics::DccKeysName(read));
+    Require(read == DccKeys::Clear0000, message);
+    device.WaitIdle();
+    RequireKeys(keys, 0x00, "uniform sampled keys behind a kernel: the keys after the kernel");
+}
+
 void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto address = AddressOf(block);
     std::memset(block, 0x55, BlockBytes);
@@ -650,6 +708,12 @@ int main() {
         std::optional<GuestBlock> sampledOutput;
         sampledOutput.emplace(false);
         RunSingleKeysSampled(*device, sampled->Data(), sampledOutput->Data(), "unwatched");
+        std::optional<GuestBlock> behind;
+        behind.emplace(false);
+        RunSampledKeysBehindKernel(*device, behind->Data());
+        std::optional<GuestBlock> uniform;
+        uniform.emplace(false);
+        RunUniformKeysBehindKernel(*device, uniform->Data());
 #ifdef _WIN32
         shared.emplace(true, true);
         RunSharedImport(*device, shared->Data());

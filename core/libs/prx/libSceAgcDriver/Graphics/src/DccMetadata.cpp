@@ -393,6 +393,7 @@ bool LayoutFor(VkFormat format, Layout& layout) {
         case VK_FORMAT_R16G16_UINT: layout = {2, {16, 16}, Kind::Uint}; return true;
         case VK_FORMAT_R16G16_SINT: layout = {2, {16, 16}, Kind::Sint}; return true;
         case VK_FORMAT_R16G16_SFLOAT: layout = {2, {16, 16}, Kind::Float}; return true;
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: layout = {3, {11, 11, 10}, Kind::Float}; return true;
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: layout = {4, {10, 10, 10, 2}, Kind::Unorm}; return true;
         case VK_FORMAT_A2B10G10R10_UINT_PACK32: layout = {4, {10, 10, 10, 2}, Kind::Uint}; return true;
         case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: layout = {4, {8, 8, 8, 8}, Kind::Unorm}; return true;
@@ -410,7 +411,6 @@ bool LayoutFor(VkFormat format, Layout& layout) {
         case VK_FORMAT_R32G32B32A32_UINT: layout = {4, {32, 32, 32, 32}, Kind::Uint}; return true;
         case VK_FORMAT_R32G32B32A32_SINT: layout = {4, {32, 32, 32, 32}, Kind::Sint}; return true;
         case VK_FORMAT_R32G32B32A32_SFLOAT: layout = {4, {32, 32, 32, 32}, Kind::Float}; return true;
-        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: layout = {3, {11, 11, 10}, Kind::Float}; return true;
         default: return false;
     }
 }
@@ -420,7 +420,14 @@ std::uint64_t One(Kind kind, std::uint32_t bits) {
     switch (kind) {
         case Kind::Unorm: case Kind::Uint: return bits >= 64 ? ~0ull : (1ull << bits) - 1u;
         case Kind::Snorm: case Kind::Sint: return (1ull << (bits - 1u)) - 1u;
-        case Kind::Float: return bits == 16 ? 0x3c00u : bits == 11 ? 0x3c0u : bits == 10 ? 0x1e0u : 0x3f800000u;
+        case Kind::Float:
+            switch (bits) {
+                case 10: return 0x1e0u;
+                case 11: return 0x3c0u;
+                case 16: return 0x3c00u;
+                case 32: return 0x3f800000u;
+                default: throw std::runtime_error("AGC graphics: DCC clear of a " + std::to_string(bits) + "-bit float channel is not implemented");
+            }
     }
     return 0;
 }
@@ -498,7 +505,9 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
 DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, bool& memoized) {
     memoized = false;
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
-    const auto keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
+    DccKeys keys;
+    if (const auto known = WaitForKeyWriters(resource, guestBytes)) keys = *known;
+    else keys = readDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
     if (keys == DccKeys::Uncompressed || (keys == DccKeys::ClearSingle && SingleKeysReadable(resource))) return keys;
     if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) throw std::runtime_error(std::string("AGC graphics: DCC clear code ") + DccKeysName(keys) + " of converted texture format " + std::to_string(resource.format) + " is not implemented");
     std::byte probe[16]{};

@@ -259,15 +259,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
   info->end = reservedEnd;
   return 0;
  }
- const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
- assert(std::is_sorted(lease.begin(), lease.end(), [](const auto& left, const auto& right) { return left->address < right->address; }));
- const GuestAllocations::Range* best = nullptr;
- for (const auto& range : lease) {
-  const auto begin = range->address;
-  const auto end = begin + range->bytes;
-  if (address >= begin && address < end) { best = range.get(); break; }
-  if ((flags & findNext) != 0 && begin > address && (best == nullptr || begin < best->address)) best = range.get();
- }
+ const auto best = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, (flags & findNext) != 0);
  if (best != nullptr) {
   info->start = best->address;
   info->end = best->address + best->bytes;

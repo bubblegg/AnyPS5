@@ -51,6 +51,7 @@ PeRelocations WindowsRelocationBuilder::Apply(WindowsLoadImage& image, const Dom
             image.WritePointer(target, 0);
             result.Imports.push_back({name, rva, addend});
             result.Imports.back().Weak = (dynamicSection.DynSymData[symbolOffset + 4] >> 4) == STB_WEAK;
+            result.Imports.back().Function = type == 7 || (type == 6 && dynamicSection.FunctionImports.contains(target));
             if (const auto module = dynamicSection.ImportModules.find(target); module != dynamicSection.ImportModules.end())
                 result.Imports.back().Library = module->second;
         }

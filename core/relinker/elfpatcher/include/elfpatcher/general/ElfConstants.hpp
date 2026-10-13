@@ -51,6 +51,7 @@ inline constexpr std::size_t kRelaPltAlignment = 8;
 inline constexpr std::size_t kGotAlignment = 8;
 inline constexpr std::size_t kGotReservedSlots = 3;
 
+inline constexpr std::uint64_t kElfHeaderSize = 64;
 inline constexpr std::uint64_t kDefaultLoadAlignment = 0x1000;
 inline constexpr std::uint64_t kPhdrHeaderAlignment = 8;
 inline constexpr std::uint64_t kDynamicHeaderAlignment = 8;

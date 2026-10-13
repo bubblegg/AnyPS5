@@ -1,11 +1,8 @@
-add_executable(relinker
-        ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
+option(ANYPS5_RELINKER_CLI "Build the native relinker command line" ON)
+
+add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxElfPatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxDesktopEntryWriter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libkernel/AppMetadata/src/ParamJsonParser.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsGuestModuleWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsGuestStartup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/guest/GuestImageReader.cpp
@@ -33,8 +30,6 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteReader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileReader.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/Amd64OnlyConverter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
@@ -71,33 +66,58 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/ValidationPolicy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/output/SysVDynamicSectionBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/output/CallRegistryWriter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/Conversion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/RelinkerPipeline.cpp
 )
-target_include_directories(relinker PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/include
+target_include_directories(relinker_core PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
         ${CMAKE_CURRENT_SOURCE_DIR}/io/include
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../libs
 )
 
+target_compile_features(relinker_core PUBLIC cxx_std_20)
+set_target_properties(relinker_core PROPERTIES CXX_EXTENSIONS OFF)
+
+if(BUILD_TESTING)
+    add_test_executable(relinker_conversion_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/ConversionTests.cpp)
+    target_link_libraries(relinker_conversion_tests PRIVATE relinker_core)
+    add_test(NAME relinker_conversion COMMAND relinker_conversion_tests)
+    set_tests_properties(relinker_conversion PROPERTIES TIMEOUT 20)
+endif()
+
+if(ANYPS5_BUILD_WASM)
+    target_compile_options(relinker_core PRIVATE -fexceptions)
+    add_subdirectory(wasm)
+endif()
+
+if(NOT ANYPS5_RELINKER_CLI)
+    return()
+endif()
+
+add_executable(relinker
+    ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxDesktopEntryWriter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libkernel/AppMetadata/src/ParamJsonParser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileReader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/NativeModules.cpp)
+target_link_libraries(relinker PRIVATE relinker_core)
+target_include_directories(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+set_target_properties(relinker PROPERTIES CXX_EXTENSIONS OFF)
+
 if(BUILD_TESTING AND WIN32)
-    get_target_property(windowsAliasTestSources relinker SOURCES)
-    list(REMOVE_ITEM windowsAliasTestSources
-        ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp)
-    add_test_executable(windows_guest_export_alias_tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/WindowsExportAliasTests.cpp
-        ${windowsAliasTestSources})
-    get_target_property(windowsAliasIncludes relinker INCLUDE_DIRECTORIES)
-    target_include_directories(windows_guest_export_alias_tests PRIVATE ${windowsAliasIncludes})
+    add_test_executable(windows_guest_export_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/WindowsExportAliasTests.cpp)
+    target_link_libraries(windows_guest_export_alias_tests PRIVATE relinker_core)
     add_test(NAME windows_guest_export_aliases COMMAND windows_guest_export_alias_tests)
 endif()
 
 if(WIN32)
+    target_sources(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/relinker.rc)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/relinker.rc PROPERTIES OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/relinker.manifest)
     target_compile_options(relinker PRIVATE -municode)
     target_link_options(relinker PRIVATE -municode)
 endif()
@@ -364,6 +384,9 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME cli_help COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/cli/tests/test_help.py $<TARGET_FILE:relinker>)
+        add_test(NAME windows_fixed_base COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_fixed_base.py $<TARGET_FILE:relinker>)
+        set_tests_properties(windows_fixed_base PROPERTIES TIMEOUT 20)
         add_test(NAME elf_offsets COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_elf_offsets.py $<TARGET_FILE:relinker>)
         add_test(NAME dynamic_segment COMMAND ${Python3_EXECUTABLE}
@@ -418,6 +441,8 @@ if(BUILD_TESTING)
         add_test(NAME windows_runpath COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_runpath.py $<TARGET_FILE:relinker>)
         set_tests_properties(windows_runpath PROPERTIES TIMEOUT 30)
+        add_test(NAME windows_trace_imports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_trace_imports.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_address_space COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_address_space.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_tls_thread_pointer COMMAND ${Python3_EXECUTABLE}
@@ -470,8 +495,43 @@ if(BUILD_TESTING)
         set_tests_properties(guest_export_lookup PROPERTIES TIMEOUT 30)
         add_test(NAME guest_needed_nested_modules COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_needed_nested_modules.py $<TARGET_FILE:relinker>)
+        set(windows_stdio_host_arguments)
+        if(WIN32)
+            if(MINGW)
+                add_library(windows_stdio_host_ucrt SHARED elfpatcher/tests/WindowsStdioHost.cpp)
+                target_compile_options(windows_stdio_host_ucrt PRIVATE -mcrtdll=ucrt)
+                target_link_options(windows_stdio_host_ucrt PRIVATE -mcrtdll=ucrt -static-libgcc -static-libstdc++)
+                set_target_properties(windows_stdio_host_ucrt PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host_ucrt>)
+
+                get_filename_component(testCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+                set(mingwDlltoolExecutable "${testCompilerDirectory}/dlltool.exe")
+                if(NOT EXISTS "${mingwDlltoolExecutable}")
+                    message(FATAL_ERROR "Cannot locate MinGW DLL tool: ${mingwDlltoolExecutable}")
+                endif()
+                set(msvcrtImportLibrary "${CMAKE_CURRENT_BINARY_DIR}/windows_stdio_msvcrt_import.a")
+                add_custom_command(OUTPUT "${msvcrtImportLibrary}"
+                    COMMAND "${mingwDlltoolExecutable}" -d "${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsMsvcrt.def"
+                        -l "${msvcrtImportLibrary}" -D msvcrt.dll
+                    DEPENDS elfpatcher/tests/WindowsMsvcrt.def
+                    VERBATIM)
+                add_custom_target(windows_stdio_msvcrt_import DEPENDS "${msvcrtImportLibrary}")
+                add_library(windows_stdio_host_msvcrt SHARED elfpatcher/tests/WindowsMsvcrtStdioHost.cpp)
+                add_dependencies(windows_stdio_host_msvcrt windows_stdio_msvcrt_import)
+                target_link_libraries(windows_stdio_host_msvcrt PRIVATE "${msvcrtImportLibrary}")
+                target_compile_options(windows_stdio_host_msvcrt PRIVATE -fno-builtin)
+                target_link_options(windows_stdio_host_msvcrt PRIVATE -nostdlib -Wl,--no-undefined -Wl,--entry,0)
+                set_target_properties(windows_stdio_host_msvcrt PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host_msvcrt>)
+            else()
+                add_library(windows_stdio_host SHARED elfpatcher/tests/WindowsStdioHost.cpp)
+                set_target_properties(windows_stdio_host PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host>)
+            endif()
+        endif()
         add_test(NAME windows_import_modules COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_import_modules.py $<TARGET_FILE:relinker>)
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_import_modules.py
+            $<TARGET_FILE:relinker> ${windows_stdio_host_arguments})
         add_test(NAME elf_header COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_elf_header.py $<TARGET_FILE:relinker>)
         add_test(NAME weak_imports COMMAND ${Python3_EXECUTABLE}
@@ -486,6 +546,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_null_symbol_relocations.py $<TARGET_FILE:relinker>)
         add_test(NAME input_nonascii COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_input_nonascii.py $<TARGET_FILE:relinker>)
+        add_test(NAME long_paths COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_long_paths.py $<TARGET_FILE:relinker>)
+        set_tests_properties(long_paths PROPERTIES SKIP_RETURN_CODE 77)
         add_test(NAME string_table_bounds COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_string_table_bounds.py $<TARGET_FILE:relinker>)
         add_test(NAME sce_code_extent COMMAND ${Python3_EXECUTABLE}

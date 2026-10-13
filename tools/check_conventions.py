@@ -29,7 +29,7 @@ RULES = {
 CPP = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"}
 IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".ico", ".tga", ".dds"}
 NOTES = {".md", ".markdown", ".rst", ".log", ".patch", ".diff"}
-AGENT_FILES = {"AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", "copilot-instructions.md"}
+AGENT_FILES = {"agents.md", "claude.md", "gemini.md", ".cursorrules", "copilot-instructions.md"}
 DEBT = "docs/dev/TechnicalDebt.md"
 DEBT_DIR = "docs/dev/debt/"
 DEBT_TARGET = re.compile(r"\]\((?:\.\./)+(core/[^)#\s]+)")
@@ -109,7 +109,7 @@ class Check:
                 if core and TITLE.search(text):
                     self.report("title-specific", path, number, TITLE.search(text).group(0))
                 match = EXPORT.search(bare)
-                if match and path.startswith("core/libs/prx/") and not match.group(1).endswith("_nid_no_patch"):
+                if match and path.startswith("core/libs/prx/") and not match.group(1).endswith(("_nid_no_patch", "_nid_no_patch_cut")):
                     source = source or self.show(path).splitlines()
                     body = function_body(source, number - 1)
                     if body is None:
@@ -324,7 +324,7 @@ def library(path):
 
 def allowed_notes(path):
     p = PurePosixPath(path)
-    if p.name in AGENT_FILES:
+    if p.name.lower() in AGENT_FILES:
         return False
     if p.suffix.lower() not in NOTES:
         return None
@@ -397,5 +397,5 @@ if __name__ == "__main__":
     if pr:
         check.pull_request(pr["title"], pr["body"])
     elif args.title is not None or args.body:
-        check.pull_request(args.title or "", open(args.body, encoding="utf-8").read() if args.body else "")
+        check.pull_request(args.title or "", open(args.body, encoding="utf-8-sig").read() if args.body else "")
     raise SystemExit(output(check, os.environ.get("GITHUB_REPOSITORY", "boykopovar/AnyPS5")))

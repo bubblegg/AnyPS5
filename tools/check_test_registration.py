@@ -11,7 +11,17 @@ KNOWN_UNRUN = set()
 
 
 def built(build):
-    listed = subprocess.run(["ninja", "-C", str(build), "-t", "targets", "all"],
+    program, generator = None, None
+    for line in (Path(build) / "CMakeCache.txt").read_text(encoding="utf-8").splitlines():
+        if line.startswith("CMAKE_MAKE_PROGRAM:"):
+            program = line.partition("=")[2]
+        elif line.startswith("CMAKE_GENERATOR:"):
+            generator = line.partition("=")[2]
+    if generator not in ("Ninja", "Ninja Multi-Config"):
+        raise ValueError(f"test registration audit requires a Ninja generator, got {generator!r}")
+    if not program or program.endswith("-NOTFOUND"):
+        raise FileNotFoundError(f"CMAKE_MAKE_PROGRAM is not set in {Path(build) / 'CMakeCache.txt'}")
+    listed = subprocess.run([program, "-C", str(build), "-t", "targets", "all"],
                             capture_output=True, text=True, check=True).stdout
     names = set()
     for line in listed.splitlines():

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -18,142 +19,93 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-// Room for every word drawRegisterKey gathers: the device, a header and the registers of each
-// range, and the programs' hash.
-constexpr std::size_t drawKeyWordCapacity() {
-    std::size_t words = 2;
-    for (const auto& range : Graphics::DrawKeyRegisters) words += 1 + range.count;
-    return words;
+bool runtimeRegister(std::uint32_t offset) {
+    return offset - 0x00cu < 32u || offset - 0x08cu < 32u || offset - 0x10cu < 32u || offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u;
 }
 
-// Four FNV lanes over the words, then folded and mixed: the lanes stay in registers, where one
-// chain kept in memory had every word wait for the previous one's store.
-std::uint64_t hashDrawKeyWords(std::span<const std::uint64_t> words, std::uint64_t seed) {
-    constexpr std::uint64_t Prime = 0x100000001b3ull;
-    std::uint64_t a = 0xcbf29ce484222325ull ^ seed, b = a ^ 0x9e3779b97f4a7c15ull, c = a ^ 0xbf58476d1ce4e5b9ull, d = a ^ 0x94d049bb133111ebull;
-    std::size_t i = 0;
-    for (; i + 4 <= words.size(); i += 4) {
-        a = (a ^ words[i]) * Prime;
-        b = (b ^ words[i + 1]) * Prime;
-        c = (c ^ words[i + 2]) * Prime;
-        d = (d ^ words[i + 3]) * Prime;
+const auto& registerMasks() {
+    static const auto masks = [] {
+        std::array<std::vector<std::uint64_t>, 3> bits;
+        for (const auto& range : Graphics::DrawKeyRegisters) {
+            auto& bank = bits[static_cast<std::size_t>(range.bank)];
+            bank.resize(std::max(bank.size(), (static_cast<std::size_t>(range.first) + range.count + 63) / 64));
+            for (auto offset = range.first; offset < range.first + range.count; ++offset) {
+                if (range.bank == Graphics::RegisterBank::Shader && runtimeRegister(offset)) continue;
+                bank[offset / 64] |= std::uint64_t{1} << (offset % 64);
+            }
+        }
+        std::array<std::shared_ptr<const Registers::Mask>, 3> result;
+        for (std::size_t i = 0; i < bits.size(); ++i) result[i] = std::make_shared<const Registers::Mask>(std::move(bits[i]));
+        return result;
+    }();
+    return masks;
+}
+
+}
+
+// `shapeKey`, when given, receives the key over everything but the shader user data words: the
+// fingerprints and the other runtime registers (0x082, 0x083, 0x102, 0x103). The draws of a shape
+// differ in their user data words alone (Driver::shapeDecode and the records kept by shape).
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey) {
+    const auto& masks = registerMasks();
+    const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
+        const auto& mask = masks[static_cast<std::size_t>(bank)];
+        return incremental ? registers.Fingerprint(mask) : registers.RecomputeFingerprint(*mask);
+    };
+    auto shape = (0xcbf29ce484222325ull ^ fingerprint(queue.context, Graphics::RegisterBank::Context)) * 0x100000001b3ull;
+    shape = (shape ^ fingerprint(queue.shader, Graphics::RegisterBank::Shader)) * 0x100000001b3ull;
+    shape = (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
+    const auto words = [&](std::uint64_t& into, std::uint32_t base, std::uint32_t count) {
+        for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count; ++it) {
+            into = (into ^ it->first) * 0x100000001b3ull;
+            into = (into ^ it->second) * 0x100000001b3ull;
+        }
+    };
+    words(shape, 0x082u, 2);
+    words(shape, 0x102u, 2);
+    if (shapeKey != nullptr) *shapeKey = shape;
+    auto exact = shape;
+    for (const auto base : {0x00cu, 0x08cu, 0x10cu}) {
+        const auto resources = queue.shader.find(base - 1);
+        const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
+        words(exact, base, allUserWords ? 32u : std::min(count, 32u));
     }
-    for (; i < words.size(); ++i) a = (a ^ words[i]) * Prime;
-    auto hash = a ^ std::rotl(b, 17) ^ std::rotl(c, 31) ^ std::rotl(d, 47) ^ words.size();
-    hash ^= hash >> 31u;
-    hash *= 0x9e3779b97f4a7c15ull;
-    hash ^= hash >> 29u;
-    return hash;
+    return exact;
 }
 
-}
-
+// The context ranges used to be walked (some 400 registers) and their hash kept with a copy of the
+// bank; upstream's incremental fingerprints (Registers::Fingerprint) replace both.
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shapeKey) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
-    // The registers are gathered as words (offset and value) and hashed afterwards: the shape key
-    // over all but the user data words, the whole key over the user data words seeded with the shape
-    // key. Only equality of keys within the process matters.
-    std::array<std::uint64_t, drawKeyWordCapacity()> shared;
-    std::array<std::uint64_t, drawKeyWordCapacity()> user;
-    std::size_t sharedWords = 0, userWords = 0;
-    const auto userEnd = [&](std::uint32_t base) {
-        if (allUserWords) return base + 32u;
-        const auto resources = queue.shader.find(base - 1);
-        if (resources == queue.shader.end()) return base;
-        const auto count = ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
-        return base + std::min(count, 32u);
+    static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
+    std::uint64_t shape = 0;
+    auto key = RegisterStateKey(queue, allUserWords, true, &shape);
+    if (verify && key != RegisterStateKey(queue, allUserWords, false)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
+    // The device and the programs belong to the shape as well as to the key.
+    const auto mix = [&](std::uint64_t value) {
+        key = (key ^ value) * 0x100000001b3ull;
+        shape = (shape ^ value) * 0x100000001b3ull;
     };
-    const std::array<std::pair<std::uint32_t, std::uint32_t>, 3> users{{{0x00cu, userEnd(0x00cu)}, {0x08cu, userEnd(0x08cu)}, {0x10cu, userEnd(0x10cu)}}};
-    const auto unread = [&](std::uint32_t offset) {
-        return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.second && offset < user.first + 32u; });
-    };
-    const auto userWord = [&](std::uint32_t offset) {
-        return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.first && offset < user.second; });
-    };
-    // The context ranges hash on their own and are kept with a copy of the bank they came from: a
-    // draw of the same context (most draws of a pass differ in their shader user data words only)
-    // takes the hash after one comparison of the bank's words instead of walking some 400 registers.
-    // APS5_NO_CONTEXT_KEY_MEMO=1 walks them every time; APS5_VERIFY_CONTEXT_KEY_MEMO=N walks them
-    // for every Nth taken hash as well and compares.
-    struct ContextKeyMemo {
-        Registers context;
-        std::uint64_t hash = 0;
-        bool valid = false;
-        std::uint64_t taken = 0;
-    };
-    struct ContextKeyMemoTag {};
-    static const bool contextMemo = std::getenv("APS5_NO_CONTEXT_KEY_MEMO") == nullptr;
-    static const std::uint64_t verifyEvery = [] {
-        const char* text = std::getenv("APS5_VERIFY_CONTEXT_KEY_MEMO");
-        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 0), 1u) : 0u;
-    }();
-    const auto contextHash = [&] {
-        std::array<std::uint64_t, drawKeyWordCapacity()> words;
-        std::size_t count = 0;
-        for (const auto& range : Graphics::DrawKeyRegisters) {
-            if (range.bank != Graphics::RegisterBank::Context) continue;
-            words[count++] = range.first;
-            const auto end = range.first + range.count;
-            for (auto it = queue.context.lower_bound(range.first); it != queue.context.end() && it->first < end; ++it) words[count++] = (static_cast<std::uint64_t>(it->first) << 32u) | it->second;
-        }
-        return hashDrawKeyWords(std::span(words).first(count), 0);
-    };
-    auto& memo = HostThreadLocal<ContextKeyMemo, ContextKeyMemoTag>();
-    std::uint64_t context = 0;
-    if (contextMemo && memo.valid && memo.context.SameWords(queue.context)) {
-        context = memo.hash;
-        if (verifyEvery != 0 && ++memo.taken % verifyEvery == 0) {
-            static std::atomic<std::uint64_t> compared{0}, differences{0};
-            const bool differs = contextHash() != context;
-            const auto count = compared.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (differs) differences.fetch_add(1, std::memory_order_relaxed);
-            if ((count & (count - 1)) == 0 || count % 100000 == 0) std::fprintf(stderr, "[context-key] verify: %llu kept hashes walked again, %llu differences\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load(std::memory_order_relaxed)));
-        }
-    } else {
-        context = contextHash();
-        if (contextMemo) {
-            memo.context = queue.context;
-            memo.hash = context;
-            memo.valid = true;
-        }
-    }
-    shared[sharedWords++] = deviceSerial;
-    shared[sharedWords++] = context;
-    for (const auto& range : Graphics::DrawKeyRegisters) {
-        if (range.bank == Graphics::RegisterBank::Context) continue;
-        const auto& bank = range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
-        shared[sharedWords++] = (static_cast<std::uint64_t>(range.bank) << 32u) | range.first;
-        const auto end = range.first + range.count;
-        const bool shader = range.bank == Graphics::RegisterBank::Shader;
-        for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
-            if (shader && unread(it->first)) continue;
-            const auto word = (static_cast<std::uint64_t>(it->first) << 32u) | it->second;
-            if (shader && userWord(it->first)) user[userWords++] = word;
-            else shared[sharedWords++] = word;
-        }
-    }
-    std::uint64_t programs = 0xcbf29ce484222325ull;
+    mix(deviceSerial);
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
         const auto low = queue.shader.find(base);
         const auto high = queue.shader.find(base + 1);
         if (low == queue.shader.end() || high == queue.shader.end()) {
-            programs = (programs ^ 0u) * 0x100000001b3ull;
+            mix(0);
             continue;
         }
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
         auto it = registry.upper_bound(address);
         if (it == registry.begin()) {
-            programs = (programs ^ 1u) * 0x100000001b3ull;
+            mix(1);
             continue;
         }
         --it;
-        for (const auto& snapshot : it->second) programs = (programs ^ reinterpret_cast<std::uintptr_t>(snapshot.get())) * 0x100000001b3ull;
-        programs = (programs ^ (address - it->first)) * 0x100000001b3ull;
+        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(address - it->first);
     }
-    shared[sharedWords++] = programs;
-    const auto shape = hashDrawKeyWords(std::span(shared).first(sharedWords), 0);
     if (shapeKey != nullptr) *shapeKey = shape;
-    return hashDrawKeyWords(std::span(user).first(userWords), shape);
+    return key;
 }
 
 std::shared_ptr<const DrawDecode> Driver::shapeDecode(std::uint64_t shapeKey, const QueueState& queue, const Submission& submission, bool profile, std::shared_ptr<ShapeStages>* stages, bool* shared) {
@@ -366,7 +318,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     const auto sameTess = [](const std::optional<ShaderRecompiler::TessellationConfiguration>& x, const std::optional<ShaderRecompiler::TessellationConfiguration>& y) {
         if (x.has_value() != y.has_value()) return false;
         if (!x) return true;
-        return x->inputControlPoints == y->inputControlPoints && x->outputControlPoints == y->outputControlPoints && x->domain == y->domain && x->partitioning == y->partitioning && x->outputTopology == y->outputTopology;
+        return x->inputControlPoints == y->inputControlPoints && x->outputControlPoints == y->outputControlPoints && x->domain == y->domain && x->partitioning == y->partitioning && x->outputTopology == y->outputTopology && x->patchesPerGroup == y->patchesPerGroup;
     };
     if (s.stages.path != t.stages.path || s.stages.registerValue != t.stages.registerValue || s.stages.vertexWaveSize != t.stages.vertexWaveSize || s.stages.fragmentWaveSize != t.stages.fragmentWaveSize || !sameMesh(s.stages.mesh, t.stages.mesh) || !sameTess(s.stages.tessellation, t.stages.tessellation)) return false;
     if (!sameColor(s.color, t.color) || s.colors.size() != t.colors.size() || s.blends.size() != t.blends.size()) return false;

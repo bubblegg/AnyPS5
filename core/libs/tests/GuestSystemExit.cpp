@@ -18,6 +18,7 @@
 #include <unistd.h>
 #endif
 extern "C" int APS5_VABI sceSystemServiceLoadExec(const char*, const char* const*);
+extern "C" int APS5_VABI __cxa_atexit_nid_postfix(void (APS5_VABI *func)(void*), void* arg, void* dsoHandle);
 extern "C" void APS5_VABI _Exit_nid_postfix(int);
 extern "C" void APS5_VABI catchReturnFromMain_nid_postfix(int);
 using GuestQuickExitCallback = void (APS5_VABI*)();
@@ -25,9 +26,11 @@ extern "C" int APS5_VABI at_quick_exit_nid_postfix(GuestQuickExitCallback);
 extern "C" void APS5_VABI quick_exit_nid_postfix(int);
 namespace {
 bool cleaned = false;
+bool finalized = false;
 void Cleanup() { cleaned = true; }
+void APS5_VABI Finalize(void*) { finalized = true; }
 void VerifyExit() {
-    if (!cleaned) std::_Exit(1);
+    if (!cleaned || !finalized) std::_Exit(1);
     std::puts("Guest shutdown and atexit completed");
 }
 int quickOrder = 0;
@@ -164,6 +167,7 @@ int main(int argc, char** argv) {
     }
     if (argc > 1) {
         LibcRegisterShutdown_nid_postfix(Cleanup);
+        Require(__cxa_atexit_nid_postfix(Finalize, nullptr, nullptr) == 0);
         Require(std::atexit(VerifyExit) == 0);
         sceSystemServiceLoadExec("exit", nullptr);
         return 2;

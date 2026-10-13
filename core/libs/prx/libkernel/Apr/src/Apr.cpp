@@ -347,15 +347,38 @@ void _addPage(AmmState& state, std::uint64_t address, const AmmPage& page) {
     if (page.pooled) ++state.pooledUses[page.physical];
 }
 
-void _forgetPages(AmmState& state, std::uint64_t address, std::uint64_t size, bool release) {
-    for (auto it = state.pages.lower_bound(address); it != state.pages.end() && it->first < address + size;) {
-        if (it->second.pooled) {
-            const auto uses = state.pooledUses.find(it->second.physical);
-            if (--uses->second == 0 && release) {
-                state.pooledUses.erase(uses);
-                _returnPoolPages(state, it->second.physical, PS5_PAGE_SIZE);
-            }
+void _releasePage(AmmState& state, const AmmPage& page) {
+    if (!page.pooled) return;
+    const auto uses = state.pooledUses.find(page.physical);
+    if (--uses->second == 0) {
+        state.pooledUses.erase(uses);
+        _returnPoolPages(state, page.physical, PS5_PAGE_SIZE);
+    }
+}
+
+class AmmPageReferences {
+public:
+    AmmPageReferences(AmmState& state, const std::vector<AmmPage>& pages) : state(state), pages(pages) {
+        for (const auto& page : pages) {
+            if (page.pooled) ++state.pooledUses.find(page.physical)->second;
         }
+    }
+
+    AmmPageReferences(const AmmPageReferences&) = delete;
+    AmmPageReferences& operator=(const AmmPageReferences&) = delete;
+
+    ~AmmPageReferences() {
+        for (const auto& page : pages) _releasePage(state, page);
+    }
+
+private:
+    AmmState& state;
+    const std::vector<AmmPage>& pages;
+};
+
+void _forgetPages(AmmState& state, std::uint64_t address, std::uint64_t size) {
+    for (auto it = state.pages.lower_bound(address); it != state.pages.end() && it->first < address + size;) {
+        _releasePage(state, it->second);
         it = state.pages.erase(it);
     }
 }
@@ -385,9 +408,9 @@ void _mapPages(AmmState& state, std::uint64_t address, const std::vector<AmmPage
         std::size_t last = first + 1;
         while (last < pages.size() && pages[last].physical == pages[last - 1].physical + PS5_PAGE_SIZE && pages[last].protection == pages[first].protection) ++last;
         _mapRun(address + first * PS5_PAGE_SIZE, pages[first].physical, (last - first) * PS5_PAGE_SIZE, pages[first].protection);
+        for (std::size_t index = first; index < last; ++index) _addPage(state, address + index * PS5_PAGE_SIZE, pages[index]);
         first = last;
     }
-    for (std::size_t index = 0; index < pages.size(); ++index) _addPage(state, address + index * PS5_PAGE_SIZE, pages[index]);
 }
 
 void _clearPrt(AmmState& state, std::uint64_t address, std::uint64_t size) {
@@ -410,7 +433,7 @@ void _ammUnmap(const Apr::AmmUnmapCommand& command) {
     auto& state = _amm();
     const std::lock_guard lock(state.lock);
     _ammCheckRange(state, command.address, command.size);
-    _forgetPages(state, command.address, command.size, true);
+    _forgetPages(state, command.address, command.size);
     _clearPrt(state, command.address, command.size);
     _reserve(command.address, command.size);
 }
@@ -419,7 +442,7 @@ void _ammMapAsPrt(const Apr::AmmUnmapCommand& command) {
     auto& state = _amm();
     const std::lock_guard lock(state.lock);
     _ammCheckRange(state, command.address, command.size);
-    _forgetPages(state, command.address, command.size, true);
+    _forgetPages(state, command.address, command.size);
     _zeroPrt(command.address, command.size);
     for (std::uint64_t offset = 0; offset < command.size; offset += PS5_PAGE_SIZE) state.prt.insert(command.address + offset);
 }
@@ -429,7 +452,7 @@ void _ammUnmapToPrt(const Apr::AmmUnmapCommand& command) {
     const std::lock_guard lock(state.lock);
     _ammCheckRange(state, command.address, command.size);
     _requirePrt(state, command.address, command.size);
-    _forgetPages(state, command.address, command.size, true);
+    _forgetPages(state, command.address, command.size);
     _zeroPrt(command.address, command.size);
 }
 
@@ -469,12 +492,14 @@ void _ammMap(const Apr::AmmMapCommand& command, bool direct) {
     auto& state = _amm();
     const std::lock_guard lock(state.lock);
     _ammCheckRange(state, command.address, command.size);
-    _forgetPages(state, command.address, command.size, true);
+    _reserve(command.address, command.size);
+    _forgetPages(state, command.address, command.size);
     _clearPrt(state, command.address, command.size);
     const auto physical = direct ? command.directOffset : _takePoolPages(state, command.size);
     try {
         _mapRun(command.address, physical, command.size, command.protection);
     } catch (...) {
+        _reserve(command.address, command.size);
         if (!direct) _returnPoolPages(state, physical, command.size);
         throw;
     }
@@ -490,12 +515,14 @@ void _ammRemap(const Apr::AmmRemapCommand& command, bool alias, bool intoPrt) {
     if (intoPrt) _requirePrt(state, command.address, command.size);
     auto pages = _mappedPages(state, command.source, command.size);
     for (auto& page : pages) page.protection = command.protection;
+    const AmmPageReferences references(state, pages);
     if (!alias) {
-        _forgetPages(state, command.source, command.size, false);
-        _clearPrt(state, command.source, command.size);
         _reserve(command.source, command.size);
+        _forgetPages(state, command.source, command.size);
+        _clearPrt(state, command.source, command.size);
     }
-    _forgetPages(state, command.address, command.size, true);
+    _reserve(command.address, command.size);
+    _forgetPages(state, command.address, command.size);
     if (!intoPrt) _clearPrt(state, command.address, command.size);
     _mapPages(state, command.address, pages);
 }

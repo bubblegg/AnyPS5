@@ -31,7 +31,11 @@ GuestCatch:
     call FixtureFail
     ud2
     .cfi_endproc
+#ifdef _WIN32
 .section .rdata,"dr"
+#else
+.section .rodata
+#endif
 .Lcatch_lsda:
     .byte 0xff, 0x80
     .uleb128 .Lcatch_types_end-.Lcatch_types_offset
@@ -48,3 +52,6 @@ GuestCatch:
     .quad FixtureCatchType
     .quad FixtureOtherType
 .Lcatch_types_end:
+#ifndef _WIN32
+.section .note.GNU-stack,"",@progbits
+#endif

@@ -192,10 +192,7 @@ extern "C" {
 
 int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* arguments) {
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
-    if (std::strcmp(path, "exit") == 0) {
-        LibcRunShutdown_nid_postfix();
-        std::exit(0);
-    }
+    if (std::strcmp(path, "exit") == 0) LibcExit_nid_no_patch(0);
     auto launch = PrepareLaunch(path, arguments);
     LibcRunShutdown_nid_postfix();
     std::fflush(nullptr);
@@ -337,8 +334,7 @@ int APS5_VABI sceSystemServiceDisableMusicPlayer(void) {
 }
 
 int APS5_VABI sceSystemServiceOpenChallengeActivity(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceOpenTournamentOccurrence(void) {

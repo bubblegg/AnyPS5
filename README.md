@@ -1,12 +1,12 @@
 # Phasmophobia port
 
-This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyPS5) `main` as of 13 October 2026 plus the changes that run Phasmophobia (PPSA09030) on Windows. It is a working branch, not a release: The upstream thread for the title is [Game bring-up discussion #4680](https://github.com/boykopovar/AnyPS5/discussions/4680).
+This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyPS5) `main` as of 14 October 2026 plus the changes that run Phasmophobia (PPSA09030) on Windows. It is a working branch, not a release: The upstream thread for the title is [Game bring-up discussion #4680](https://github.com/boykopovar/AnyPS5/discussions/4680).
 
 ## What works
 
 - The title starts, reaches the lobby, loads saves and plays a contract.
 - Voice recognition works with the default Windows microphone.
-- Measured on Windows 11 with an RTX 5070 Ti and pipelined draws on: about 26 to 30 presents a second in the lobby (1,500 to 1,900 draws a frame) and about 11 in the truck (about 6,300 draws a frame).
+- Measured on Windows 11 with an RTX 5070 Ti and pipelined draws on: about 26 to 31 presents a second in the lobby (1,700 to 1,900 draws a frame) and about 11 to 12 in the truck (6,100 to 6,600 draws a frame).
 
 ## Known problems
 
@@ -33,17 +33,23 @@ Written with AI assistance.
 
 Tool for automatic executables porting to Linux and Windows.
 
+[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+
+![anyps5_collage1](https://github.com/user-attachments/assets/0f8e13e8-1cb7-4c69-8075-39978e138994)
+
+[Discord](https://discord.gg/BHFztBPUe)
+
 Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
 
 [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
 
 ## Status
 
-[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/) [![shaders](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/)
+[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![shaders](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
 
-[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/)
+[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
 
-[![progress history](https://boykopovar.github.io/AnyPS5/history.svg)](https://boykopovar.github.io/AnyPS5/history.html)
+[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
 
 <sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
 

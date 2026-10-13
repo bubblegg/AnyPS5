@@ -94,6 +94,7 @@ SysVDynamicSection SysVDynamicSectionBuilder::BuildDynamicSection(
 
     for (const auto& ref : nidReferences) {
         if (!ref.Library.empty()) result.ImportModules.emplace(ref.RelocationAddress, ref.Library);
+        if (ref.Function) result.FunctionImports.insert(ref.RelocationAddress);
         std::uint32_t relType = ref.RelocationTypeValue;
         if (relType == 0) relType = R_X86_64_JUMP_SLOT;
 

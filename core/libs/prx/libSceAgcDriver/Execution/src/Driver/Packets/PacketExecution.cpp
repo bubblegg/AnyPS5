@@ -308,6 +308,7 @@ void Driver::execute(const Submission& submission) {
         } else if (header == FlipPacketHeader) {
             CheckFailure();
             std::uint64_t batchesAtFlip = 0, unsignaledAtFlip = 0;
+            bool flipInterruptDeferred = false;
             if (!drains) {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -318,8 +319,13 @@ void Driver::execute(const Submission& submission) {
                 static const bool profileDrawKeys = std::getenv("APS5_PROFILE_DRAW_KEYS") != nullptr;
                 if (profileDrawKeys) DrawKeysAtFlip();
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
-                if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
+                if (localDevice != nullptr) {
+                    localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
+                    const auto queueId = submission.queue;
+                    flipInterruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, false);
+                }
             }
+            if (!flipInterruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
             ++flipsCounted;
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;

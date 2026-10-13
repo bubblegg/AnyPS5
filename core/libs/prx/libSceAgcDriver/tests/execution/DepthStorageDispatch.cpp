@@ -46,6 +46,8 @@ constexpr std::size_t MultisampledOffset = 4u << 16u;
 constexpr std::size_t MultisampledColorOffset = 5u << 16u;
 constexpr std::size_t SampledOffset = 8u << 16u;
 constexpr std::size_t LaterDepthOffset = 10u << 16u;
+constexpr std::size_t ArrayDepthOffset = 12u << 16u;
+constexpr std::size_t ArrayStencilOffset = 13u << 16u;
 
 alignas(256) constexpr std::array<std::uint32_t, 14> ScaleDepthCode{
     0x7e3c0300u, 0x7e3e0280u, 0x7e140280u, 0xf0001108u, 0x00010a1eu, 0xbf8c3f70u, 0x34060082u,
@@ -55,6 +57,16 @@ alignas(256) constexpr std::array<std::uint32_t, 14> ScaleDepthCode{
 alignas(256) constexpr std::array<std::uint32_t, 14> AddStencilCode{
     0x7e3c0300u, 0x7e3e0280u, 0x7e140280u, 0xf0001108u, 0x00010a1eu, 0xbf8c3f70u, 0x34060082u,
     0xe0701000u, 0x80000a03u, 0x4a141484u, 0xf0201108u, 0x00010a1eu, 0xbf810000u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 16> ScaleDepthLayerCode{
+    0x7e3c0300u, 0x7e3e0280u, 0x7e400280u, 0x7e140280u, 0xf0001128u, 0x00010a1eu, 0xbf8c3f70u, 0x34060082u,
+    0xe0701000u, 0x80000a03u, 0x1014140cu, 0xf0201128u, 0x00010a1eu, 0xbf810000u, 0xbf810000u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 16> AddStencilLayerCode{
+    0x7e3c0300u, 0x7e3e0280u, 0x7e400280u, 0x7e140280u, 0xf0001128u, 0x00010a1eu, 0xbf8c3f70u, 0x34060082u,
+    0xe0701000u, 0x80000a03u, 0x4a141484u, 0xf0201128u, 0x00010a1eu, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 9> StoreCode{
@@ -215,13 +227,33 @@ void StoreBackCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, std:
     }
 }
 
-void ArrayViewCase(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+void ArrayViewCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, std::uint8_t* block) {
+    auto* depth = block + ArrayDepthOffset;
+    auto* stencil = block + ArrayStencilOffset;
+    const std::span<std::uint32_t> output(reinterpret_cast<std::uint32_t*>(block + OutputOffset), Threads);
+    const Surface surface{reinterpret_cast<std::uintptr_t>(depth), reinterpret_cast<std::uintptr_t>(stencil), 0, false, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    const VkStencilOpState writeFive{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, 5u};
+    Require(Draw(device, shaders, surface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS, .stencilTest = true, .stencil = writeFive}) == Covered, "the depth and stencil producer of the array views did not cover the surface");
+    const auto layer = [&](std::span<const std::uint32_t> code, const std::uint8_t* plane, std::uint32_t format, float factor) {
+        std::vector<std::uint32_t> userData(16, 0u);
+        const auto buffer = BufferDescriptor(output.data(), static_cast<std::uint32_t>(output.size_bytes()));
+        const auto texture = TextureDescriptor(plane, format, Type2DArray);
+        std::copy(buffer.begin(), buffer.end(), userData.begin());
+        std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+        userData[12] = std::bit_cast<std::uint32_t>(factor);
+        return Compile(device, code, userData);
+    };
+    RunPlane(device, layer(ScaleDepthLayerCode, depth, Format32Float, 1.5f), ScaleDepthLayerCode, output, std::bit_cast<std::uint32_t>(0.5f), "depth dispatch through a one-layer 2D array view");
+    RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}), "depth test against the one-layer 2D array view's depth");
+    RunPlane(device, layer(AddStencilLayerCode, stencil, Format8Uint, 0.0f), AddStencilLayerCode, output, 5u, "stencil dispatch through a one-layer 2D array view");
+    RequireRow(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = StencilEqual(9u)}), "stencil test against the one-layer 2D array view's stencil");
+
     std::vector<std::uint32_t> userData(16, 0u);
-    const auto texture = TextureDescriptor(block, Format32Float, Type2DArray);
+    const auto texture = TextureDescriptor(depth, Format32Float, Type2DArray, TileLinear, 1u);
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     userData[14] = std::bit_cast<std::uint32_t>(1.0f / 64.0f);
     const auto program = Compile(device, StoreLayerCode, userData);
-    ExpectRefusal([&] { device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data())); }, "storage image access to depth/stencil surface", "a one-layer 2D array storage view of the depth plane");
+    ExpectRefusal([&] { device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data())); }, "storage image access to depth/stencil surface", "a two-layer 2D array storage view of the depth plane");
 }
 
 void MultisampledCase(AgcDriver::VulkanDevice& device, const Shaders& compiled, std::uint8_t* block) {
@@ -301,7 +333,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         const auto shaders = DepthFastClearHarness::Compile(*device);
         StoreBackCase(*device, shaders, block.Data());
-        ArrayViewCase(*device, block.Data());
+        ArrayViewCase(*device, shaders, block.Data());
         MultisampledCase(*device, shaders, block.Data());
         TwoViewsCase(*device, block.Data());
         SampledCopyCase(*device, shaders, block.Data());

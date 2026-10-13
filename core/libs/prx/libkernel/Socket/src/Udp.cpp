@@ -393,8 +393,15 @@ struct PollFlag {
 constexpr short GuestPollPriority = 0x2;
 constexpr short GuestPollInvalid = 0x20;
 constexpr short GuestPollAccepted = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100;
+#ifdef _WIN32
+constexpr short NativePollIn = POLLRDNORM;
+constexpr short NativePollPriority = POLLRDBAND;
+#else
+constexpr short NativePollIn = POLLIN;
+constexpr short NativePollPriority = POLLPRI;
+#endif
 constexpr PollFlag RequestFlags[] = {
-    {0x1, POLLIN}, {0x2, POLLPRI}, {0x4, POLLOUT}, {0x40, POLLRDNORM}, {0x80, POLLRDBAND}, {0x100, POLLWRBAND}};
+    {0x1, NativePollIn}, {GuestPollPriority, NativePollPriority}, {0x4, POLLOUT}, {0x40, POLLRDNORM}, {0x80, POLLRDBAND}, {0x100, POLLWRBAND}};
 constexpr PollFlag StatusFlags[] = {{0x8, POLLERR}, {0x10, POLLHUP}, {GuestPollInvalid, POLLNVAL}};
 std::shared_ptr<Socket> Find(int descriptor) {
     std::lock_guard lock(socketsMutex);
@@ -1199,9 +1206,6 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
             pipes.push_back(i);
             continue;
         }
-#ifdef _WIN32
-        if (entry.events & GuestPollPriority) throw std::runtime_error("poll: POLLPRI is not supported by WSAPoll");
-#endif
         NativePollDescriptor request{};
         request.fd = socket->value;
         for (const auto& flag : RequestFlags)

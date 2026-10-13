@@ -272,6 +272,57 @@ static void CheckBatchMapStopsAtInvalidEntry() {
     Require(sceKernelMunmap(entries[0].start, page) == 0);
 }
 
+static void CheckVirtualQueryFindsNeighbours() {
+    constexpr std::size_t page = 0x4000;
+    void* low = nullptr;
+    void* high = nullptr;
+    Require(sceKernelMapNamedFlexibleMemory(&low, page * 4, 3, 0, "neighbours") == 0 && low != nullptr);
+    Require(sceKernelMapFlexibleMemory(&high, page, 3, 0) == 0 && high != nullptr);
+    auto* lowBytes = static_cast<unsigned char*>(low);
+    VirtualQueryInfo info{};
+    Require(sceKernelVirtualQuery(lowBytes + page, 0, &info, sizeof(info)) == 0);
+    Require(info.start == reinterpret_cast<std::uintptr_t>(low) && info.end == reinterpret_cast<std::uintptr_t>(low) + page * 4);
+    Require(sceKernelMprotect(lowBytes + page, page, 1) == 0);
+    Require(sceKernelVirtualQuery(lowBytes + page, 0, &info, sizeof(info)) == 0);
+    Require(info.start == reinterpret_cast<std::uintptr_t>(low) + page && info.end == reinterpret_cast<std::uintptr_t>(low) + page * 2 && info.protection == 1);
+    Require(sceKernelVirtualQuery(lowBytes + page * 2, 0, &info, sizeof(info)) == 0);
+    Require(info.start == reinterpret_cast<std::uintptr_t>(low) + page * 2 && info.end == reinterpret_cast<std::uintptr_t>(low) + page * 4 && info.protection == 3);
+    Require(sceKernelMunmap(lowBytes + page * 2, page) == 0);
+    Require(sceKernelVirtualQuery(lowBytes + page * 2, 0, &info, sizeof(info)) != 0);
+    Require(sceKernelVirtualQuery(lowBytes + page * 2, 1, &info, sizeof(info)) == 0);
+    Require(info.start == reinterpret_cast<std::uintptr_t>(low) + page * 3 && info.end == reinterpret_cast<std::uintptr_t>(low) + page * 4);
+    Require(sceKernelVirtualQuery(lowBytes + page * 3, 0, &info, sizeof(info)) == 0 && info.start == reinterpret_cast<std::uintptr_t>(low) + page * 3);
+    Require(sceKernelMunmap(low, page * 2) == 0);
+    Require(sceKernelMunmap(lowBytes + page * 3, page) == 0);
+    Require(sceKernelMunmap(high, page) == 0);
+}
+
+static void CheckReleaseFindsEveryDirectMapping() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t pieces = 48;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * pieces, 0, 0, &phys) == 0);
+    void* mapped[pieces] = {};
+    for (std::size_t index = 0; index < pieces; ++index) {
+        const auto piece = pieces - 1 - index;
+        Require(sceKernelMapDirectMemory(&mapped[piece], page, 3, 0, phys + static_cast<std::int64_t>(piece * page), 0) == 0);
+        static_cast<unsigned char*>(mapped[piece])[0] = static_cast<unsigned char>(piece);
+    }
+    void* alias = nullptr;
+    Require(sceKernelMapDirectMemory(&alias, page * 2, 3, 0, phys + static_cast<std::int64_t>(page * 10), 0) == 0);
+    Require(static_cast<unsigned char*>(alias)[0] == 10 && static_cast<unsigned char*>(alias)[page] == 11);
+    Require(sceKernelReleaseDirectMemory(phys + static_cast<std::int64_t>(page * 10), page * 3) == 0);
+    VirtualQueryInfo info{};
+    for (std::size_t index = 0; index < pieces; ++index) {
+        const bool released = index >= 10 && index < 13;
+        Require((sceKernelVirtualQuery(mapped[index], 0, &info, sizeof(info)) == 0) != released);
+    }
+    Require(sceKernelVirtualQuery(alias, 0, &info, sizeof(info)) != 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 10) == 0);
+    Require(sceKernelReleaseDirectMemory(phys + static_cast<std::int64_t>(page * 13), page * (pieces - 13)) == 0);
+    for (std::size_t index = 0; index < pieces; ++index) Require(sceKernelVirtualQuery(mapped[index], 0, &info, sizeof(info)) != 0);
+}
+
 static void CheckCheckedReleaseDirectMemory() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -1441,6 +1492,43 @@ static void CheckFailedCollectKeepsWrites() {
 #endif
 }
 
+static void CheckSplitPrivateCollect() {
+#ifdef _WIN32
+    constexpr std::size_t granule = 0x4000;
+    constexpr std::size_t regions = 8;
+    constexpr std::size_t bytes = granule * regions;
+    constexpr std::size_t pages = bytes / 4096;
+    auto* block = static_cast<unsigned char*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, granule));
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, granule);
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    const auto collect = [&](std::size_t capacity) {
+        std::vector<std::uintptr_t> found;
+        std::array<void*, pages> buffer{};
+        for (auto cursor = address; cursor < address + bytes;) {
+            std::size_t count = capacity;
+            Require(GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, address + bytes - cursor, buffer.data(), &count, true));
+            for (std::size_t i = 0; i < count; ++i) found.push_back(reinterpret_cast<std::uintptr_t>(buffer[i]));
+            if (count < capacity) break;
+            cursor = found.back() + 4096;
+        }
+        return found;
+    };
+    collect(pages);
+    for (const std::size_t capacity : {pages, std::size_t{5}, std::size_t{1}}) {
+        for (std::size_t page = 0; page < pages; ++page) static_cast<volatile unsigned char*>(block)[page * 4096 + 7] = static_cast<unsigned char>(capacity + page);
+        const auto found = collect(capacity);
+        Require(found.size() == pages);
+        for (std::size_t page = 0; page < pages; ++page) Require(found[page] == address + page * 4096);
+        Require(collect(pages).empty());
+    }
+    static_cast<volatile unsigned char*>(block)[granule * 3 + 4096 + 1] = 9;
+    const auto one = collect(pages);
+    Require(one.size() == 1 && one[0] == address + granule * 3 + 4096);
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+#endif
+}
+
 static void CheckPinnedSharedPages() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -2105,6 +2193,7 @@ int main() {
     CheckFixedMappingReplacesPartialOverlap();
     CheckFixedMappingOverHoleInsideAllocation();
     CheckDirectMemoryGpuProtBits();
+    CheckSplitPrivateCollect();
     CheckGpuAccessFollowsProtection();
     CheckGpuMapsAreObserved();
     CheckClearingTheObserverWaitsForItsCalls();
@@ -2149,6 +2238,8 @@ int main() {
     CheckMappingCostFollowsTheMappingCount();
     CheckDirectMemoryBackingNeedsNoFilesystem();
     CheckDirectMemorySharedBacking();
+    CheckVirtualQueryFindsNeighbours();
+    CheckReleaseFindsEveryDirectMapping();
 #endif
     constexpr std::size_t page = 0x4000;
     const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));

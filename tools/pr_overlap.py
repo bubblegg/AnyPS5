@@ -20,6 +20,11 @@ def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout
 
 
+def own(prs, sha):
+    return {n: pr for n, pr in prs.items()
+            if pr["sha"] != sha and subprocess.run(["git", "merge-base", "--is-ancestor", pr["sha"], sha], capture_output=True).returncode != 0}
+
+
 def gh(*args):
     return subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
 
@@ -75,7 +80,7 @@ def exports(diff):
     lines = diff.splitlines()
     for i, line in enumerate(lines):
         m = EXPORT.match(line)
-        if not m or m.group(1).endswith("_nid_no_patch"):
+        if not m or m.group(1).endswith(("_nid_no_patch", "_nid_no_patch_cut")):
             continue
         text = line[1:]
         for nxt in lines[i + 1:]:
@@ -192,7 +197,7 @@ if __name__ == "__main__":
     fetch(args.base, prs)
     if args.branch:
         sha = git("rev-parse", args.branch).strip()
-        prs = {n: pr for n, pr in prs.items() if pr["sha"] != sha}
+        prs = own(prs, sha)
         prs[0] = {"ref": sha, "author": None, "depends": set()}
     for pr in prs.values():
         scan(pr)

@@ -206,6 +206,22 @@ void missingPositionals() {
     expectUsage({"--rpath", "/libs"});
 }
 
+void windowsFixedBase() {
+    require(!parse({"--windows", "input.elf", "output.exe"}).windowsFixedBase, "fixed base was enabled by default");
+    for (const auto& value : {"0x400000", "0X400000", "4194304"}) {
+        const auto args = parse({"--windows-fixed-base", value, "--windows", "input.elf", "output.exe"});
+        require(args.windowsFixedBase == 0x400000, "fixed base was parsed incorrectly");
+    }
+    require(parse({"--windows", "--windows-fixed-base", "0x400000000", "input.elf", "output.exe"}).windowsFixedBase == 0x400000000, "fixed base was truncated to 32 bits");
+    for (const auto& value : {"0", "0x10000", "0x400001", "0x", "-4194304", "+4194304", " 4194304", "0x400000junk", "18446744073709551616", "0x800000000000"})
+        expectThrows({"--windows", "--windows-fixed-base", value, "input.elf", "output.exe"}, "--windows-fixed-base requires a 64 KiB-aligned address from 0x20000 through 0x7fffffff0000");
+    expectThrows({"--windows-fixed-base"}, "--windows-fixed-base requires an address");
+    expectThrows({"--windows-fixed-base", "--windows"}, "--windows-fixed-base requires an address");
+    expectThrows({"--windows-fixed-base", "0x400000", "input.elf", "output.exe"}, "--windows-fixed-base requires --windows");
+    expectThrows({"--macos", "--windows-fixed-base", "0x400000", "input.elf", "output.exe"}, "--windows-fixed-base requires --windows");
+    expectThrows({"--windows", "--windows-fixed-base", "0x400000", "--windows-fixed-base", "0x800000", "input.elf", "output.exe"}, "--windows-fixed-base cannot be repeated");
+}
+
 }
 
 int main() {
@@ -233,6 +249,7 @@ int main() {
         windowsDiagnosticsRequiresWindows();
         windowsGuiRequiresWindows();
         missingPositionals();
+        windowsFixedBase();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
