@@ -374,13 +374,31 @@ public:
 private:
     // APS5_REARM_WRITTEN_PAGES=1 protects a written page again at once.
     const bool quietPages = std::getenv("APS5_REARM_WRITTEN_PAGES") == nullptr;
+    const bool skipClean = std::getenv("APS5_NO_CLEAN_COLLECTABLE") == nullptr;
 
     // The views are walked in their order: a lookup per page was a descent of the whole map for each
     // of the hundreds of pages of a render target, on every collect of one.
+    // A clean range is stepped over, as Collect steps over it: its bytes are subpages of mapped,
+    // accessible views that a collect armed, and whatever would make one of them uncollectable (a
+    // protection change, an unmap, a pin) forgets it as clean first (invalidate, reset). A static
+    // texture's range is wholly clean on every collect after its first, and walking its hundreds of
+    // views here was most of the collect. APS5_NO_CLEAN_COLLECTABLE=1 walks every view as before.
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         auto next = views.lower_bound(address & ~(pageBytes - 1));
+        auto clean = skipClean ? cleanRanges.upper_bound(address) : cleanRanges.end();
         for (auto cursor = address; cursor < end;) {
+            if (skipClean) {
+                while (clean != cleanRanges.end() && clean->first <= cursor) ++clean;
+                if (clean != cleanRanges.begin()) {
+                    const auto before = std::prev(clean);
+                    if (cursor < before->second) {
+                        cursor = std::min(end, before->second);
+                        continue;
+                    }
+                }
+            }
             const auto base = cursor & ~(pageBytes - 1);
+            if (next != views.end() && next->first + 64 * pageBytes < base) next = views.lower_bound(base);
             while (next != views.end() && next->first < base) ++next;
             if (next != views.end() && next->first == base) {
                 if (next->second.protection == PAGE_NOACCESS) return false;
