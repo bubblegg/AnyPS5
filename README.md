@@ -6,13 +6,12 @@ This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyP
 
 - The title starts, reaches the lobby, loads saves and plays a contract.
 - Voice recognition works with the default Windows microphone.
-- Measured on Windows 11 with an RTX 5070 Ti and pipelined draws on: about 26 to 31 presents a second in the lobby (1,700 to 1,900 draws a frame) and about 11 to 12 in the truck (training level) (6,100 to 6,600 draws a frame).
+- Measured on Windows 11 with an RTX 5070 Ti and pipelined draws on: about 32 to 33 presents a second in the lobby (about 1,550 draws a frame) and about 12 to 12.5 in the truck (training level) (6,250 to 6,450 draws a frame).
+- The lobby whiteboards render correctly, also after returning from a contract.
 
 ## Known problems
 
 - The frame rate falls with the number of draws in view; the truck being one of the worst cases.
-- Brief colour blocks appear when the camera moves to the lobby whiteboard.
-- One draw type is skipped (`multisampled image resources have no descriptor image shape`).
 - Multisampled targets are drawn with one sample.
 
 ## What is in here
@@ -20,6 +19,7 @@ This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyP
 - Fixes the title needs to run: kernel waits and module loading, network, SSL and entitlement functions, save data sizes, depth and DCC handling.
 - A port of the pipelined draws draft ([#1201](https://github.com/boykopovar/AnyPS5/pull/1201)): one thread prepares draws while another records them. Off unless `APS5_PIPELINED_DRAWS=1` is set.
 - Draw path speed work on top of it: an allocator cache for the driver, a compiled resource walk, per-shape reuse of what a draw prepares and records, pooled per-draw storage, a cached draw key and only the changed Vulkan state recorded per draw. Each has an environment switch that turns it off, and most have one that checks it against the original path.
+- The window does not capture the host cursor, which stays visible and free; `APS5_CAPTURE_MOUSE=1` restores upstream's capture.
 
 ## Building and running
 
