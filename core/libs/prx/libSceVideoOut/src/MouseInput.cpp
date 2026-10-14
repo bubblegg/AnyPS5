@@ -5,6 +5,7 @@
 #include "SDL_video.h"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
     MouseInputEvent input{};
@@ -82,6 +83,11 @@ bool MouseInput::CaptureWanted(bool allowed) const {
 }
 
 void MouseInput::UpdateCapture(bool allowed) {
+    // The host cursor stays free (and visible) unless APS5_CAPTURE_MOUSE=1: a captured cursor
+    // disappears into the window as soon as it reaches it. Relative mode is then left to the pad's
+    // mouse-to-stick toggle alone, as before the capture existed.
+    static const bool captureEnabled = std::getenv("APS5_CAPTURE_MOUSE") != nullptr;
+    if (!captureEnabled) return;
     const bool wanted = CaptureWanted(allowed);
     if (wanted == captured && (SDL_GetRelativeMouseMode() == SDL_TRUE) == wanted) return;
     if (SDL_SetRelativeMouseMode(wanted ? SDL_TRUE : SDL_FALSE) != 0) {
