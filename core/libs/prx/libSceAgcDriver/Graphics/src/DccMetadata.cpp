@@ -502,6 +502,37 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
     return uniform ? ByteKeys(first) : DccKeys::Mixed;
 }
 
+// Diagnostic for a mixed key range: its runs of equal keys (the first twelve) and how many keys
+// hold each value, read as readDccKeys just read them.
+std::string describeMixedKeys(std::uint64_t metaAddress, std::size_t count) {
+    if (count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count)) return "unreadable";
+    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    std::array<std::size_t, 256> totals{};
+    std::string runs;
+    std::size_t listed = 0, runCount = 0;
+    for (std::size_t i = 0; i < count;) {
+        std::size_t end = i + 1;
+        while (end < count && keys[end] == keys[i]) ++end;
+        totals[keys[i]] += end - i;
+        ++runCount;
+        if (listed < 12) {
+            char text[48];
+            std::snprintf(text, sizeof(text), "%s0x%02x x 0x%zx", listed != 0 ? ", " : "", keys[i], end - i);
+            runs += text;
+            ++listed;
+        }
+        i = end;
+    }
+    std::string values;
+    for (std::size_t value = 0; value < totals.size(); ++value) {
+        if (totals[value] == 0) continue;
+        char text[48];
+        std::snprintf(text, sizeof(text), "%s0x%02zx: 0x%zx", values.empty() ? "" : ", ", value, totals[value]);
+        values += text;
+    }
+    return std::to_string(runCount) + " runs from the start: " + runs + "; keys by value: " + values;
+}
+
 DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, bool& memoized) {
     memoized = false;
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
@@ -515,7 +546,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
         static std::mutex reportedMutex;
         static std::set<std::pair<std::uint64_t, int>> reported;
         std::lock_guard lock(reportedMutex);
-        if (reported.size() < 32 && reported.insert({resource.baseAddress, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] texture 0x%llx (format %u) has %s DCC keys at 0x%llx; its texels are read as stored\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, DccKeysName(keys), static_cast<unsigned long long>(resource.dccAddress));
+        if (reported.size() < 32 && reported.insert({resource.baseAddress, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] texture 0x%llx (format %u) has %s DCC keys at 0x%llx; its texels are read as stored (%ux%u, %u mips of %u allocated, levels %u-%u, dimension %d, tile mode %d, 0x%llx surface bytes, 0x%zx keys read, 0x%zx in the key extent; %s)\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, DccKeysName(keys), static_cast<unsigned long long>(resource.dccAddress), resource.width, resource.height, resource.mipCount, resource.allocatedMipCount, resource.baseLevel, resource.lastLevel, static_cast<int>(resource.dimension), static_cast<int>(resource.tileMode), static_cast<unsigned long long>(guestBytes), DccKeyBytes(guestBytes), DccKeyCount(resource, guestBytes), keys == DccKeys::Mixed ? describeMixedKeys(resource.dccAddress, DccKeyBytes(guestBytes)).c_str() : "uniform");
         return DccKeys::Uncompressed;
     }
     return keys;
