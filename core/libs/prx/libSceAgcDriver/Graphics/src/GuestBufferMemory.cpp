@@ -632,9 +632,11 @@ void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
 #ifdef _WIN32
     state.watchDevice = context.device;
-    // Upstream compares direct imports (driver writes can arrive after the import window).
-    // APS5_WATCH_HOST_IMPORTS=1 keeps them write-watched, as before that change.
-    static const bool watchImports = std::getenv("APS5_WATCH_HOST_IMPORTS") != nullptr;
+    // Upstream compares direct imports (driver writes can arrive after the import window). Here they
+    // stay write-watched: since imports are joined into large windows most sampled textures lie in
+    // one, and the comparisons held the lobby at 10 fps (2026-10-14). APS5_UNWATCH_HOST_IMPORTS=1
+    // compares them as upstream does.
+    static const bool watchImports = std::getenv("APS5_UNWATCH_HOST_IMPORTS") == nullptr;
     state.unwatchImports = !watchImports;
     state.unwatchDmaBufImports = false;
     if (!watchImports && context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
