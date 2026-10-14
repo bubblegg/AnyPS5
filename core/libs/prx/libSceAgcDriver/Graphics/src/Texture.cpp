@@ -4821,3 +4821,15 @@ VkImageView StorageTexture::View() const {
 }
 
 }
+
+namespace AgcDriver::Graphics {
+
+std::uint64_t StorageTexture::CpuCopyBytes() {
+    auto& live = Live();
+    std::lock_guard lock(live.mutex);
+    std::uint64_t total = 0;
+    for (const auto* texture : live.textures) total += texture->original.capacity() + texture->generationBaseline.capacity();
+    return total;
+}
+
+}

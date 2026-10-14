@@ -23,6 +23,9 @@ namespace AgcDriver { class VulkanDevice; }
 
 namespace AgcDriver::Graphics {
 
+// CPU copies the sampled texture cache keeps of its snapshots (compared on a lookup).
+std::uint64_t SampledSnapshotCpuBytes();
+
 class Recorder;
 
 void FlushCachedTextures(VkDevice device);

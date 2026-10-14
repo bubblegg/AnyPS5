@@ -2,6 +2,8 @@
 #include <x86intrin.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #endif
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -215,6 +217,15 @@ struct PreparedScope {
         const auto shown = presents - perf.lastPresents;
         std::fprintf(stderr, "[perf] %.1f s: %llu draws prepared in %.1f us each (and %.1f us each waiting for room in the queue), %llu committed in %.1f us each; %llu presents (%.1f a second, %.0f draws each); stages taken from their shape: %llu, %llu of them with the stage inputs checked again, %llu resolved; recorded with their shape's outputs %llu, layout %llu, pipeline %llu, resources %llu, targets %llu of %llu\n", seconds, static_cast<unsigned long long>(preparedDraws), preparedDraws != 0 ? static_cast<double>(preparedCycles) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, preparedDraws != 0 ? static_cast<double>(waitedNow - perf.lastWaited) / cyclesPerUs / static_cast<double>(preparedDraws) : 0.0, static_cast<unsigned long long>(committedDraws), committedDraws != 0 ? static_cast<double>(committedCycles) / cyclesPerUs / static_cast<double>(committedDraws) : 0.0, static_cast<unsigned long long>(shown), static_cast<double>(shown) / seconds, shown != 0 ? static_cast<double>(preparedDraws) / static_cast<double>(shown) : 0.0, static_cast<unsigned long long>(StageMemoCounters().reused.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().revalidated.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().resolved.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().outputs.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().layouts.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().pipelines.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().resources.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().targets.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(Graphics::DrawShapeMemoCounters().draws.exchange(0, std::memory_order_relaxed)));
         std::fprintf(stderr, "[perf]   pixel stages replayed from their shape: %llu; captured instead: %llu with other user words, %llu with the same words over changed memory; stages of any kind captured from their shape without the walk: %llu\n", static_cast<unsigned long long>(StageMemoCounters().replayed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().replayOtherWords.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().replayOtherMemory.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(StageMemoCounters().recaptured.exchange(0, std::memory_order_relaxed)));
+        {
+            // Where the process's memory is: the process (private bytes, working set), the guest memory
+            // imported as host memory, and the CPU copies the driver keeps of sampled snapshots and of
+            // storage images' guest bytes.
+            PROCESS_MEMORY_COUNTERS_EX memory{};
+            memory.cb = sizeof(memory);
+            K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
+            std::fprintf(stderr, "[perf]   memory (MiB): process private %.0f, working set %.0f; host imports %.0f; CPU copies of sampled snapshots %.0f, of storage images %.0f\n", static_cast<double>(memory.PrivateUsage) / 1048576.0, static_cast<double>(memory.WorkingSetSize) / 1048576.0, static_cast<double>(Graphics::HostImportLiveBytes()) / 1048576.0, static_cast<double>(Graphics::SampledSnapshotCpuBytes()) / 1048576.0, static_cast<double>(Graphics::StorageTexture::CpuCopyBytes()) / 1048576.0);
+        }
         {
             auto& walked = StageMemoCounters().walked;
             const auto taken = [&](std::size_t kind, std::size_t reason) { return static_cast<unsigned long long>(walked[kind][reason].exchange(0, std::memory_order_relaxed)); };

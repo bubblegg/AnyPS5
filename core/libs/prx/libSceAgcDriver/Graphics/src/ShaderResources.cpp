@@ -4212,3 +4212,15 @@ bool ShaderResources::ReadsImage(const StorageTexture* image) const {
 }
 
 }
+
+namespace AgcDriver::Graphics {
+
+std::uint64_t SampledSnapshotCpuBytes() {
+    auto& cache = Textures();
+    std::lock_guard lock(cache.mutex);
+    std::uint64_t total = 0;
+    for (const auto& entry : cache.entries) total += entry.bytes.capacity();
+    return total;
+}
+
+}

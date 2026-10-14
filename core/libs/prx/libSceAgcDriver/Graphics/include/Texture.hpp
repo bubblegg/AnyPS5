@@ -291,6 +291,8 @@ public:
     };
     static FillCoverage ClassifyFill(std::uint64_t address, std::size_t bytes);
     static std::size_t NoteKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key);
+    // CPU copies the live storage images keep of their guest bytes (original, generation baseline).
+    static std::uint64_t CpuCopyBytes();
     static std::size_t ClearByKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key);
     // Results pending in images lying wholly inside the range are dead (a fill overwrites every
     // byte of them): they are dropped instead of stored. Returns how many images were.
