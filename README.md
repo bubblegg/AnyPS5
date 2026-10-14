@@ -6,7 +6,7 @@ This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyP
 
 - The title starts, reaches the lobby, loads saves and plays a contract.
 - Voice recognition works with the default Windows microphone.
-- Measured on Windows 11 with an RTX 5070 Ti and pipelined draws on: about 26 to 31 presents a second in the lobby (1,700 to 1,900 draws a frame) and about 11 to 12 in the truck (6,100 to 6,600 draws a frame).
+- Measured on Windows 11 with an RTX 5070 Ti and pipelined draws on: about 26 to 31 presents a second in the lobby (1,700 to 1,900 draws a frame) and about 11 to 12 in the truck (training level) (6,100 to 6,600 draws a frame).
 
 ## Known problems
 
