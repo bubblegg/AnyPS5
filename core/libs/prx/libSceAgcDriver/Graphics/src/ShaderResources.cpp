@@ -112,6 +112,11 @@ struct CachedTexture {
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+    // A snapshot of memory outside the write watch (a direct host import): the write-watch hint,
+    // write stamp, forget serial and newest recorded write it was last proved current at
+    // (GuestMemory::UntrackedHint, as StorageTexture::compareUntracked memoizes its comparisons);
+    // all zero when there is none.
+    std::array<std::uint64_t, 4> untrackedStamp{};
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -647,6 +652,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             committed = std::move(ranges);
         }
     }
+    // A surface the write watch does not cover (generation 0) is proved by comparing its bytes; with
+    // the same write-watch hint and stamps as at its last proof it is unchanged without the compare.
+    // After upstream joined host imports into windows most sampled textures fell outside the watch and
+    // every lookup compared the whole surface. APS5_NO_UNTRACKED_TEXTURE_HINT=1 compares as before.
+    static const bool untrackedHints = std::getenv("APS5_NO_UNTRACKED_TEXTURE_HINT") == nullptr;
+    const auto untrackedStamp = [&]() -> std::array<std::uint64_t, 4> {
+        if (!untrackedHints || source != nullptr || generation != 0 || committed.has_value() || GuestMemory::CollectEpoch() == 0) return {};
+        const auto hint = GuestMemory::UntrackedHint(address, bytes);
+        const auto forget = GuestMemory::ForgetSerial();
+        if (hint == 0 || (forget & 1u) != 0) return {};
+        const auto* recorder = Recorder::Active();
+        return {hint, GuestMemory::NewestStamp(address, bytes), forget, recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+    }();
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
@@ -682,17 +700,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // Diagnostic: how snapshot hits are proved, every 10 s.
             struct SnapshotProofs {
                 std::mutex mutex;
-                std::uint64_t keys = 0, unchanged = 0, compared = 0, comparedBytes = 0, differed = 0, noGeneration = 0, partial = 0;
+                std::uint64_t keys = 0, unchanged = 0, hinted = 0, compared = 0, comparedBytes = 0, differed = 0, noGeneration = 0, partial = 0;
                 std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
             };
             static SnapshotProofs proofs;
             const bool byKeys = *keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle;
             const bool byStamps = !byKeys && unchanged();
-            const bool byBytes = !byKeys && !byStamps && equalsCommitted();
+            const bool byHint = !byKeys && !byStamps && untrackedStamp[0] != 0 && untrackedStamp == it->untrackedStamp && !Recorder::SnapshotWriteOverlaps(address, it->bytes.size());
+            const bool byBytes = !byKeys && !byStamps && !byHint && equalsCommitted();
             {
                 std::lock_guard proofLock(proofs.mutex);
                 if (byKeys) ++proofs.keys;
                 else if (byStamps) ++proofs.unchanged;
+                else if (byHint) ++proofs.hinted;
                 else {
                     ++proofs.compared;
                     proofs.comparedBytes += it->bytes.size();
@@ -702,12 +722,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 }
                 const auto now = std::chrono::steady_clock::now();
                 if (now - proofs.since >= std::chrono::seconds(10)) {
-                    std::fprintf(stderr, "[texture-proof] %.1f s: snapshot hits by keys %llu, by write stamps %llu, by comparing the bytes %llu (%.0f MiB, %llu differed; %llu with no write generation, %llu partly committed)\n", std::chrono::duration<double>(now - proofs.since).count(), static_cast<unsigned long long>(proofs.keys), static_cast<unsigned long long>(proofs.unchanged), static_cast<unsigned long long>(proofs.compared), static_cast<double>(proofs.comparedBytes) / 1048576.0, static_cast<unsigned long long>(proofs.differed), static_cast<unsigned long long>(proofs.noGeneration), static_cast<unsigned long long>(proofs.partial));
-                    proofs.keys = proofs.unchanged = proofs.compared = proofs.comparedBytes = proofs.differed = proofs.noGeneration = proofs.partial = 0;
+                    std::fprintf(stderr, "[texture-proof] %.1f s: snapshot hits by keys %llu, by write stamps %llu, by write-watch hints %llu, by comparing the bytes %llu (%.0f MiB, %llu differed; %llu with no write generation, %llu partly committed)\n", std::chrono::duration<double>(now - proofs.since).count(), static_cast<unsigned long long>(proofs.keys), static_cast<unsigned long long>(proofs.unchanged), static_cast<unsigned long long>(proofs.hinted), static_cast<unsigned long long>(proofs.compared), static_cast<double>(proofs.comparedBytes) / 1048576.0, static_cast<unsigned long long>(proofs.differed), static_cast<unsigned long long>(proofs.noGeneration), static_cast<unsigned long long>(proofs.partial));
+                    proofs.keys = proofs.unchanged = proofs.hinted = proofs.compared = proofs.comparedBytes = proofs.differed = proofs.noGeneration = proofs.partial = 0;
                     proofs.since = now;
                 }
             }
-            if (byKeys || byStamps || byBytes) {
+            if (byKeys || byStamps || byHint || byBytes) {
+                if (byHint || byBytes) it->untrackedStamp = untrackedStamp;
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 touchTexture(cache, it);
@@ -722,6 +743,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
+    entry.untrackedStamp = untrackedStamp;
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
