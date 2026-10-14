@@ -679,7 +679,35 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (it->committed != committed) return false;
                 return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->bytes.size()) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
+            // Diagnostic: how snapshot hits are proved, every 10 s.
+            struct SnapshotProofs {
+                std::mutex mutex;
+                std::uint64_t keys = 0, unchanged = 0, compared = 0, comparedBytes = 0, differed = 0, noGeneration = 0, partial = 0;
+                std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+            };
+            static SnapshotProofs proofs;
+            const bool byKeys = *keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle;
+            const bool byStamps = !byKeys && unchanged();
+            const bool byBytes = !byKeys && !byStamps && equalsCommitted();
+            {
+                std::lock_guard proofLock(proofs.mutex);
+                if (byKeys) ++proofs.keys;
+                else if (byStamps) ++proofs.unchanged;
+                else {
+                    ++proofs.compared;
+                    proofs.comparedBytes += it->bytes.size();
+                    if (!byBytes) ++proofs.differed;
+                    if (generation == 0) ++proofs.noGeneration;
+                    if (committed.has_value()) ++proofs.partial;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now - proofs.since >= std::chrono::seconds(10)) {
+                    std::fprintf(stderr, "[texture-proof] %.1f s: snapshot hits by keys %llu, by write stamps %llu, by comparing the bytes %llu (%.0f MiB, %llu differed; %llu with no write generation, %llu partly committed)\n", std::chrono::duration<double>(now - proofs.since).count(), static_cast<unsigned long long>(proofs.keys), static_cast<unsigned long long>(proofs.unchanged), static_cast<unsigned long long>(proofs.compared), static_cast<double>(proofs.comparedBytes) / 1048576.0, static_cast<unsigned long long>(proofs.differed), static_cast<unsigned long long>(proofs.noGeneration), static_cast<unsigned long long>(proofs.partial));
+                    proofs.keys = proofs.unchanged = proofs.compared = proofs.comparedBytes = proofs.differed = proofs.noGeneration = proofs.partial = 0;
+                    proofs.since = now;
+                }
+            }
+            if (byKeys || byStamps || byBytes) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 touchTexture(cache, it);

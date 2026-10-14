@@ -1160,6 +1160,40 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
+// Diagnostic: collects that answered 0 ("not tracked"), by why, every 10 s with a few of the ranges
+// and what Windows says about their first page. A texture whose collect fails is compared byte by
+// byte on every lookup.
+void noteCollectFailure(std::uint64_t address, std::size_t bytes, int reason) {
+    static std::mutex mutex;
+    static std::array<std::uint64_t, 2> counts{};
+    static std::string samples;
+    static std::size_t sampled = 0;
+    static auto since = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++counts[static_cast<std::size_t>(reason)];
+    if (sampled < 6) {
+        char text[200];
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION memory{};
+        VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory));
+        std::uint32_t protection = 0;
+        const bool view = GuestArena::GuestArenaProtection_nid_postfix(static_cast<std::uintptr_t>(address), &protection);
+        std::snprintf(text, sizeof(text), " [0x%llx+0x%zx %s: state 0x%lx type 0x%lx protect 0x%lx, view %d protect 0x%x]", static_cast<unsigned long long>(address), bytes, reason == 0 ? "untracked" : "walk refused", memory.State, memory.Type, memory.Protect, view ? 1 : 0, protection);
+#else
+        std::snprintf(text, sizeof(text), " [0x%llx+0x%zx %s]", static_cast<unsigned long long>(address), bytes, reason == 0 ? "untracked" : "walk refused");
+#endif
+        samples += text;
+        ++sampled;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since < std::chrono::seconds(10)) return;
+    std::fprintf(stderr, "[collect] %.1f s: %llu collects outside the tracked arena, %llu walks refused; e.g.%s\n", std::chrono::duration<double>(now - since).count(), static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]), samples.c_str());
+    counts = {};
+    samples.clear();
+    sampled = 0;
+    since = now;
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -1194,7 +1228,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) {
+        if (tracker.watched) noteCollectFailure(address, bytes, 0);
+        return 0;
+    }
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -1215,7 +1252,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        noteCollectFailure(address, bytes, 1);
+        return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
