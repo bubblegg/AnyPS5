@@ -13,6 +13,7 @@ This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyP
 
 - The frame rate falls with the number of draws in view; the truck being one of the worst cases.
 - Multisampled targets are drawn with one sample.
+- The very first start, with no shaders compiled yet, once stayed on "Initializing" after "Continue offline"; the next start went through.
 
 ## What is in here
 
@@ -23,7 +24,17 @@ This branch (`phasmophobia-port`) is [AnyPS5](https://github.com/boykopovar/AnyP
 
 ## Building and running
 
-Build as upstream describes in the [build instructions](docs/dev/BUILD.md) and convert the title as in [Usage](docs/user/USAGE.md). This branch was built with WinLibs GCC 16.1.0; upstream supports 15.2.0. Run the converted executable with `APS5_PIPELINED_DRAWS=1` for the figures above.
+1. Build the `libs` and `relinker` targets as upstream describes in the [build instructions](docs/dev/BUILD.md). This branch was built with WinLibs GCC 16.1.0; upstream supports 15.2.0.
+2. Decrypt the title: `eboot.bin`, the modules in `sce_module/` and the plugins in `Media/Plugins/` and `Media/Modules/`, kept in the same layout (ELF files, not SELF).
+3. Convert it (see [Usage](docs/user/USAGE.md)):
+
+   ```
+   relinker --windows --module-dir Media/Plugins --module-dir Media/Modules --exclude-sce-module psvr2.prx <decrypted>/eboot.bin <game>/Phasmophobia.exe
+   ```
+
+   `psvr2.prx` (PS VR2) imports functions of `libSceHmd2` and `libSceVrTracker2` that AnyPS5 does not have, and Windows refuses to start the executable while it is converted (exit code `0xC0000139`). The title runs without it. Upstream marks `--exclude-sce-module` as deprecated.
+4. The converted modules are written to `<game>/app0/`. Copy the rest of the title (`Media/`, `sce_sys/` and the other files) into `<game>/app0/` too, and the built libraries (`build/core/libs/libs/*.prx` with `libgcc_s_seh-1.dll`, `libstdc++-6.dll` and `libwinpthread-1.dll` from the toolchain) into `<game>/libs/`.
+5. Start `Phasmophobia.exe` with `APS5_PIPELINED_DRAWS=1` set for the figures above. The first start compiles shaders and stutters for a few minutes.
 
 Written with AI assistance.
 
