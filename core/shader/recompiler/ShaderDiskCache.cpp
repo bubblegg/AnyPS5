@@ -1167,6 +1167,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_DISK_PLANS",
     "APS5_NO_PERF_DOM_INTERSECTION",
     "APS5_NO_PERF_ITERATION_SELECTION",
+    "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_RESULT_MEMO",
 };
 

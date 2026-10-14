@@ -152,6 +152,7 @@ struct ShaderPixelStageInfo {
     bool stencilRefExportEnable;
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
+    bool ditheredAlphaToCoverage = false;
 };
 
 struct ShaderVertexBufferResource {

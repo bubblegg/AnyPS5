@@ -33,6 +33,7 @@
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
+#include "Optimization/include/Optimization/RedundantValueEliminator.hpp"
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -164,6 +165,10 @@ std::uint64_t FrontEndBuilds() {
     return frontEndBuilds.load(std::memory_order_relaxed);
 }
 
+std::uint32_t ShaderPreparationContext::ResourcePrograms() const {
+    return resourcePrograms;
+}
+
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     return PrepareResourceProgram(request, nullptr);
 }
@@ -171,7 +176,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation) {
     frontEndBuilds.fetch_add(1, std::memory_order_relaxed);
     ShaderPreparationContext local;
-    const auto frontend = (preparation != nullptr ? *preparation : local).AcquireFrontend(request);
+    auto& context = preparation != nullptr ? *preparation : local;
+    ++context.resourcePrograms;
+    context.interfaceSource.reset();
+    context.interfaceProgram.reset();
+    const auto frontend = context.AcquireFrontend(request);
     const auto stageKind = toShaderStageKind(request.shader.stage);
     const auto inputInfo = RequestInputInfo(request);
     const auto& decoded = frontend->decoded;
@@ -297,7 +306,7 @@ struct EmissionFailure {
     std::exception_ptr failure;
 };
 
-struct SourceEntry {
+struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     HostMutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
@@ -456,7 +465,19 @@ std::uint64_t nextVariantId() {
     return variants.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) try {
+template<typename TStep>
+auto recordEmissionFailure(std::exception_ptr* emissionFailure, TStep&& step) -> decltype(step()) {
+    try {
+        return step();
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (...) {
+        if (emissionFailure != nullptr) *emissionFailure = std::current_exception();
+        throw;
+    }
+}
+
+void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
@@ -464,13 +485,19 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     resourceMaterializer.ApplyStaticInterface(program, nativeSampleOffsets);
 
     deadCodeEliminator.RemoveIdentities(program);
+    constexpr RedundantValueEliminator redundantValueEliminator;
+    static_cast<void>(redundantValueEliminator.Eliminate(program));
     deadCodeEliminator.Eliminate(program);
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
+}
 
+CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {
+    const auto inputInfo = RequestInputInfo(request);
     constexpr BindingAllocator bindingAllocator;
     bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
+    program.Metadata().bindingLayoutComplete = false;
     auto bindings = bindingAllocator.Allocate(program, request.layout, registration);
 
     SpirvTargetOptions targetOptions {};
@@ -554,12 +581,16 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     }
 #endif
 
-    return {request.layout, std::move(program).TakeCompiledInfo(), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
-} catch (const std::bad_alloc&) {
-    throw;
-} catch (...) {
-    if (emissionFailure != nullptr) *emissionFailure = std::current_exception();
-    throw;
+    return {request.layout, {}, std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
+}
+
+CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) {
+    return recordEmissionFailure(emissionFailure, [&] {
+        prepareInterface(request, program);
+        auto variant = emitVariant(request, program);
+        variant.info = std::move(program).TakeCompiledInfo();
+        return variant;
+    });
 }
 
 struct SpecializedModule {
@@ -999,6 +1030,29 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+}
+
+struct PreparedInterface {
+    static CompiledVariant Compile(SourceEntry& source, const RecompileRequest& request, ShaderPreparationContext& preparation, std::exception_ptr* emissionFailure) {
+        if (preparation.interfaceSource.get() != &source || preparation.interfaceProgram->Resources().shaderHash != request.shader.codeAddress) {
+            preparation.interfaceSource.reset();
+            preparation.interfaceProgram.reset();
+            auto program = source.program != nullptr ? std::move(source.program) : std::make_unique<IrProgram>(PrepareResourceProgram(request, &preparation));
+            recordEmissionFailure(emissionFailure, [&] { prepareInterface(request, *program); });
+            preparation.interfaceSource = source.shared_from_this();
+            preparation.interfaceProgram = std::move(program);
+        }
+        auto& program = *preparation.interfaceProgram;
+        return recordEmissionFailure(emissionFailure, [&] {
+            auto variant = emitVariant(request, program);
+            variant.info = program.CompiledInfo();
+            return variant;
+        });
+    }
+};
+
+namespace {
+
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
@@ -1023,11 +1077,16 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         }
     }
     if (variant == nullptr) {
-        auto program = source.program != nullptr ? std::move(*source.program) : PrepareResourceProgram(request, preparation);
-        source.program.reset();
+        static const bool layoutPair = std::getenv("APS5_NO_PERF_LAYOUT_PAIR") == nullptr;
         std::exception_ptr emissionFailure;
         try {
-            variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure));
+            if (layoutPair && preparation != nullptr) {
+                variant = std::make_shared<const CompiledVariant>(PreparedInterface::Compile(source, request, *preparation, &emissionFailure));
+            } else {
+                auto program = source.program != nullptr ? std::move(*source.program) : PrepareResourceProgram(request, preparation);
+                source.program.reset();
+                variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure));
+            }
         } catch (...) {
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;

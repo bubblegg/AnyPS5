@@ -5,11 +5,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "ThreadOwned.hpp"
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 
 namespace AgcDriver::DriverDetail {
 
@@ -38,6 +41,23 @@ void Driver::noteReleasedTails(const Submission& submission) {
         tail = scratch.rewindTail;
         words = scratch.rewindWords;
     }
+}
+
+namespace {
+
+std::uint64_t captureTime() {
+    return static_cast<std::uint64_t>(std::llround(TraceMs() * 1000.0));
+}
+
+void writeCaptured(Driver& driver, SubmissionCapture& capture, const CapturedSubmission& captured) {
+    try {
+        capture.Write(captured);
+    } catch (...) {
+        driver.ReportFailure(std::current_exception());
+        throw;
+    }
+}
+
 }
 
 void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words) {
@@ -215,14 +235,14 @@ void Driver::reserveOutputs(Submission& submission) {
 void Driver::executeRewindTail(const Submission& stalled) {
     PerformanceTimer timing("Driver.Rewind");
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
-    if ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
+    if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
         struct BlockedWait {
             Driver& driver;
             std::uint32_t queue;
             ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
         } blocked{*this, stalled.queue};
-        while ((control.load(std::memory_order_acquire) & 0x80000000u) == 0) {
+        while ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
             CheckFailure();
             checkStopping();
             noteAwaitingTitle(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
@@ -247,6 +267,8 @@ void Driver::executeRewindTail(const Submission& stalled) {
     if (APS5_ENABLE_TIMING_LOG) tail.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(tail);
     if (APS5_ENABLE_TIMING_LOG) tail.roomReadyAt = std::chrono::steady_clock::now();
+    auto* const capture = SubmissionCapture::Active();
+    auto captured = capture != nullptr ? SubmissionCapture::Prepare(tail.queue, SubmissionKind::Rewind, tail.commands, tail.conditionalEnds) : CapturedSubmission{};
     {
         std::lock_guard lock(mutex);
         rethrowFailure();
@@ -255,7 +277,9 @@ void Driver::executeRewindTail(const Submission& stalled) {
         tail.shaders = shaders;
         tail.serial = stalled.serial;
         tail.received = ++eventSerial;
+        if (capture != nullptr) capture->Take(captured, tail.serial, captureTime(), tail.heldAtSubmit);
     }
+    if (capture != nullptr) writeCaptured(*this, *capture, captured);
     if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
     timing.Finish();
     execute(tail);
@@ -290,6 +314,8 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
     const auto validated = profile ? std::chrono::steady_clock::now() : start;
+    auto* const capture = SubmissionCapture::Active();
+    auto captured = capture != nullptr ? SubmissionCapture::Prepare(queue, SubmissionKind::Submit, submission.commands, submission.conditionalEnds) : CapturedSubmission{};
     {
         std::lock_guard lock(mutex);
         rethrowFailure();
@@ -302,6 +328,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         submission.received = ++eventSerial;
         const auto now = std::chrono::steady_clock::now();
         submission.enqueuedAt = now;
+        if (capture != nullptr) capture->Take(captured, submission.serial, captureTime(), submission.heldAtSubmit);
         if (profile) {
             ++costs.submissions;
             costs.validateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(validated - copied).count());
@@ -316,11 +343,14 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         ++accepted;
     }
     changed.notify_all();
+    if (capture != nullptr) writeCaptured(*this, *capture, captured);
 }
 
 void Driver::SuspendPoint() {
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     require(!onWorkerThread(), "worker cannot suspend itself");
+    auto* const capture = SubmissionCapture::Active();
+    auto captured = capture != nullptr ? SubmissionCapture::Prepare(0, SubmissionKind::Suspend, {}, {}) : CapturedSubmission{};
     std::unique_lock lock(mutex);
     rethrowFailure();
     checkStopping();
@@ -332,10 +362,14 @@ void Driver::SuspendPoint() {
     boundary.queue = 0;
     boundary.receivedAt = receivedAt;
     boundary.enqueuedAt = std::chrono::steady_clock::now();
+    if (capture != nullptr) capture->Take(captured, boundary.serial, captureTime(), boundary.heldAtSubmit);
     enqueue(std::move(boundary));
     ++accepted;
 
     changed.notify_all();
+    if (capture == nullptr) return;
+    lock.unlock();
+    writeCaptured(*this, *capture, captured);
 }
 
 bool Driver::waitFree(const Submission& submission) {
@@ -417,8 +451,9 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
         return;
     }
     if ((opcode != 0x3c && opcode != 0x93) || packet.size() < 7 || ((packet[1] >> 4u) & 3u) != 1u) return;
-    const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
-    const std::size_t bytes = Pm4::WaitAwaitedBytes(packet);
+    const auto wait = Pm4::DecodeWait(packet);
+    const auto address = wait.address;
+    const std::size_t bytes = wait.bytes;
     if (address % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return;
     const auto worker = workers.find(submission.queue);
     for (std::size_t offset = 0; offset < bytes; offset += 4) {

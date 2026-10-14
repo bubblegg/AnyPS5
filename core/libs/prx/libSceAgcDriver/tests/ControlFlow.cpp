@@ -501,6 +501,38 @@ void verifyNullSwappc() {
 
 }
 
+void VerifyUserDataTail() {
+    const RdnaInstructionDecoder decoder;
+    const std::vector<std::uint32_t> code{0x7e000280u, 0xbe802008u, 0xbf9f0000u};
+    const auto decoded = decoder.Decode(code);
+    const auto tail = FindUserDataTail(decoded, 8u, 2u);
+    require(tail && tail->programCounter == 4u && tail->userDataRegister == 8u, "unchanged user-data tail was not recognized");
+    require(!FindUserDataTail(decoded, 9u, 2u) && !FindUserDataTail(decoded, 8u, 1u), "tail outside user data was accepted");
+    const std::vector<std::vector<std::uint32_t>> refused{
+        {0xbe880380u, 0xbe802008u, 0xbf9f0000u},
+        {0xbe890380u, 0xbe802008u, 0xbf9f0000u},
+        {0xbe880480u, 0xbe802008u, 0xbf9f0000u},
+        {0xf4080200u, 0xfa000000u, 0xbe802008u, 0xbf9f0000u},
+        {0xbf820000u, 0xbe802008u, 0xbf9f0000u},
+        {0xbe802009u, 0xbf9f0000u},
+        {0xbe802008u, 0xbf810000u},
+        {0xbe802008u, 0xbf800000u, 0xbf9f0000u},
+    };
+    for (const auto& rejected : refused) require(!FindUserDataTail(decoder.Decode(rejected), 8u, 4u), "a modified, branching or malformed tail was accepted");
+    const std::vector<std::uint32_t> continuation{0xbf820001u, 0x7e000281u, 0xbf810000u};
+    const auto linked = LinkUserDataTail(decoded, *tail, decoder.Decode(continuation));
+    require(linked == std::vector<std::uint32_t>({0x7e000280u, 0xbf820000u, 0xbf820001u, 0x7e000281u, 0xbf810000u}), "linking did not preserve relative branches and register operations");
+    static_cast<void>(GraphBuilder{}.Build(decoder.Decode(linked)));
+    const std::vector<std::uint32_t> readsPc{0xbe8c1f00u, 0xbf810000u};
+    bool refusedPc = false;
+    try {
+        static_cast<void>(LinkUserDataTail(decoded, *tail, decoder.Decode(readsPc)));
+    } catch (const std::invalid_argument& error) {
+        refusedPc = std::string_view(error.what()).find("reads its program counter") != std::string_view::npos;
+    }
+    require(refusedPc, "a continuation reading its relocated PC was accepted");
+}
+
 int main(int argc, char** argv) {
     try {
         verifyLoopMergeDoesNotEnterNestedSelection();
@@ -1300,6 +1332,7 @@ done:
     }
     try {
         verifyNullSwappc();
+        VerifyUserDataTail();
         verifyLargeLoopExitFallback();
         verifyNestedExitForwarders();
         verifyIrreducibleLoopEntry();

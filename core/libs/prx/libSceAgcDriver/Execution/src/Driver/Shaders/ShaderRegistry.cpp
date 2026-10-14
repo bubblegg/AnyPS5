@@ -91,6 +91,7 @@ std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
             std::as_writable_bytes(std::span(snapshot.code).subspan(previous)), alignof(std::uint32_t));
         try {
             const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(snapshot.code);
+            if (const auto tail = ShaderRecompiler::FindUserDataTail(decoded, 0u, 106u)) snapshot.userDataTailRegister = tail->userDataRegister;
             const auto& last = decoded.instructions.back();
             snapshot.code.resize(last.programCounter / sizeof(std::uint32_t) + last.wordCount);
             auto result = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
@@ -118,6 +119,16 @@ std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
         }
     }
     throw std::runtime_error("AGC driver: raw shader program has no reachable end within mapped code or the size limit");
+}
+
+std::shared_ptr<const ShaderSnapshot> ReadUserDataTailContinuation(std::span<const std::uint32_t> code, std::uint32_t userDataBase, std::span<const std::uint32_t> userData) {
+    const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    const auto tail = ShaderRecompiler::FindUserDataTail(program, userDataBase, static_cast<std::uint32_t>(userData.size()));
+    if (!tail) return nullptr;
+    const auto slot = tail->userDataRegister - userDataBase;
+    const auto address = userData[slot] | (static_cast<std::uint64_t>(userData[slot + 1u]) << 32u);
+    require(address != 0 && (address & 3u) == 0u, "user-data tail continuation address is null or not dword aligned");
+    return ReadRawShader(address);
 }
 
 std::shared_ptr<const ShaderSnapshot> ProgramSnapshot(const ShaderRegistry& shaders, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
@@ -168,10 +179,11 @@ bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset
     return used;
 }
 
-std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl) {
+std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl, const ShaderSnapshot* continuation) {
     constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
     const auto bits = paClVsOutCntl & Graphics::PositionExportLayoutBits;
     if (bits == 0) return 0;
+    if (continuation != nullptr && PositionExportLayout(continuation, 0, continuation->code, bits) != 0) return bits;
     const bool cached = snapshot != nullptr && codeOffset == 0;
     if (cached) {
         const auto use = snapshot->positionVectorUse->load(std::memory_order_acquire);
@@ -199,7 +211,22 @@ bool VertexWorkgroupRequired(const QueueState& queue, const ShaderRegistry& regi
     const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second) << 40u);
     const auto snapshot = ProgramSnapshot(registry, address, {2});
     require((address - snapshot->codeAddress) % sizeof(std::uint32_t) == 0, "graphics entry point is not dword aligned");
-    return (snapshot->header.empty() || snapshot->type == 2) && ProgramUsesWorkgroup(*snapshot, (address - snapshot->codeAddress) / sizeof(std::uint32_t));
+    const auto offset = (address - snapshot->codeAddress) / sizeof(std::uint32_t);
+    if (!snapshot->header.empty()) return snapshot->type == 2 && ProgramUsesWorkgroup(*snapshot, offset);
+    if (!snapshot->userDataTailRegister) return ProgramUsesWorkgroup(*snapshot, offset);
+    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, 0x8b);
+    const auto resources = queue.shader.find(0x8b);
+    const auto rsrc2 = resources == queue.shader.end() ? 0u : resources->second;
+    const auto count = ((rsrc2 >> 1u) & 0x1fu) | (((rsrc2 >> 27u) & 1u) << 5u);
+    require(count <= 32, "graphics user SGPR count exceeds the register bank");
+    std::vector<std::uint32_t> userData;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, 0x8c + index);
+        const auto found = queue.shader.find(0x8c + index);
+        userData.push_back(found == queue.shader.end() ? 0u : found->second);
+    }
+    const auto continuation = ReadUserDataTailContinuation(std::span(snapshot->code).subspan(offset), 8u, userData);
+    return ProgramUsesWorkgroup(*snapshot, offset) || (continuation != nullptr && ProgramUsesWorkgroup(*continuation, 0u));
 }
 
 struct ShaderPreparationTransaction::State {
@@ -469,6 +496,15 @@ ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, con
 
 namespace {
 
+std::vector<std::uint32_t> LinkVertexUserDataTail(const ShaderRecompiler::RecompileRequest& request, const ShaderSnapshot& snapshot) {
+    if (request.shader.stage != ShaderRecompiler::ShaderStage::Vertex || !request.shader.header.empty() || !snapshot.userDataTailRegister) return {};
+    const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.shader.code);
+    const auto tail = ShaderRecompiler::FindUserDataTail(program, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()));
+    if (!tail) return {};
+    const auto continuation = ReadUserDataTailContinuation(request.shader.code, request.context.userDataBaseRegister, request.context.userData);
+    return ShaderRecompiler::LinkUserDataTail(program, *tail, ShaderRecompiler::RdnaInstructionDecoder{}.Decode(continuation->code));
+}
+
 std::string hexText(std::uint64_t value) {
     char text[24];
     std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
@@ -523,7 +559,8 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
-    const auto linked = LinkUserDataCallees(request);
+    auto linked = LinkUserDataCallees(request);
+    if (linked.empty()) linked = LinkVertexUserDataTail(request, snapshot);
     auto source = request;
     if (!linked.empty()) source.shader.code = linked;
     auto invocationRequest = source;
@@ -730,8 +767,16 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     return plan;
 }
 
+bool LibraryPrebuildDisabled() {
+    static const bool disabled = [] {
+        const auto* value = std::getenv("APS5_NO_LIBRARY_PREBUILD");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return disabled;
+}
+
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset) {
-    if (result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
+    if (LibraryPrebuildDisabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
     SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset] {
         const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), pushOffset}}};
         try {
@@ -751,7 +796,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         entries.push_back({plan.codeOffset, PrepareShaderWithDiagnostics(request, &preparation)});
     };
     append();
-    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment) {
+    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled()) {
         try {
             PrebuildStageLibrary(plan.prebuildDevice, {Graphics::ShaderPath::Vertex, 0u, 32u, request.context.waveSize, {}, {}}, request.shader.stage, ShaderRecompiler::RegistrationResult(request, *entries.front().handle), request.layout.pushConstantOffsetBytes);
         } catch (const std::exception& error) {
@@ -981,7 +1026,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto wave = fragment ? decoded.state.stages.fragmentWaveSize : decoded.state.stages.vertexWaveSize;
         std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
         if (!fragment) vertex = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, nullptr, true, 8u - program.firstUserSgpr);
-        if (vertex) vertex->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, decoded.state.paClVsOutCntl) | decoded.state.layerExports;
+        if (vertex) vertex->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, decoded.state.paClVsOutCntl, program.tailContinuation.get()) | decoded.state.layerExports;
         pushOffset = Graphics::StagePushOffset(pushOffset, program.binary.stage, fixedSlots);
         const auto offset = pushOffset;
         const auto room = (fixedSlots && fragment ? Graphics::PipelinePushSlotBytes : capacity) - pushOffset % Graphics::PipelinePushSlotBytes;
@@ -1002,7 +1047,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto bytes = handle->artifact->bindings.pushConstantSizeBytes;
         require(bytes <= room, "prepared graphics stages exceed the push constant block");
         std::shared_ptr<const ShaderRecompiler::RecompileResult> registration;
-        if (target.registrationModules) {
+        if (target.registrationModules && !LibraryPrebuildDisabled()) {
             try {
                 registration = ShaderRecompiler::RegistrationResult(request, *handle);
             } catch (const std::exception& error) {

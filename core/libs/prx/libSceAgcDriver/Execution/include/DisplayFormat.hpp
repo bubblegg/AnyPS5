@@ -12,6 +12,7 @@ VkFormat DisplayTexelFormat(std::uint64_t pixelFormat);
 bool DisplayTenBit(std::uint64_t pixelFormat);
 bool DisplayRedLow(std::uint64_t pixelFormat);
 bool DisplayHalfFloat(std::uint64_t pixelFormat);
+bool DisplayPq(std::uint64_t pixelFormat);
 std::uint32_t DisplayTexelBytes(std::uint64_t pixelFormat);
 
 enum class ResidentPresent : std::uint8_t { None, Blit, Convert };

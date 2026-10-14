@@ -18,10 +18,12 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "CacheKey.hpp"
+#include "CompiledVariant.hpp"
 #include "BdaAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -336,6 +338,140 @@ void verifyFrontendPair() {
         verifyResult(pixelReference, *MaterializeShader(pixel, *pixelCapture, *pixelHandle));
         verifyResult(zeroReference, *MaterializeShader(zero, *zeroCapture, *zeroHandle));
     }
+}
+
+ShaderRecompiler::RecompileRequest LayoutPairRequest(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, bool registration, std::uint32_t wordLimit) {
+    using namespace ShaderRecompiler;
+    auto request = FrontendRequest(code, userData);
+    request.shader.stage = ShaderStage::Fragment;
+    request.context.compute.reset();
+    request.context.pixel = ShaderPixelStageInfo{};
+    request.context.pixel->wave32 = true;
+    request.context.pixel->targetOutputMode[0] = 9u;
+    request.context.waveSize = 32u;
+    request.target.registrationModules = registration;
+    request.target.registrationWordLimit = wordLimit;
+    request.useCache = true;
+    return request;
+}
+
+void verifyLayoutPairVariant(const ShaderRecompiler::SourceHandle& paired, const ShaderRecompiler::SourceHandle& isolated) {
+    const auto& left = *paired.artifact;
+    const auto& right = *isolated.artifact;
+    require(left.artifact.spirv == right.artifact.spirv, "layout pair: the SPIR-V differs from an isolated compile");
+    require(left.bindings.layout == right.bindings.layout && left.bindings.layout.UsesPushData() == right.bindings.layout.UsesPushData() && left.bindings.pushConstantOffsetBytes == right.bindings.pushConstantOffsetBytes && left.bindings.pushConstantSizeBytes == right.bindings.pushConstantSizeBytes, "layout pair: the binding layout or push range differs from an isolated compile");
+    const auto& a = left.artifact;
+    const auto& b = right.artifact;
+    const auto sameParameter = [](const ShaderRecompiler::FragmentParameter& p, const ShaderRecompiler::FragmentParameter& q) {
+        return p.location == q.location && p.sourceLocation == q.sourceLocation && p.flat == q.flat && p.perVertex == q.perVertex && p.custom == q.custom && p.flatP10 == q.flatP10;
+    };
+    require(a.vertexInputPatches == b.vertexInputPatches && a.memoryOffsetDword == b.memoryOffsetDword && a.shaderDataDwords == b.shaderDataDwords && a.imageMetadataDword == b.imageMetadataDword && a.runtimeImageCount == b.runtimeImageCount && a.runtimeImageResources == b.runtimeImageResources && a.registrationModule == b.registrationModule && a.bdaAbiVersion == b.bdaAbiVersion && a.runtimeAbiVersion == b.runtimeAbiVersion, "layout pair: the artifact's bindings or ABI differ from an isolated compile");
+    require(a.vertexInputs == b.vertexInputs && a.vertexOffsetSgpr == b.vertexOffsetSgpr && a.instanceOffsetSgpr == b.instanceOffsetSgpr && a.vertexOffsetShared == b.vertexOffsetShared && a.instanceOffsetShared == b.instanceOffsetShared && a.vertexOffsetConflict == b.vertexOffsetConflict && a.instanceOffsetConflict == b.instanceOffsetConflict && a.hostSubgroupSize == b.hostSubgroupSize, "layout pair: the artifact's vertex interface differs from an isolated compile");
+    require(a.parameterExports == b.parameterExports && std::ranges::equal(a.fragmentParameters, b.fragmentParameters, sameParameter) && a.barycentricEmulation.active == b.barycentricEmulation.active && a.barycentricEmulation.smooth == b.barycentricEmulation.smooth && a.barycentricEmulation.linear == b.barycentricEmulation.linear, "layout pair: the artifact's fragment interface differs from an isolated compile");
+    const auto& x = left.info;
+    const auto& y = right.info;
+    require(x.stage == y.stage && x.shaderHash == y.shaderHash && x.waveSize == y.waveSize && x.userDataBase == y.userDataBase && x.userDataCount == y.userDataCount && x.scratchDwords == y.scratchDwords && x.paramExportMask == y.paramExportMask && x.info == y.info && x.bindings == y.bindings, "layout pair: the compiled shader information differs from an isolated compile");
+}
+
+void verifyLayoutPairIsolation(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle, std::uint32_t separateLimit) {
+    using namespace ShaderRecompiler;
+    const std::vector<std::uint32_t> isolatedCode(request.shader.code.begin(), request.shader.code.end());
+    auto isolated = request;
+    isolated.shader.code = isolatedCode;
+    isolated.target.registrationWordLimit = separateLimit;
+    const auto reference = PrepareShader(isolated);
+    require(reference->source != handle.source, "layout pair: the isolated compile shared a source");
+    verifyLayoutPairVariant(handle, *reference);
+    SrtRuntime runtime{};
+    runtime.userData = request.context.userData;
+    runtime.shaderBase = request.shader.codeAddress;
+    auto uncached = request;
+    uncached.useCache = false;
+    verifyResult(Recompile(uncached), *MaterializeShader(request, *CaptureResources(request, runtime, handle), handle));
+}
+
+void verifyLayoutPair() {
+    using namespace ShaderRecompiler;
+    const bool reuse = std::getenv("APS5_NO_PERF_LAYOUT_PAIR") == nullptr;
+    const std::array<std::uint32_t, 4> buffer{0x10000000u, 0u, 0x40u, 0x00027facu};
+    const auto pixelCode = [](std::uint32_t variant) {
+        return std::vector<std::uint32_t>{0xbf800000u | variant, 0xf4200100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0xf800180fu, 0u, 0xbf810000u};
+    };
+    const auto interpolatedCode = [](std::uint32_t variant) {
+        return std::vector<std::uint32_t>{0xbf800000u | variant, 0xc8100000u, 0xc8110001u, 0xc8140500u, 0xc8150501u, 0xf4200100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0xf800180fu, 0x05040500u, 0xbf810000u};
+    };
+    const auto defaultLimit = SpirvTarget{}.registrationWordLimit;
+    struct Configuration {
+        bool registration;
+        std::uint32_t wordLimit;
+        std::uint32_t pushOffset;
+        bool interpolated;
+    };
+    std::uint32_t variant = 0u;
+    for (const auto& [registration, wordLimit, pushOffset, interpolated] : {Configuration{false, defaultLimit, 0u, false}, Configuration{true, defaultLimit, 0u, false}, Configuration{true, defaultLimit, 128u, false}, Configuration{true, 1u, 128u, false}, Configuration{true, defaultLimit, 128u, true}}) {
+        for (const bool zeroFirst : {false, true}) {
+            const auto code = interpolated ? interpolatedCode(variant++) : pixelCode(variant++);
+            auto pixel = LayoutPairRequest(code, buffer, registration, wordLimit);
+            pixel.layout.pushConstantOffsetBytes = pushOffset;
+            if (interpolated) {
+                pixel.context.pixel->interpolatorCount = 2u;
+                pixel.context.pixel->interpolatorSettings[1] = 1u;
+                pixel.context.pixel->inputAddr = PixelInputBit(PixelInput::PerspectiveCenter);
+                pixel.context.pixel->hasPerspectiveCenterVgpr = true;
+            }
+            auto zero = pixel;
+            zero.layout.pushConstantSizeBytes = 0u;
+            ShaderPreparationContext preparation;
+            const auto first = PrepareShader(zeroFirst ? zero : pixel, &preparation);
+            const auto second = PrepareShader(zeroFirst ? pixel : zero, &preparation);
+            require(first->source == second->source, "layout pair: the two layouts did not share a source");
+            require(preparation.ResourcePrograms() == (reuse ? 1u : 2u), "layout pair: the second layout ignored the reuse switch");
+            const auto& pixelHandle = zeroFirst ? second : first;
+            const auto& zeroHandle = zeroFirst ? first : second;
+            require(pixelHandle->artifact->bindings.layout.UsesPushData() && !zeroHandle->artifact->bindings.layout.UsesPushData(), "layout pair: the fixture does not distinguish the push-constant capacities");
+            const bool module = registration && wordLimit == defaultLimit;
+            require(GetPreparedArtifact(*pixelHandle).registrationModule == module && GetPreparedArtifact(*zeroHandle).registrationModule == module, "layout pair: the word limit did not choose the module mode");
+            require(GetPreparedArtifact(*pixelHandle).fragmentParameters.size() == (interpolated ? 2u : 0u) && GetPreparedArtifact(*zeroHandle).fragmentParameters.size() == (interpolated ? 2u : 0u), "layout pair: the interpolated fixture did not declare its two parameters");
+            verifyLayoutPairIsolation(pixel, *pixelHandle, wordLimit + 1u);
+            verifyLayoutPairIsolation(zero, *zeroHandle, wordLimit + 2u);
+        }
+    }
+
+    const auto code = pixelCode(variant++);
+    const auto pixel = LayoutPairRequest(code, buffer, true, defaultLimit);
+    auto relocated = pixel;
+    relocated.shader.codeAddress += 0x1000u;
+    relocated.layout.pushConstantSizeBytes = 0u;
+    ShaderPreparationContext preparation;
+    const auto first = PrepareShader(pixel, &preparation);
+    const auto moved = PrepareShader(relocated, &preparation);
+    require(first->source == moved->source, "layout pair: relocated code did not share the source");
+    require(preparation.ResourcePrograms() == 2u && moved->artifact->info.shaderHash == relocated.shader.codeAddress, "layout pair: a program translated at another code address was reused");
+    verifyLayoutPairIsolation(relocated, *moved, defaultLimit + 1u);
+
+    const std::vector<std::uint32_t> colorCode{0xbf800000u | variant++, 0x7e000200u, 0xf800180fu, 0u, 0xbf810000u};
+    auto color = LayoutPairRequest(colorCode, std::span(buffer).first(1u), true, defaultLimit);
+    color.shader.codeAddress = relocated.shader.codeAddress;
+    color.layout.pushConstantSizeBytes = 0u;
+    require(ResolveSource(color) != nullptr, "layout pair: the other source was not resolved");
+    const auto colored = PrepareShader(color, &preparation);
+    require(colored->source != first->source && preparation.ResourcePrograms() == 2u, "layout pair: another source at the same code address reused the retained program");
+    verifyLayoutPairIsolation(color, *colored, defaultLimit + 1u);
+
+    const auto retained = colored->source.use_count();
+    const auto otherCode = pixelCode(variant++);
+    static_cast<void>(PrepareResourceProgram(LayoutPairRequest(otherCode, buffer, true, defaultLimit), &preparation));
+    require(preparation.ResourcePrograms() == 3u && retained - colored->source.use_count() == (reuse ? 1 : 0), "layout pair: the context kept a program while it built another");
+
+    const std::vector<std::uint32_t> computeCode{0xbf800000u, 0xbf810000u};
+    auto compute = FrontendRequest(computeCode, buffer);
+    compute.context.userDataBaseRegister = 2u;
+    compute.context.compute->scratchDwords = 64u;
+    auto program = PrepareResourceProgram(compute);
+    const auto copied = program.CompiledInfo();
+    const auto taken = std::move(program).TakeCompiledInfo();
+    require(taken.userDataBase == 2u && taken.scratchDwords == 64u, "layout pair: the compute fixture did not set a user-data base and scratch");
+    require(copied.stage == taken.stage && copied.shaderHash == taken.shaderHash && copied.waveSize == taken.waveSize && copied.userDataBase == taken.userDataBase && copied.userDataCount == taken.userDataCount && copied.scratchDwords == taken.scratchDwords && copied.paramExportMask == taken.paramExportMask && copied.info == taken.info && copied.bindings == taken.bindings, "layout pair: the copied compiled information differs from the moved one");
 }
 
 void verifyRegisterSources() {
@@ -923,6 +1059,24 @@ void verifyBindlessTable() {
     latch.context.memory = latchRegions;
     require(!Recompile(latch, *latchCapture)->spirv.empty(), "bindless: a sample in a loop latch did not compile");
 
+    std::vector<std::uint32_t> queryCode(wholeCode.begin(), wholeCode.begin() + 8);
+    queryCode.insert(queryCode.end(), {0xbea80380u, 0x7e040280u, 0x7e200500u, 0x80102810u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf0380f08u, 0x00050402u, 0xf09c0f08u, 0x00450800u, 0x80288128u, 0xbf0a8228u, 0xbf85fff4u, 0xe0700000u, 0x80070800u, 0xe0700004u, 0x80070400u, 0xbf810000u});
+    auto query = makeRequest(queryCode);
+    const auto queryPlan = GetResourcePlan(query);
+    require(std::ranges::count_if(queryPlan->descriptorSources, [](const DescriptorSource& source) { return source.indirectImage.has_value(); }) == 1, "bindless: a T# both queried and sampled was not planned as one table");
+    AgcDriver::ShaderMemory queryMemory({});
+    const auto queryCapture = queryMemory.Capture(query);
+    const auto queryDirect = static_cast<std::uint32_t>(queryPlan->info.images.size());
+    require(queryDirect == 1u, "bindless: the queried and sampled T# became more than one image");
+    const auto queryRoot = tableRoot(*queryCapture, queryDirect);
+    require(queryCapture->snapshot.images[queryRoot].dwords == heap[0] && queryCapture->snapshot.images[queryDirect].dwords == heap[1], "bindless: the queried and sampled table slots are wrong");
+    query.context.memory = queryMemory.Regions();
+    const auto queried = Recompile(query, *queryCapture);
+    require(!queried->spirv.empty(), "bindless: a T# both queried and sampled did not compile");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(queried->spirv, query.target.vulkanVersion, query.target.spirvVersion));
+#endif
+
     // A table wider than the slots without a material pattern is rejected.
     fillSrt(100u);
     AgcDriver::ShaderMemory wideMemory({});
@@ -1427,6 +1581,20 @@ void verifyHalfWaveReduction() {
         {0u, 0x38000000u, 0x88000000u, spv::OpGroupNonUniformBitwiseOr, "half-wave reduction: the wave64 OR scan did not read lane 31 as a subgroup OR on 32 lanes"},
     }};
     for (const auto& reduction : scans) require(reductions(pixel(scan(reduction.identity, reduction.vector, reduction.scalar), 32u, true), reduction.reduce) == 1u, reduction.message);
+    auto comparedScan = scan(0u, 0x38000000u, 0x88000000u);
+    *std::find(comparedScan.begin(), comparedScan.end(), 0xbe98047eu) = 0x8a986a7eu;
+    comparedScan.insert(comparedScan.begin(), 0x7c080080u);
+    require(reductions(pixel(comparedScan, 32u, true), spv::OpGroupNonUniformBitwiseOr) == 1u, "half-wave reduction: an OR scan keyed by the lanes that failed a compare did not read lane 31 as a subgroup OR on 32 lanes");
+    auto narrowedScan = comparedScan;
+    std::vector<std::uint32_t> narrowing;
+    for (std::uint32_t step = 1; step <= 600u; ++step) {
+        const auto threshold = -static_cast<float>(step);
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &threshold, sizeof(bits));
+        narrowing.insert(narrowing.end(), {0x7c0800ffu, bits, 0x87fe6a7eu});
+    }
+    narrowedScan.insert(narrowedScan.begin(), narrowing.begin(), narrowing.end());
+    require(reductions(pixel(narrowedScan, 32u, true), spv::OpGroupNonUniformBitwiseOr) == 1u, "half-wave reduction: an OR scan keyed by lanes that 600 compares narrowed exec to did not read lane 31 as a subgroup OR on 32 lanes");
     for (const auto& reduction : scans) {
         const auto wide = "half-wave reduction: a wave64 scan reduced by SPIR-V opcode " + std::to_string(reduction.reduce) + " did not read lanes 31 and 63 as reductions of host invocations 0-31 and 32-63 on 64 lanes";
         require(halves(pixel(scan(reduction.identity, reduction.vector, reduction.scalar), 64u, true), reduction.reduce, reduction.identity), wide.c_str());
@@ -1843,6 +2011,177 @@ std::string requestPrefix(std::string_view text, std::size_t bytes) {
     return result;
 }
 
+void verifyCanonicalVersion20And21Requests() {
+    using namespace ShaderRecompiler;
+    struct Fixture { ShaderStage stage; std::uint32_t selector; bool subgroups; std::string_view text; };
+    static constexpr std::array<Fixture, 12> fixtures{{
+        {ShaderStage::Fragment, 0u, false,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAA="},
+        {ShaderStage::Fragment, 0u, true,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAE="},
+        {ShaderStage::Fragment, 1u, false,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEBAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAA="},
+        {ShaderStage::Fragment, 1u, true,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEBAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAE="},
+        {ShaderStage::Fragment, 2u, false,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQECAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAA="},
+        {ShaderStage::Fragment, 2u, true,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQECAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAE="},
+        {ShaderStage::Fragment, 3u, false,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEDAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAA="},
+        {ShaderStage::Fragment, 3u, true,
+            "NVNQQRQAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEDAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAA"
+            "AAF4VjQSAQEBOTAAAAE="},
+        {ShaderStage::Vertex, 330245u, false,
+            "NVNQQRQAAAABAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACQAAAA0AAAABBQoFAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAAAAF4VjQS"
+            "AQEBOTAAAAA="},
+        {ShaderStage::Vertex, 330245u, true,
+            "NVNQQRQAAAABAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACQAAAA0AAAABBQoFAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAAAAF4VjQS"
+            "AQEBOTAAAAE="},
+        {ShaderStage::Vertex, 656650u, false,
+            "NVNQQRQAAAABAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACQAAAA0AAAABCgUKAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAAAAF4VjQS"
+            "AQEBOTAAAAA="},
+        {ShaderStage::Vertex, 656650u, true,
+            "NVNQQRQAAAABAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAgAAAADAAAAAAAAAN+bVxPgrGgk776t"
+            "3gAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACQAAAA0AAAABCgUKAAEAAAAAAAAAAAAFAAAAAAAEAAAAAAAAABI0VngAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAALAAAAEAAAAEAAAAAAAAF4VjQS"
+            "AQEBOTAAAAE="},
+    }};
+    constexpr std::array<std::uint32_t, 3> userData{0x13579bdfu, 0x2468ace0u, 0xdeadbeefu};
+    constexpr std::array<std::byte, 4> bytes{std::byte{0x12}, std::byte{0x34}, std::byte{0x56}, std::byte{0x78}};
+    const RequestSerializer serializer;
+    // Original serializers at 4bb2c7f394 (20) and 075169f7b3 (21) emitted these
+    // twelve payloads independently; every pair differs only in its version header.
+    for (const auto version : {20u, 21u}) {
+        for (const auto& fixture : fixtures) {
+            auto text = std::string(fixture.text);
+            if (version == 21u) {
+                constexpr std::string_view prefix = "NVNQQRUAAAA";
+                text.replace(0, prefix.size(), prefix);
+            }
+            const auto legacy = serializer.Deserialize(text);
+            const auto& request = legacy.request;
+            require(request.shader.stage == fixture.stage && request.shader.codeAddress == 0x30000u && request.shader.code.size() == 1u && request.shader.code[0] == 0xbf810000u, "canonical version20/21 shader identity was misread");
+            require(request.context.waveSize == 64u && request.context.userDataBaseRegister == 8u && request.context.userData.size() == userData.size() && std::equal(request.context.userData.begin(), request.context.userData.end(), userData.begin()), "canonical version20/21 guest context was misread");
+            require(request.context.memory.size() == 1u && request.context.memory[0].guestAddress == 0x50000u && request.context.memory[0].bytes.size() == bytes.size() && std::equal(request.context.memory[0].bytes.begin(), request.context.memory[0].bytes.end(), bytes.begin()), "canonical version20/21 trailing memory was misread");
+            require(request.layout.descriptorSet == 2u && request.layout.firstBinding == 11u && request.layout.pushConstantOffsetBytes == 16u && request.layout.pushConstantSizeBytes == 64u && !request.useCache, "canonical version20/21 trailing layout or cache flag was misread");
+            require(request.target.vertexSubgroups == fixture.subgroups && request.target.float64DenormPreserve && request.target.registrationModules && request.target.registrationWordLimit == 12345u && request.target.nonConstantImageOffsets && request.target.srgbDecodeFormats == 0x12345678u && request.target.narrowSubgroupClock, "canonical version20/21 target fields were misread");
+            if (fixture.stage == ShaderStage::Fragment) {
+                require(request.context.pixel.has_value() && !request.context.vertex, "canonical version20/21 pixel presence was misread");
+                const auto& pixel = *request.context.pixel;
+                require(pixel.rasterPrimitive == static_cast<RasterPrimitive>(fixture.selector) && !pixel.layerExported && !pixel.ditheredAlphaToCoverage && pixel.alphaToCoverage && pixel.stencilRefExportEnable && pixel.targetOutputMode[0] == 9u && pixel.targetExportMapping[0] == 0xe4u, "canonical version20/21 pixel fields were misread");
+            } else {
+                require(request.context.vertex.has_value() && !request.context.pixel, "canonical version20/21 vertex presence was misread");
+                const auto& vertex = *request.context.vertex;
+                require(vertex.paClVsOutCntl == fixture.selector && vertex.fetchAttribReg == 9u && vertex.fetchBufferReg == 13u && vertex.fetchEmbedded, "canonical version20/21 vertex fields were misread");
+            }
+            const auto upgraded = serializer.Deserialize(serializer.Serialize(request));
+            require(RecompileCacheKey::ContextHash(request) == RecompileCacheKey::ContextHash(upgraded.request), "upgrading canonical version20/21 changed shader identity");
+            require(serializer.Serialize(upgraded.request) == serializer.Serialize(request), "upgrading canonical version20/21 changed request fields");
+        }
+    }
+}
 void verifyPixelRequestSerialization() {
     using namespace ShaderRecompiler;
     const auto fields = [](const ShaderPixelStageInfo& value) {
@@ -1851,7 +2190,7 @@ void verifyPixelRequestSerialization() {
                         value.posZ, value.posW, value.frontFace, value.ancillary, value.sampleShading,
                         value.noPerspective, value.linearCentroid, value.pixelKillEnable, value.depthExportEnable,
                         value.sampleMaskExportEnable, value.earlyZ, value.executeOnNoop, value.conservativeZExport, value.orderedPixelShader,
-                        value.targetOutputMode, value.targetExportMapping, value.alphaToCoverage, value.stencilRefExportEnable);
+                        value.targetOutputMode, value.targetExportMapping, value.alphaToCoverage, value.stencilRefExportEnable, value.rasterPrimitive, value.layerExported, value.ditheredAlphaToCoverage);
     };
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     const std::array<std::uint32_t, 3> userData{0x12345678u, 0xabcdef01u, 0x87654321u};
@@ -1896,6 +2235,7 @@ void verifyPixelRequestSerialization() {
     for (std::uint32_t i = 0; i < pixel.interpolatorSettings.size(); ++i) pixel.interpolatorSettings[i] = 0x10101010u + i;
     pixel.alphaToCoverage = true;
     pixel.stencilRefExportEnable = true;
+    pixel.ditheredAlphaToCoverage = true;
     const std::array<std::array<std::uint8_t, 8>, 3> mappings{{
         {0x00u, 0xe4u, 0xc6u, 0x1bu, 0xffu, 0x80u, 0x55u, 0xaau},
         {0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u},
@@ -1920,6 +2260,10 @@ void verifyPixelRequestSerialization() {
             RecompileCacheKey::Build(changed, replayKey);
             require(key == replayKey && RecompileCacheKey::ContextHash(request) == RecompileCacheKey::ContextHash(changed), "runtime pixel export mapping changed the static shader identity");
         }
+        auto undithered = request;
+        undithered.context.pixel->ditheredAlphaToCoverage = false;
+        RecompileCacheKey::Build(undithered, replayKey);
+        require(key != replayKey && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(undithered), "dithered coverage did not change shader identity");
         auto withoutCoverage = request;
         withoutCoverage.context.pixel->alphaToCoverage = false;
         RecompileCacheKey::Build(withoutCoverage, replayKey);
@@ -1940,15 +2284,121 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel = ShaderPixelStageInfo{};
     minimal.context.pixel->rasterPrimitive = RasterPrimitive::Rectangle;
     minimal.context.pixel->layerExported = true;
+    minimal.context.pixel->ditheredAlphaToCoverage = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRgAAAA=", "new requests did not use serialization version 24");
-    require(serializer.Deserialize(encoded).request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle, "the pixel primitive class did not round-trip");
+    require(requestPrefix(encoded, 8u) == "NVNQQRkAAAA=", "new requests did not use serialization version 25");
+    require(serializer.Deserialize(encoded).request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle && serializer.Deserialize(encoded).request.context.pixel->ditheredAlphaToCoverage, "the pixel primitive class or dither mode did not round-trip");
     require(serializer.Deserialize(encoded).request.context.pixel->layerExported, "the pixel layer export did not round-trip");
-    constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
-    for (std::size_t bytes = 0; bytes < 22u; ++bytes) {
-        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class or layer export flag was accepted");
+    const auto legacy16 = serializer.Deserialize(
+        "NVNQQRAAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAEEAAAAMBAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAsAAAAQAAAAgAAAAAAAAAAAAAAAAQ==");
+    require(legacy16.request.context.pixel->alphaToCoverage && !legacy16.request.context.pixel->ditheredAlphaToCoverage, "version16 coverage acquired a dither mode");
+    require(legacy16.request.context.pixel->targetOutputMode[0] == 9u && legacy16.request.context.pixel->targetExportMapping[0] == 0xe4u && legacy16.request.target.float64DenormPreserve, "version16 export or FP64 fields were lost");
+    require(legacy16.request.layout.firstBinding == 11u && legacy16.request.layout.pushConstantOffsetBytes == 16u && !legacy16.request.useCache, "version16 trailing fields were misaligned");
+    const auto upgraded16 = serializer.Deserialize(serializer.Serialize(legacy16.request));
+    require(RecompileCacheKey::ContextHash(legacy16.request) == RecompileCacheKey::ContextHash(upgraded16.request), "upgrading version16 changed shader identity");
+    const auto legacy17 = serializer.Deserialize(
+        "NVNQQREAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAAAAAAAAAAAABBAAAADAQBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALAAAAEAAAAIAAAAAAAAAAAAAAAAEBOTAAAA==");
+    require(legacy17.request.context.pixel->alphaToCoverage && legacy17.request.context.pixel->stencilRefExportEnable && !legacy17.request.context.pixel->ditheredAlphaToCoverage, "version17 coverage or stencil flags were lost");
+    require(legacy17.request.target.float64DenormPreserve && legacy17.request.target.registrationModules && legacy17.request.target.registrationWordLimit == 12345u, "version17 registration or FP64 fields were lost");
+    require(legacy17.request.context.pixel->targetOutputMode[0] == 9u && legacy17.request.context.pixel->targetExportMapping[0] == 0xe4u && legacy17.request.layout.firstBinding == 11u && legacy17.request.layout.pushConstantOffsetBytes == 16u && !legacy17.request.useCache, "version17 export or trailing fields were misaligned");
+    const auto upgraded17 = serializer.Deserialize(serializer.Serialize(legacy17.request));
+    require(RecompileCacheKey::ContextHash(legacy17.request) == RecompileCacheKey::ContextHash(upgraded17.request), "upgrading version17 changed shader identity");
+    const std::array<std::pair<bool, std::string_view>, 2> legacy18Requests{{
+        {false,
+            "NVNQQRIAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALAAAAEAAAAAAAAAAAAAAAAAAAAAEBOTAAAAA="},
+        {true,
+            "NVNQQRIAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALAAAAEAAAAAAAAAAAAAAAAAAAAAEBOTAAAAE="}
+    }};
+    for (const auto& [subgroups, text] : legacy18Requests) {
+        const auto legacy18 = serializer.Deserialize(text);
+        require(legacy18.request.target.vertexSubgroups == subgroups, "version18 vertex-subgroup flag was lost");
+        require(legacy18.request.context.pixel->alphaToCoverage && legacy18.request.context.pixel->stencilRefExportEnable && !legacy18.request.context.pixel->ditheredAlphaToCoverage, "version18 coverage or stencil flags were lost");
+        require(legacy18.request.target.float64DenormPreserve && legacy18.request.target.registrationModules && legacy18.request.target.registrationWordLimit == 12345u, "version18 registration or FP64 fields were lost");
+        require(legacy18.request.context.pixel->targetOutputMode[0] == 9u && legacy18.request.context.pixel->targetExportMapping[0] == 0xe4u && legacy18.request.layout.firstBinding == 11u && legacy18.request.layout.pushConstantOffsetBytes == 16u && !legacy18.request.useCache, "version18 export or trailing fields were misaligned");
+        const auto upgraded18 = serializer.Deserialize(serializer.Serialize(legacy18.request));
+        require(RecompileCacheKey::ContextHash(legacy18.request) == RecompileCacheKey::ContextHash(upgraded18.request), "upgrading version18 changed shader identity");
+        require(upgraded18.request.target.vertexSubgroups == subgroups, "upgrading version18 changed vertex-subgroup support");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRkAAAA="}) {
+    const std::array<std::pair<std::pair<RasterPrimitive, bool>, std::string_view>, 8> legacy19Requests{{
+        {{static_cast<RasterPrimitive>(0u), false},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAA"},
+        {{static_cast<RasterPrimitive>(0u), true},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAB"},
+        {{static_cast<RasterPrimitive>(1u), false},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAA"},
+        {{static_cast<RasterPrimitive>(1u), true},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAB"},
+        {{static_cast<RasterPrimitive>(2u), false},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQECAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAA"},
+        {{static_cast<RasterPrimitive>(2u), true},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQECAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAB"},
+        {{static_cast<RasterPrimitive>(3u), false},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAA"},
+        {{static_cast<RasterPrimitive>(3u), true},
+            "NVNQQRMAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAJAAAAAAAAAOQAAAAAAAAAAAAAAAAAAAAAAQEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwAAABAAAAAAAAAAAAAAAAAAAAABATkwAAAB"},
+    }};
+    for (const auto& [flags, text] : legacy19Requests) {
+        const auto legacy19 = serializer.Deserialize(text);
+        require(legacy19.request.context.pixel->rasterPrimitive == flags.first && !legacy19.request.context.pixel->ditheredAlphaToCoverage, "version19 primitive or dither mode was misread");
+        require(legacy19.request.context.pixel->alphaToCoverage && legacy19.request.context.pixel->stencilRefExportEnable, "version19 coverage or stencil flags were lost");
+        require(legacy19.request.target.vertexSubgroups == flags.second && legacy19.request.target.float64DenormPreserve && legacy19.request.target.registrationModules && legacy19.request.target.registrationWordLimit == 12345u, "version19 target fields were misaligned");
+        require(legacy19.request.context.pixel->targetOutputMode[0] == 9u && legacy19.request.context.pixel->targetExportMapping[0] == 0xe4u && legacy19.request.layout.firstBinding == 11u && legacy19.request.layout.pushConstantOffsetBytes == 16u && !legacy19.request.useCache, "version19 export or trailing fields were misaligned");
+        const auto upgraded19 = serializer.Deserialize(serializer.Serialize(legacy19.request));
+        require(RecompileCacheKey::ContextHash(legacy19.request) == RecompileCacheKey::ContextHash(upgraded19.request), "upgrading version19 changed shader identity");
+    }
+    constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
+    for (std::size_t bytes = 0; bytes < 23u; ++bytes) {
+        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export or dither flag was accepted");
+    }
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRoAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -2037,11 +2487,11 @@ void verifyVertexInfoVersion19() {
     while (offset < plain.size() && plain[offset] == flagged[offset]) ++offset;
     require(offset + 4u <= plain.size() && flagged[offset] == 0xefu && flagged[offset + 1u] == 0xcdu && flagged[offset + 2u] == 0xabu && flagged[offset + 3u] == 0x89u, "PA_CL_VS_OUT_CNTL is not the four bytes the version 20 vertex info adds");
     require(std::equal(plain.begin() + offset + 4u, plain.end(), flagged.begin() + offset + 4u), "PA_CL_VS_OUT_CNTL moved the fields after it");
-    auto version20 = flagged;
-    version20[4] = 20u;
-    const auto replay20 = serializer.Deserialize(encodeBase64(version20));
-    require(replay20.request.context.vertex.has_value() && replay20.request.context.vertex->paClVsOutCntl == 0x89abcdefu, "a version 20 vertex info lost its position export layout");
-    require(serializer.Serialize(replay20.request) == marked, "a version 20 vertex info misread the fields after its position export layout");
+    auto version20Vertex = flagged;
+    version20Vertex[4] = 20u;
+    const auto replay20Vertex = serializer.Deserialize(encodeBase64(version20Vertex));
+    require(replay20Vertex.request.context.vertex.has_value() && replay20Vertex.request.context.vertex->paClVsOutCntl == 0x89abcdefu, "a main version20 request lost PA_CL_VS_OUT_CNTL");
+    require(serializer.Serialize(replay20Vertex.request) == marked, "a main version20 vertex request misread trailing fields");
     vertex.context.vertex->paClVsOutCntl = (1u << 18u) | (1u << 21u) | 0xfu;
     const auto layered = serializer.Deserialize(serializer.Serialize(vertex));
     require(layered.request.context.vertex.has_value() && layered.request.context.vertex->paClVsOutCntl == vertex.context.vertex->paClVsOutCntl, "a layered vertex info lost its clip distances or render target index");
@@ -2066,11 +2516,13 @@ void verifyVertexInfoVersion19() {
     std::size_t flagOffset = 0;
     while (flagOffset < legacyPixel.size() && legacyPixel[flagOffset] == exportedBytes[flagOffset]) ++flagOffset;
     require(flagOffset < legacyPixel.size(), "the pixel layer export flag is not serialized");
-    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset));
+    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset + 2u));
     for (const auto version : {19u, 20u, 21u, 22u}) {
-        legacyPixel[4] = static_cast<std::uint8_t>(version);
-        const auto replayPixel = serializer.Deserialize(encodeBase64(legacyPixel));
-        require(replayPixel.request.context.pixel.has_value() && replayPixel.request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle && !replayPixel.request.context.pixel->layerExported, "a main version 19 to 22 request lost its pixel primitive class or read a layer export flag");
+        auto versionPixel = legacyPixel;
+        versionPixel[4] = static_cast<std::uint8_t>(version);
+        if (version < 22u) versionPixel.pop_back();
+        const auto replayPixel = serializer.Deserialize(encodeBase64(versionPixel));
+        require(replayPixel.request.context.pixel.has_value() && replayPixel.request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle && !replayPixel.request.context.pixel->layerExported && !replayPixel.request.context.pixel->ditheredAlphaToCoverage, "a main version 19 to 22 request lost its pixel primitive class or read a layer export or dither flag");
         require(serializer.Serialize(replayPixel.request) == encodedPixel, "a main version 19 to 22 request misread the fields after its pixel primitive class");
     }
 }
@@ -2159,7 +2611,7 @@ void verifyLegacyPixelRequests() {
         require(pixel.targetExportMapping == std::array<std::uint8_t, 8>{}, "legacy pixel mapping no longer defaults to zero");
         require(pixel.targetExportPacking == std::array<ColorExportPacking, 8>{}, "a legacy request packed a color export");
         require(!pixel.dualSourceBlend, "a legacy request enabled dual-source blending");
-        require(!pixel.alphaToCoverage, "a legacy request enabled alpha-to-coverage");
+        require(!pixel.alphaToCoverage && !pixel.ditheredAlphaToCoverage, "a legacy request enabled alpha-to-coverage");
         require(!pixel.stencilRefExportEnable, "a legacy request exported a stencil reference");
         require(pixel.rasterPrimitive == RasterPrimitive::Triangle, "a legacy request drew something other than triangles");
         require(pixel.inputAddr == 2u && pixel.hasPerspectiveCenterVgpr && pixel.targetOutputMode[0] == 9u, "legacy pixel layout was misread");
@@ -3105,10 +3557,10 @@ void verifyBdaReadFallbackFunctions() {
     alignas(256) static std::array<std::uint32_t, 32> output{};
     const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
     const std::array<std::uint32_t, 8> userData{0x10000000u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 128u, 0x01016facu};
-    const auto compile = [&](std::uint32_t loads, bool barrier, bool coherent) {
+    const auto compile = [&](std::uint32_t loads, bool barrier, bool coherent, std::uint32_t stride) {
         std::vector<std::uint32_t> code{0x7e020200u, 0x7e040201u};
         for (std::uint32_t load = 0; load < loads; ++load) {
-            code.push_back(0xdc308000u | (coherent ? 0x10000u : 0u) | (4u * load + 4u));
+            code.push_back(0xdc308000u | (coherent ? 0x10000u : 0u) | (stride * load + 4u));
             code.push_back(((3u + load) << 24u) | 0x007d0001u);
         }
         code.push_back(0xbf8c3f70u);
@@ -3134,8 +3586,9 @@ void verifyBdaReadFallbackFunctions() {
     };
     for (const bool barrier : {false, true}) {
         for (const bool coherent : {false, true}) {
-            const auto one = compile(1u, barrier, coherent);
-            const auto five = compile(5u, barrier, coherent);
+            const auto one = compile(1u, barrier, coherent, 32u);
+            const auto five = compile(5u, barrier, coherent, 32u);
+            const auto adjacent = compile(5u, barrier, coherent, 4u);
             std::map<std::uint32_t, std::string> names;
             std::map<std::string, std::uint32_t> definitions;
             const auto reader = std::string("read_bda_dword_bytes") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
@@ -3196,6 +3649,19 @@ void verifyBdaReadFallbackFunctions() {
             require(mainProbes == 0u, "BDA read functions: a read site probes or reads bytes outside its span read function");
             require(spanCalls == 5u, "BDA read functions: a read site does not call its span read function once");
             require(five.size() - one.size() < 4u * 150u, "BDA read functions: a read site takes 150 SPIR-V words or more");
+            std::size_t adjacentSpanCalls = 0;
+            names.clear();
+            function.clear();
+            for (std::size_t cursor = 5; cursor < adjacent.size();) {
+                const auto length = adjacent[cursor] >> 16u;
+                require(length != 0 && length <= adjacent.size() - cursor, "BDA read functions: truncated SPIR-V instruction");
+                const auto op = adjacent[cursor] & 0xffffu;
+                if (op == spv::OpName) names[adjacent[cursor + 1]] = reinterpret_cast<const char*>(&adjacent[cursor + 2]);
+                if (op == spv::OpFunction) function = names[adjacent[cursor + 2]];
+                if (op == spv::OpFunctionCall && function == "main" && names[adjacent[cursor + 3]] == span) ++adjacentSpanCalls;
+                cursor += length;
+            }
+            require(adjacentSpanCalls == 2u, "BDA read functions: five adjacent dwords of one address do not share two span reads");
         }
     }
 }
@@ -3710,6 +4176,28 @@ void verifyCubeDepthCompareMode() {
     require(modes[selected].cube && (modes[selected].emulatedCompare & EmulatedCompare::Enabled) != 0u, "cube color comparison did not select its emulated runtime mode");
 }
 
+void verifyVolumeArrayLoadMode() {
+    using namespace ShaderRecompiler;
+    const DescriptorValue descriptor{{0x02466600u, 0x01400000u, 0u, 0xa0500204u, 1u, 0x00700000u, 0u, 0u}, 8u};
+    ImageResource image{};
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.dimension = RdnaImageDimension::Dim2DArray;
+    const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+    const auto selected = ResourceMaterializer::RuntimeImageMode(image, descriptor, modes);
+    require(modes[selected].dimension == RdnaImageDimension::Dim3D && !modes[selected].cube, "2D-array image load on a 3D T# did not select a volume runtime mode");
+    image.fmaskCompatible = false;
+    expectFailure([&] { static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, descriptor, ResourceMaterializer::RuntimeImageModes(image))); }, "incompatible with the static runtime image interface", "2D-array image sample on a 3D T# was accepted");
+    ImageResource store{};
+    store.resourceClass = ImageResourceClass::Storage;
+    store.dimension = RdnaImageDimension::Dim2DArray;
+    store.written = true;
+    store.fmaskCompatible = false;
+    const auto storeModes = ResourceMaterializer::RuntimeImageModes(store);
+    require(storeModes[ResourceMaterializer::RuntimeImageMode(store, descriptor, storeModes)].dimension == RdnaImageDimension::Dim3D, "2D-array image store on a 3D T# did not select a volume runtime mode");
+    store.atomic = true;
+    expectFailure([&] { static_cast<void>(ResourceMaterializer::RuntimeImageMode(store, descriptor, ResourceMaterializer::RuntimeImageModes(store))); }, "incompatible with the static runtime image interface", "2D-array image atomic on a 3D T# was accepted");
+}
+
 void verifySrgbDepthCompareModes() {
     using namespace ShaderRecompiler;
     for (const auto decodeFormats : {0u, 1u, 2u, 3u}) {
@@ -3736,6 +4224,11 @@ int main(int argc, char** argv) {
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--layout-pair") {
+            verifyLayoutPair();
+            std::cout << "Both push-constant layouts of a pixel shader compile from one program unchanged\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
             verifyBindlessTable();
             std::cout << "Bindless mapping, indexing capabilities and strict validation passed\n";
@@ -3750,6 +4243,7 @@ int main(int argc, char** argv) {
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyFrontendPair();
+        verifyLayoutPair();
         verifySignedSrtComparison();
         verifyOutOfRangeConstantReads();
         verifySignedMinimum();
@@ -3766,6 +4260,7 @@ int main(int argc, char** argv) {
         verifySingleLaneVertexWave();
         verifyMeshConfiguration();
         verifyPixelInputs();
+        verifyCanonicalVersion20And21Requests();
         verifyPixelRequestSerialization();
         verifyVertexInfoVersion19();
         verifyPositionExportComponents();
@@ -3788,6 +4283,7 @@ int main(int argc, char** argv) {
         verifySrtReadPatching();
         verifyGuardedNullPointers();
         verifyCubeDepthCompareMode();
+        verifyVolumeArrayLoadMode();
         verifySrgbDepthCompareModes();
         verifyCoherentGds();
 #if ANYPS5_ENABLE_SPIRV_TOOLS

@@ -529,7 +529,7 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
-        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207)) | graphics.layerExports;
+        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
@@ -618,7 +618,6 @@ DrawVerdict Driver::drawTail(DrawTail& t) {
             programResults[i] = matched[i]->compiled.get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
-            resultIndex[i] = results.size();
             if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
                 for (auto previous = i; previous-- > 0;) {
                     if (programResults[previous] == nullptr) continue;

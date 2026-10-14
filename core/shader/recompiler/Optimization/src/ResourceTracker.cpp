@@ -358,9 +358,17 @@ private:
         return true;
     }
 
-    static bool usesOnly(const IrValue& value, std::span<const IrValue* const> users) {
+    static bool usedOnlyAsImage(const IrValue& value, const std::array<IrValue*, 8>& reads) {
         return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const IrValue* user) {
-            return std::ranges::find(users, user) != users.end();
+            if (user->Opcode() != IrOpcode::GetImageResource || user->ArgumentCount() != reads.size()) {
+                return false;
+            }
+            for (std::uint32_t dword = 0; dword < reads.size(); dword++) {
+                if (user->Argument(dword)->Resolve() != reads[dword]) {
+                    return false;
+                }
+            }
+            return true;
         });
     }
 
@@ -535,9 +543,8 @@ private:
         }
         entryOffset += immediateOffset;
 
-        const std::array<const IrValue*, 1> imageUsers {&handle};
         for (const auto* read : heapReads) {
-            if (!usesOnly(*read, imageUsers)) {
+            if (!usedOnlyAsImage(*read, heapReads)) {
                 return false;
             }
         }

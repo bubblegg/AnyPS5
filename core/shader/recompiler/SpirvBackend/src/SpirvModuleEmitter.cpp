@@ -288,7 +288,50 @@ void StoreCoverage(SpirvEmitterState& state, std::uint32_t mask) {
     state.module.AddFunction(spv::OpStore, pointer, mask);
 }
 
+void StoreDitheredAlphaCoverage(SpirvEmitterState& state, std::uint32_t color) {
+    constexpr std::array<std::uint32_t, 64> masks{{
+    0x00000000u, 0x00000010u, 0x00000004u, 0x10000004u, 0x10000002u, 0x10100002u, 0x04100002u, 0x04101002u,
+    0x04101001u, 0x04101011u, 0x04041011u, 0x14041011u, 0x12041011u, 0x12141011u, 0x12140411u, 0x12141411u,
+    0x12141411u, 0x12141431u, 0x12141415u, 0x32141415u, 0x32121415u, 0x32321415u, 0x16321415u, 0x16323415u,
+    0x15323415u, 0x15323435u, 0x15163435u, 0x35163435u, 0x35163235u, 0x35363235u, 0x35361635u, 0x35363635u,
+    0x35363635u, 0x35363675u, 0x3536363du, 0x7536363du, 0x75363637u, 0x75763637u, 0x3d763637u, 0x3d767637u,
+    0x3d757637u, 0x3d757677u, 0x3d3d7677u, 0x7d3d7677u, 0x773d7677u, 0x777d7677u, 0x777d3e77u, 0x777d7e77u,
+    0x777d7e77u, 0x777d7ef7u, 0x777d7e7fu, 0xf77d7e7fu, 0xf7777e7fu, 0xf7f77e7fu, 0x7ff77e7fu, 0x7ff7fe7fu,
+    0x7ff7fd7fu, 0x7ff7fdffu, 0x7f7ffdffu, 0xff7ffdffu, 0xff7ff7ffu, 0xfffff7ffu, 0xffff7fffu, 0xffffffffu,
+    }};
+    const auto alpha = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), alpha, color, 3u);
+    const auto positive = Select(state, TypeF32(state), Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), alpha, ConstantF32Value(state, 0.0f)), alpha, ConstantF32Value(state, 0.0f));
+    const auto bounded = Select(state, TypeF32(state), Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), positive, ConstantF32Value(state, 63.0f / 64.0f)), ConstantF32Value(state, 63.0f / 64.0f), positive);
+    const auto index = Unary(state, spv::OpConvertFToU, TypeU32(state), Binary(state, spv::OpFMul, TypeF32(state), bounded, ConstantF32Value(state, 64.0f)));
+    std::array<std::uint32_t, masks.size()> words{};
+    for (std::size_t i = 0; i < words.size(); ++i) words[i] = ConstantU32(state, masks[i]);
+    const auto array = state.module.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, static_cast<std::uint32_t>(words.size())));
+    const auto table = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, array), spv::StorageClassPrivate);
+    state.module.AddFunction(spv::OpStore, table, state.module.Constant(spv::OpConstantComposite, array, std::span<const std::uint32_t>(words)));
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), pointer, table, index);
+    const auto packed = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), packed, pointer);
+    const auto coord = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeF32Vector(state, 4u), coord, InputVariableForKind(state, StageInputKind::FragCoord));
+    std::array<std::uint32_t, 2> parity{};
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        const auto component = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, coord, i);
+        parity[i] = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpConvertFToU, TypeU32(state), component), ConstantU32(state, 1u));
+    }
+    const auto pixel = Binary(state, spv::OpBitwiseOr, TypeU32(state), Binary(state, spv::OpShiftLeftLogical, TypeU32(state), parity[0], ConstantU32(state, 1u)), parity[1]);
+    const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pixel, ConstantU32(state, 3u));
+    const auto mask = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeU32(state), packed, shift), ConstantU32(state, 255u));
+    StoreCoverage(state, Unary(state, spv::OpBitcast, TypeI32(state), mask));
+}
+
 void StoreAlphaCoverage(SpirvEmitterState& state, std::uint32_t color) {
+    if (state.inputInfo.pixel->psDitheredAlphaToCoverage) {
+        StoreDitheredAlphaCoverage(state, color);
+        return;
+    }
     const auto alpha = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), alpha, color, 3u);
     const auto below = state.module.AllocateId();

@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -109,6 +110,10 @@ private:
     std::vector<VkDescriptorPool> dedicated;
     Stats stats;
 };
+
+enum class ContentKeyComponent : std::size_t { Layout, BufferWord0, BufferWord1, BufferWord2, BufferWord3, Image, Sampler, ShaderData, Other, DrawTarget, Count };
+
+using ContentKeyDiff = std::array<bool, static_cast<std::size_t>(ContentKeyComponent::Count)>;
 
 class ShaderResources {
 public:
@@ -218,6 +223,7 @@ public:
     static bool ContentKeyIs(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> key, bool fixedKnown = false);
     // Whether a ResourceCache holds the object as an entry (set and cleared by the cache).
     bool InResourceCache() const { return inResourceCache.load(std::memory_order_acquire); }
+    static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -331,6 +337,8 @@ private:
         std::uint64_t begin;
         std::uint64_t end;
         std::uint64_t serial;
+        std::uint64_t regionEnd = 0;
+        std::uint64_t committedEnd = 0;
     };
 
     // The build is two stages. A (buildPrepare, no device lock): the binding plan with its layout

@@ -658,6 +658,39 @@ void testProgramWorkgroupUse() {
     check(!AgcDriver::DriverDetail::ProgramUsesWorkgroup(entry, 2) && AgcDriver::DriverDetail::ProgramUsesWorkgroup(entry, 0), "the workgroup check did not start at the program's entry");
 }
 
+void testVertexTailSnapshots() {
+    using namespace AgcDriver::DriverDetail;
+    alignas(256) static std::array<std::uint32_t, 64> prolog{0xbe802008u, 0xbf9f0000u};
+    alignas(256) static std::array<std::uint32_t, 64> continuation{0xbf800000u, 0xbf810000u};
+    const auto address = reinterpret_cast<std::uintptr_t>(prolog.data());
+    const auto next = reinterpret_cast<std::uintptr_t>(continuation.data());
+    const std::array<std::uint32_t, 2> data{static_cast<std::uint32_t>(next), static_cast<std::uint32_t>(next >> 32u)};
+    const auto source = ReadRawShader(address);
+    check(source->userDataTailRegister == 8u, "raw tail metadata is missing");
+    const auto target = ReadUserDataTailContinuation(source->code, 8u, data);
+    check(target && target->codeAddress == next, "tail did not read its user-data continuation");
+    DrawDecode decode{};
+    decode.programs.resize(1);
+    decode.programs[0].snapshot = source;
+    decode.programs[0].tailContinuation = target;
+    check(DecodeProgramsCurrent(decode, {}), "unchanged tail snapshot became stale");
+    continuation[0] = 0xbf8a0000u;
+    check(!DecodeProgramsCurrent(decode, {}), "rewriting the continuation did not invalidate the draw cache");
+    AgcDriver::QueueState queue{};
+    queue.context[0x2d5] = 0x2000u;
+    queue.shader = {{0xc8, static_cast<std::uint32_t>(address >> 8u)}, {0xc9, static_cast<std::uint32_t>(address >> 40u)},
+        {0x8b, 4u}, {0x8c, data[0]}, {0x8d, data[1]}};
+    check(VertexWorkgroupRequired(queue, {}), "a barrier in the continuation was hidden from workgroup routing");
+    queue.context[0x2d5] |= 0x02000000u;
+    check(!VertexWorkgroupRequired(queue, {}), "a passthrough program was rerouted to a workgroup");
+    const std::array<std::uint32_t, 2> nullAddress{};
+    check(expectFailure([&] { static_cast<void>(ReadUserDataTailContinuation(source->code, 8u, nullAddress)); }).find("address is null") != std::string::npos, "null tail address was accepted");
+    const std::array<std::uint32_t, 2> unaligned{data[0] + 1u, data[1]};
+    check(expectFailure([&] { static_cast<void>(ReadUserDataTailContinuation(source->code, 8u, unaligned)); }).find("dword aligned") != std::string::npos, "unaligned tail address was accepted");
+    const std::array<std::uint32_t, 2> unmapped{0x1000u, 0u};
+    check(!expectFailure([&] { static_cast<void>(ReadUserDataTailContinuation(source->code, 8u, unmapped)); }).empty(), "unmapped tail address was accepted");
+}
+
 void testRegisteredVertexWorkgroupRouting() {
     using namespace AgcDriver::DriverDetail;
     ShaderSnapshot snapshot{0x20000, 0x30000, 2, {0xd8340000u, 0x00000100u, 0xbf810000u, 0xbf810000u}, {}};
@@ -781,6 +814,7 @@ int main(int argc, char** argv) {
 #endif
         testProgramSnapshots();
         testProgramWorkgroupUse();
+        testVertexTailSnapshots();
         testRegisteredVertexWorkgroupRouting();
         testEvents();
         testValidation();

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PqToSdr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HalfFloatScanout.hpp"
 #include <algorithm>
@@ -60,7 +61,14 @@ void decodeHalfFloatTexel(const std::byte* texel, std::byte* pixel, bool redLow)
     pixel[3] = static_cast<std::byte>(Graphics::HalfFloatScanoutCode(halves[3], true));
 }
 
-void decodeTexel(const std::byte* texel, std::byte* pixel, bool rgba, bool tenBit) {
+void decodeTexel(const std::byte* texel, std::byte* pixel, bool rgba, bool tenBit, bool pq) {
+    if (pq) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, texel, 4);
+        const auto converted = PqToSdrPixel(word, rgba, SdrToneMapLuminanceNits);
+        for (std::size_t i = 0; i < converted.size(); ++i) pixel[i] = static_cast<std::byte>(converted[i]);
+        return;
+    }
     if (tenBit) {
         std::uint32_t word = 0;
         std::memcpy(&word, texel, 4);
@@ -118,7 +126,7 @@ void traceDisplayKeys(const DisplayBuffer& buffer, const std::uint8_t* keys, std
 std::size_t DisplayBufferSize(const DisplayBuffer& buffer) {
     require(buffer.width != 0 && buffer.height != 0 && buffer.width <= 16384 && buffer.height <= 16384, "VideoOut: invalid display buffer dimensions");
     const bool halfFloat = DisplayHalfFloat(buffer.pixelFormat);
-    if (!halfFloat && baseFormat(buffer.pixelFormat) != PixelFormatB8G8R8A8 && baseFormat(buffer.pixelFormat) != PixelFormatR8G8B8A8) {
+    if (!halfFloat && !DisplayPq(buffer.pixelFormat) && baseFormat(buffer.pixelFormat) != PixelFormatB8G8R8A8 && baseFormat(buffer.pixelFormat) != PixelFormatR8G8B8A8) {
         char message[96];
         std::snprintf(message, sizeof(message), "VideoOut: unsupported display pixel format 0x%016llx", static_cast<unsigned long long>(buffer.pixelFormat));
         throw std::runtime_error(message);
@@ -159,7 +167,8 @@ std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::spa
         return pixels;
     }
     const auto blocksPerRow = (buffer.width + 127u) / 128u;
-    const bool rgba = baseFormat(buffer.pixelFormat) == PixelFormatR8G8B8A8;
+    const bool rgba = DisplayRedLow(buffer.pixelFormat);
+    const bool pq = DisplayPq(buffer.pixelFormat);
     // Bit 56 marks the 10-bit variant: A2B10G10R10 with red in the low bits (the scanout draws render
     // COLOR_2_10_10_10 into it). Presented as 8-bit BGRA by dropping the low two bits of each channel.
     const bool tenBit = (buffer.pixelFormat & PixelFormatUnormBit) != 0;
@@ -170,7 +179,7 @@ std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::spa
             const auto tiled = buffer.tilingMode == 1 ? (static_cast<std::size_t>(y) * pitch + x) * 4u
                 : (static_cast<std::size_t>(y / 128u) * blocksPerRow + x / 128u) * 65536u + tileOffset(x, y);
             const auto linear = (static_cast<std::size_t>(y) * buffer.width + x) * 4;
-            decodeTexel(source.data() + tiled, pixels.data() + linear, rgba, tenBit);
+            decodeTexel(source.data() + tiled, pixels.data() + linear, rgba, tenBit, pq);
         }
     }
     timing.Mark("detile_convert");
@@ -195,7 +204,7 @@ std::array<std::byte, 4> DisplayBufferClearPixel(const DisplayBuffer& buffer, Gr
         throw std::runtime_error(message);
     }
     std::array<std::byte, 4> pixel{};
-    decodeTexel(texel.data(), pixel.data(), baseFormat(buffer.pixelFormat) == PixelFormatR8G8B8A8, (buffer.pixelFormat & PixelFormatUnormBit) != 0);
+    decodeTexel(texel.data(), pixel.data(), DisplayRedLow(buffer.pixelFormat) && !DisplayHalfFloat(buffer.pixelFormat), (buffer.pixelFormat & PixelFormatUnormBit) != 0, DisplayPq(buffer.pixelFormat));
     return pixel;
 }
 

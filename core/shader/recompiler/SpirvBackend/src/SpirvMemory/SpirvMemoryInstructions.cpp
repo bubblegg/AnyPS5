@@ -203,7 +203,86 @@ std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     return AddBdaImmediate(ctx, inst, address, immediate);
 }
 
+bool SameAddressValue(const IrValue* left, const IrValue* right, std::uint32_t depth = 0u) {
+    if (left == right) return true;
+    if (left == nullptr || right == nullptr || depth > 3u || left->Opcode() != right->Opcode() || left->ArgumentCount() != right->ArgumentCount()) return false;
+    if (left->HasImmediate() || right->HasImmediate()) return left->HasImmediate() && right->HasImmediate() && left->ArgumentCount() == 0u && left->ImmediateU32() == right->ImmediateU32();
+    if (left->Opcode() != IrOpcode::GetAddressResource && left->Opcode() != IrOpcode::SelectU32) return false;
+    for (std::size_t index = 0; index < left->ArgumentCount(); ++index) {
+        const IrValue* first = left->Argument(index);
+        const IrValue* second = right->Argument(index);
+        if (first == nullptr || second == nullptr || !SameAddressValue(first->Resolve(), second->Resolve(), depth + 1u)) return false;
+    }
+    return true;
+}
+
+bool WritesMemory(IrOpcode opcode) {
+    const auto buffer = BufferAccessOf(opcode);
+    const auto shared = SharedAccessOf(opcode);
+    const auto address = AddressOpcodeInfoOf(opcode).access;
+    const auto image = ImageOpcodeInfoOf(opcode).access;
+    return buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || (shared != SharedAccess::None && shared != SharedAccess::Read) || address == AddressAccess::Write || address == AddressAccess::Atomic ||
+        image == ImageAccess::Write || image == ImageAccess::Atomic || opcode == IrOpcode::Barrier || opcode == IrOpcode::StoreVectorWindow;
+}
+
+std::vector<std::pair<const IrValue*, std::uint32_t>> AdjacentBdaLoads(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
+    std::vector<std::pair<const IrValue*, std::uint32_t>> members;
+    const IrBlock* block = inst.Parent();
+    if (block == nullptr || ctx.state.laneCount != 1u || (mem.offset & 3u) != 0u) return members;
+    const auto& instructions = block->Instructions();
+    auto next = std::find(instructions.begin(), instructions.end(), &inst);
+    if (next == instructions.end()) return members;
+    std::uint32_t taken = 1u;
+    for (++next; next != instructions.end(); ++next) {
+        const IrValue* other = *next;
+        if (other->Opcode() != inst.Opcode()) {
+            if (WritesMemory(other->Opcode())) break;
+            continue;
+        }
+        const auto& otherMemory = ctx.Memory(*other);
+        if (otherMemory.planningOnly || otherMemory.kind != mem.kind || otherMemory.addressIsFull != mem.addressIsFull || otherMemory.coherent != mem.coherent || other->ArgumentCount() != inst.ArgumentCount()) continue;
+        bool sameArguments = true;
+        for (std::size_t index = 0; index < inst.ArgumentCount(); ++index) {
+            const IrValue* left = inst.Argument(index);
+            const IrValue* right = other->Argument(index);
+            if (left == nullptr || right == nullptr || !SameAddressValue(left->Resolve(), right->Resolve())) sameArguments = false;
+        }
+        const auto delta = otherMemory.offset - mem.offset;
+        if (!sameArguments || delta == 0u || delta > 12u || (delta & 3u) != 0u || (taken & (1u << (delta / 4u))) != 0u) continue;
+        taken |= 1u << (delta / 4u);
+        members.emplace_back(other, delta / 4u);
+    }
+    return members;
+}
+
 std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t bits) {
+    auto& state = ctx.state;
+    if (bits == 32u) {
+        if (const auto grouped = state.bdaGroupedLoads.find(&inst); grouped != state.bdaGroupedLoads.end()) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, grouped->second.first, grouped->second.second);
+            return value;
+        }
+        const auto members = AdjacentBdaLoads(ctx, inst, mem);
+        if (!members.empty()) {
+            std::uint32_t used = 1u;
+            for (const auto& member : members) used |= 1u << member.second;
+            const auto vector = TypeU32Vector(state, 4);
+            const auto zero = ConstantU32(state, 0u);
+            const auto none = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, vector, none, zero, zero, zero, zero);
+            const auto all = EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), vector, none, [&]() {
+                const auto values = EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, 4u, false, used);
+                const auto read = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeConstruct, vector, read, values[0], values[1], values[2], values[3]);
+                return read;
+            });
+            for (const auto& member : members) state.bdaGroupedLoads[member.first] = {all, member.second};
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, all, 0u);
+            return value;
+        }
+    }
     return EmitValueOrZeroIfCondition(ctx.state, ActiveArgument(ctx, inst), [&]() {
         return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
     });

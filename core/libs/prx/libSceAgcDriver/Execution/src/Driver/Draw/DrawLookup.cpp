@@ -80,6 +80,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.dualSourceBlend);
             mix(pixel.alphaToCoverage);
             mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
+            mix(pixel.ditheredAlphaToCoverage);
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);

@@ -21,6 +21,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ToneMapLuminance.hpp"
 
 namespace {
 
@@ -225,9 +226,8 @@ int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLumi
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- constexpr float SdrReferenceWhiteNits = 100.0f;
- luminance->max_full_frame_tone_map_luminance = SdrReferenceWhiteNits;
- luminance->max_tone_map_luminance = SdrReferenceWhiteNits;
+ luminance->max_full_frame_tone_map_luminance = AgcDriver::SdrToneMapLuminanceNits;
+ luminance->max_tone_map_luminance = AgcDriver::SdrToneMapLuminanceNits;
  luminance->min_tone_map_luminance = 0.0f;
  return SYSTEM_SERVICE_OK;
 }

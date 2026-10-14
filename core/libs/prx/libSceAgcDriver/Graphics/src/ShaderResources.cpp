@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -1861,6 +1862,13 @@ void ShaderResources::noteReusable() {
         if (serial == 0) return;
         directRegions.push_back({begin, end, serial});
     }
+    for (const auto& cut : guestMemory.CutRegions()) {
+        for (auto& region : directRegions) {
+            if (region.begin != cut.begin) continue;
+            region.regionEnd = cut.end;
+            region.committedEnd = cut.committedEnd;
+        }
+    }
     reusable = true;
 }
 
@@ -1953,7 +1961,18 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
     Require(shader.program != nullptr, "missing compiled shader");
     std::vector<std::uint32_t> key;
-    key.reserve(8u + shader.program->bindings.size() * 12u);
+    std::size_t words = 5;
+    const auto addWords = [&](std::size_t count) {
+        if (count > key.max_size() - words) throw std::length_error("resource content key exceeds vector limits");
+        words += count;
+    };
+    for (const auto& binding : shader.program->bindings) {
+        addWords(18);
+        addWords(binding.imageSamplers.size());
+        if ((dataWords && !movableBuffers) || !DataRole(binding.role)) addWords(binding.guestDescriptor.size());
+        for (const auto* bits : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) addWords(bits->size() / 32u + (bits->size() % 32u != 0 ? 1u : 0u));
+    }
+    key.reserve(words);
     VisitContentKey<false>(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); }, [](std::size_t) {});
     return key;
 }
@@ -1973,6 +1992,96 @@ bool ShaderResources::ContentKeyIs(const CompiledShader& shader, bool dataWords,
     if (fixedKnown) VisitContentKey<true>(shader, dataWords, movableBuffers, compare, [&](std::size_t words) { cursor += words; });
     else VisitContentKey<false>(shader, dataWords, movableBuffers, compare, [](std::size_t) {});
     return equal && cursor == key.size();
+}
+
+namespace {
+
+using Component = ContentKeyComponent;
+
+bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::size_t end, bool movable, std::vector<std::uint8_t>& labels) {
+    const auto label = [&](std::size_t first, std::size_t count, Component component) {
+        if (first + count > end) return false;
+        std::fill(labels.begin() + static_cast<std::ptrdiff_t>(first), labels.begin() + static_cast<std::ptrdiff_t>(first + count), static_cast<std::uint8_t>(component));
+        return true;
+    };
+    if (!label(at, 5, Component::Layout)) return false;
+    const bool dataWords = key[at] != 0;
+    const auto bindings = key[at + 4];
+    at += 5;
+    for (std::uint32_t binding = 0; binding < bindings; ++binding) {
+        if (!label(at, 8, Component::Layout)) return false;
+        const auto role = static_cast<ShaderRecompiler::DescriptorRole>(key[at + 1]);
+        const auto size = key[at + 7];
+        at += 8;
+        const auto words = DataRole(role) && !(dataWords && !movable) ? 0u : size;
+        if (at + words > end) return false;
+        for (std::uint32_t i = 0; i < words; ++i) {
+            auto component = Component::Other;
+            if (role == ShaderRecompiler::DescriptorRole::GuestBuffers) component = static_cast<Component>(static_cast<std::size_t>(Component::BufferWord0) + i % 4u);
+            else if (role == ShaderRecompiler::DescriptorRole::GuestImages) component = Component::Image;
+            else if (role == ShaderRecompiler::DescriptorRole::GuestSamplers) component = Component::Sampler;
+            else if (DataRole(role)) component = Component::ShaderData;
+            labels[at + i] = static_cast<std::uint8_t>(component);
+        }
+        at += words;
+        for (int flags = 0; flags < 9; ++flags) {
+            if (at >= end) return false;
+            const auto count = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
+            if (!label(at, count, Component::Other)) return false;
+            at += count;
+        }
+        if (at >= end) return false;
+        const auto samplers = static_cast<std::size_t>(key[at]);
+        if (!label(at, 1 + samplers, Component::Sampler)) return false;
+        at += 1 + samplers;
+    }
+    return at == end;
+}
+
+bool LabelContentKey(std::span<const std::uint32_t> key, bool draw, bool movable, std::vector<std::uint8_t>& labels) {
+    labels.assign(key.size(), static_cast<std::uint8_t>(Component::Layout));
+    if (!draw) {
+        if (LabelShaderKey(key, 0, key.size(), movable, labels)) return true;
+        if (key.size() < 2) return false;
+        labels.assign(key.size(), static_cast<std::uint8_t>(Component::Layout));
+        if (!LabelShaderKey(key, 0, key.size() - 2, movable, labels)) return false;
+        labels[key.size() - 2] = static_cast<std::uint8_t>(Component::Other);
+        labels[key.size() - 1] = static_cast<std::uint8_t>(Component::Other);
+        return true;
+    }
+    if (key.size() < 4) return false;
+    std::fill(labels.begin() + 1, labels.begin() + 3, static_cast<std::uint8_t>(Component::Other));
+    std::size_t at = 4;
+    for (std::uint32_t stage = 0; stage < key[3]; ++stage) {
+        if (at >= key.size()) return false;
+        const auto size = static_cast<std::size_t>(key[at]);
+        ++at;
+        if (at + size > key.size() || !LabelShaderKey(key, at, at + size, movable, labels)) return false;
+        at += size;
+    }
+    if (at >= key.size()) return false;
+    for (auto tail = at + 1; tail < key.size(); ++tail) labels[tail] = static_cast<std::uint8_t>(Component::DrawTarget);
+    return true;
+}
+
+}
+
+bool ShaderResources::DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff) {
+    diff = {};
+    std::vector<std::uint8_t> labels;
+    bool labelled = false;
+    for (const bool movable : {draw, false}) {
+        labelled = LabelContentKey(key, draw, movable, labels);
+        if (labelled) break;
+    }
+    if (!labelled || previous.size() != key.size()) {
+        diff[static_cast<std::size_t>(Component::Layout)] = true;
+        return false;
+    }
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        if (previous[i] != key[i]) diff[labels[i]] = true;
+    }
+    return true;
 }
 
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
@@ -2616,6 +2725,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
             if (serial == 0) serial = ImageMirrorSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
             if (serial != region.serial) return false;
+            if (region.regionEnd != 0) {
+                const auto committed = GuestMemory::DescribeCommitted(region.begin, static_cast<std::size_t>(region.regionEnd - region.begin));
+                if (committed.ranges.size() != 1 || committed.ranges.front().first != region.begin || committed.ranges.front().second != region.committedEnd) return false;
+            }
         }
         return true;
     };
@@ -2668,6 +2781,14 @@ namespace {
 // seen for the same shader variant(s) and the first differing word is charged to its binding's role
 // (and to its index within the V# or T# element), printed as [rescache] every 10 s: it says whether
 // V# bases of ring allocations, SRT words or image descriptors churn.
+struct KeyMissWindow {
+    std::uint64_t compared = 0;
+    std::uint64_t noCandidate = 0;
+    std::uint64_t unlabelled = 0;
+    std::uint64_t identical = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ContentKeyComponent::Count)> differing{};
+};
+
 struct ChurnCounts {
     std::array<std::uint64_t, 8> roles{};
     std::array<std::uint64_t, 4> bufferWords{};
@@ -2676,6 +2797,7 @@ struct ChurnCounts {
     std::uint64_t sameKey = 0;
     std::uint64_t layout = 0;
     std::uint64_t drawWords = 0;
+    KeyMissWindow window;
 };
 
 // Dispatch keys and draw keys are counted apart: what churns a draw's key decides the draw steps.
@@ -2684,8 +2806,20 @@ struct ChurnProfile {
     std::unordered_map<std::uint64_t, ResourceCache::Key> lastByVariant;
     ChurnCounts dispatch;
     ChurnCounts draws;
+    std::unordered_map<std::uint64_t, std::uint32_t> tracedByVariant;
+    std::size_t tracedLines = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+constexpr std::size_t MaxTracedLines = 256;
+constexpr std::uint32_t MaxTracedLinesPerVariant = 4;
+
+const char* componentName(std::size_t component) {
+    constexpr std::array<const char*, static_cast<std::size_t>(ContentKeyComponent::Count)> names{"layout", "V# word 0", "V# word 1", "V# word 2", "V# word 3", "image", "sampler", "shader-data", "other", "draw target/index"};
+    return names[component];
+}
+
+void traceMiss(ChurnProfile& churn, bool draw, std::uint64_t variants, const ContentKeyDiff* parts);
 
 ChurnProfile& Churn() {
     static ChurnProfile profile;
@@ -2749,9 +2883,28 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     return found->second->second;
 }
 
+namespace {
+
+void traceMiss(ChurnProfile& churn, bool draw, std::uint64_t variants, const ContentKeyDiff* parts) {
+    if (churn.tracedLines >= MaxTracedLines || ++churn.tracedByVariant[variants] > MaxTracedLinesPerVariant) return;
+    ++churn.tracedLines;
+    std::string changed = parts == nullptr ? "first-seen" : "";
+    for (std::size_t i = 0; parts != nullptr && i < parts->size(); ++i) {
+        if (!(*parts)[i]) continue;
+        if (!changed.empty()) changed += ", ";
+        changed += componentName(i);
+    }
+    if (changed.empty()) changed = "no-component-change";
+    const auto hashed = (variants ^ 0x9e3779b97f4a7c15ull) * 0xff51afd7ed558ccdull;
+    AgcDriver::ProfilePrint_nid_no_patch("[keymiss] resource-content %s shader set %016llx: %s\n", draw ? "draw" : "dispatch", static_cast<unsigned long long>(hashed ^ (hashed >> 33u)), changed.c_str());
+}
+
+}
+
 void ResourceCache::noteMiss(const Key& key) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile || key.size() < 5) return;
+    static const bool trace = std::getenv("APS5_TRACE_RESOURCE_KEY_MISSES") != nullptr;
+    if ((!profile && !trace) || key.size() < 5) return;
     // The variant(s) the key belongs to: a compute key starts with the data-words flag, the stage
     // and its variant, a draw key with a marker, the device and its stages' keys (Draw.cpp
     // DrawResourceKey).
@@ -2772,6 +2925,8 @@ void ResourceCache::noteMiss(const Key& key) {
     const auto found = churn.lastByVariant.find(variants);
     if (found == churn.lastByVariant.end()) {
         ++counts.firstSeen;
+        ++counts.window.noCandidate;
+        if (trace) traceMiss(churn, draw, variants, nullptr);
         churn.lastByVariant.emplace(variants, key);
     } else {
         const auto& previous = found->second;
@@ -2791,6 +2946,19 @@ void ResourceCache::noteMiss(const Key& key) {
         } else {
             std::size_t at = 0;
             if (!chargeShaderKey(counts, key, at, diff)) ++counts.layout;
+        }
+        if (trace) {
+            ContentKeyDiff parts;
+            ++counts.window.compared;
+            if (!ShaderResources::DiffContentKeys(previous, key, draw, parts)) ++counts.window.unlabelled;
+            bool anyPart = false;
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                if (!parts[i]) continue;
+                ++counts.window.differing[i];
+                anyPart = true;
+            }
+            if (!anyPart) ++counts.window.identical;
+            traceMiss(churn, draw, variants, &parts);
         }
         found->second = key;
     }
@@ -2816,8 +2984,20 @@ void ResourceCache::noteMiss(const Key& key) {
         line += item;
         AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
     };
-    report("dispatch", churn.dispatch);
-    report("draws", churn.draws);
+    if (profile) {
+        report("dispatch", churn.dispatch);
+        report("draws", churn.draws);
+    }
+    const auto keyMiss = [](const char* what, KeyMissWindow& window) {
+        const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+        const auto part = [&](ContentKeyComponent component) { return count(window.differing[static_cast<std::size_t>(component)]); };
+        AgcDriver::ProfilePrint_nid_no_patch("[keymiss] resource-content %s (10 s): misses %llu; differing: layout %llu, V# word0 %llu, V# word1 %llu, V# word2 %llu, V# word3 %llu, image %llu, sampler %llu, shader-data %llu, other %llu, draw target/index %llu; no-candidate %llu; identical %llu; not comparable %llu\n", what, count(window.compared + window.noCandidate), part(ContentKeyComponent::Layout), part(ContentKeyComponent::BufferWord0), part(ContentKeyComponent::BufferWord1), part(ContentKeyComponent::BufferWord2), part(ContentKeyComponent::BufferWord3), part(ContentKeyComponent::Image), part(ContentKeyComponent::Sampler), part(ContentKeyComponent::ShaderData), part(ContentKeyComponent::Other), part(ContentKeyComponent::DrawTarget), count(window.noCandidate), count(window.identical), count(window.unlabelled));
+        window = KeyMissWindow{};
+    };
+    if (trace) {
+        keyMiss("dispatch", churn.dispatch.window);
+        keyMiss("draw", churn.draws.window);
+    }
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {

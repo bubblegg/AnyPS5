@@ -112,8 +112,10 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             }
             pixelStorage.psInputVgpr[static_cast<std::uint32_t>(input)] = PixelInputVgpr(pixel.inputAddr, input);
         };
+        place(PixelInput::PerspectiveSample, (pixel.inputAddr & PixelInputBit(PixelInput::PerspectiveSample)) != 0u);
         place(PixelInput::PerspectiveCenter, pixel.hasPerspectiveCenterVgpr);
         place(PixelInput::PerspectiveCentroid, pixel.perspectiveCentroid);
+        place(PixelInput::LinearSample, (pixel.inputAddr & PixelInputBit(PixelInput::LinearSample)) != 0u);
         place(PixelInput::LinearCenter, pixel.noPerspective);
         place(PixelInput::LinearCentroid, pixel.linearCentroid);
         place(PixelInput::PositionX, pixel.posX);
@@ -143,7 +145,9 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         pixelStorage.psExecuteOnNoop = pixel.executeOnNoop;
         pixelStorage.psConservativeZExport = pixel.conservativeZExport;
         pixelStorage.psOrderedPixelShader = pixel.orderedPixelShader;
+        if (pixel.ditheredAlphaToCoverage && !pixel.alphaToCoverage) throw std::runtime_error("dithered alpha-to-coverage requires enabled coverage");
         pixelStorage.psAlphaToCoverage = pixel.alphaToCoverage;
+        pixelStorage.psDitheredAlphaToCoverage = pixel.ditheredAlphaToCoverage;
         ShaderStageInputInfo result;
         result.pixel = &pixelStorage;
         return result;

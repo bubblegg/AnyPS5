@@ -535,6 +535,7 @@ private:
         std::vector<Read> reads;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        std::uint64_t traceId = 0;
         bool submitted = false;
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
@@ -741,7 +742,7 @@ private:
     static const Batch::Read* readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
-    void publishPendingWrites() const;
+    void publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions = {}) const;
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
     // `ownLabel`: the range is a label's own store (NoteLabel, AfterCompletions), which does not
     // overwrite the table entries it covers; any other range flags them (table mutex, briefly).
@@ -825,6 +826,8 @@ private:
     std::map<DrawSnapshotKey, IndexRange> indexRanges;
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
+    mutable bool publishedWriteRangesValid = false;
 };
 
 }

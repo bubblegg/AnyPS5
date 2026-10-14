@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -241,6 +242,24 @@ std::uint32_t LodU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) 
         ctx.Fail(access.inst, "has an image address without the mip level component");
     }
     return AddressU32(ctx, access, component);
+}
+
+bool VolumeSliceAddress(const ImageEmitAccess& access) {
+    return access.mem.imageDimension == RdnaImageDimension::Dim2DArray && access.image.dimension == RdnaImageDimension::Dim3D;
+}
+
+std::uint32_t VolumeSliceInRange(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t image, std::optional<std::uint32_t> lod) {
+    auto& state = ctx.state;
+    state.module.EmitCapability(spv::CapabilityImageQuery);
+    const auto size = state.module.AllocateId();
+    if (lod.has_value()) {
+        state.module.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 3), size, image, *lod);
+    } else {
+        state.module.AddFunction(spv::OpImageQuerySize, TypeU32Vector(state, 3), size, image);
+    }
+    const auto depth = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), depth, size, 2u);
+    return Binary(state, spv::OpULessThan, TypeBool(state), AddressU32(ctx, access, 2u), depth);
 }
 
 std::uint32_t DrefValueF32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const ImageSampleLayout& layout) {
@@ -964,6 +983,9 @@ void EmitReadOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     if (access.mem.imageDimension == RdnaImageDimension::Dim3D && access.image.dimension == RdnaImageDimension::Dim2D) {
         condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, Binary(state, spv::OpIEqual, TypeBool(state), AddressU32(ctx, access, 2u), ConstantU32(state, 0u)));
     }
+    if (VolumeSliceAddress(access)) {
+        condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, VolumeSliceInRange(ctx, access, LoadSampledImageDescriptor(state, access.mem.resource, access.slot), LodU32(ctx, access)));
+    }
     ctx.Define(access.inst, EmitValueOrDefaultIfCondition(state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4), [&]() {
         const auto descriptor = LoadSampledImageDescriptor(state, access.mem.resource, access.slot);
         const auto color = state.module.AllocateId();
@@ -997,7 +1019,14 @@ void EmitWriteOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
         ctx.Fail(access.inst, "stores through a bindless image table are unsupported");
     }
     const bool uintImage = access.image.numericClass == IrTextureNumericClass::Uint;
-    EmitIfCondition(state, ctx.Arg(access.inst, 3), [&]() {
+    auto condition = ctx.Arg(access.inst, 3);
+    if (VolumeSliceAddress(access)) {
+        if (access.image.mipMode == ImageMipMode::DynamicStorage) ctx.Fail(access.inst, "stores a 2D-array address to a 3D image with dynamic mips, which is not implemented");
+        const auto image = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, ImageType(state, access.image), image, StorageImageDescriptorPointer(state, access.mem.resource));
+        condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, VolumeSliceInRange(ctx, access, image, std::nullopt));
+    }
+    EmitIfCondition(state, condition, [&]() {
         const auto mipLod = access.image.mipMode == ImageMipMode::DynamicStorage ? LodU32(ctx, access) : 0u;
         const auto coord = CoordU32(ctx, access);
         const auto texel = access.mem.imagePacked ? PackedStoreTexel(ctx, access, ctx.Arg(access.inst, 2)) : StoreTexel(ctx, access, ctx.Arg(access.inst, 2), uintImage);

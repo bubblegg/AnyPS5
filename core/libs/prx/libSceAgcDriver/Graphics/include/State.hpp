@@ -114,6 +114,7 @@ struct State {
     bool negativeOneToOne;
     bool depthClamp = false;
     bool alphaToCoverage = false;
+    bool ditheredAlphaToCoverage = false;
     VkConservativeRasterizationModeEXT conservativeRasterization = VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT;
     VkRect2D scissor;
     VkCullModeFlags cullMode;

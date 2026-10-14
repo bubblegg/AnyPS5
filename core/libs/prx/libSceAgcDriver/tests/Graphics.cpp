@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -631,8 +632,14 @@ void MsaaEnableSingleSampleTests() {
     queue.context.erase(0x306);
     expectFailure([&] { DecodeState(queue); }, "missing register");
     queue = enabled();
+    queue.context[0x203] &= ~0x800u;
     queue.context[0x2dc] = 0xaa01;
     refused(queue, "MSAA_ENABLE on a single-sample target with alpha-to-coverage");
+    queue = enabled();
+    queue.context[0x2dc] = 0xaa01;
+    refused(queue, "MSAA_ENABLE on a single-sample target with alpha-to-coverage");
+    queue.context[0x2dc] = 0x18701;
+    Require(!DecodeState(queue).alphaToCoverage && DrawRejection(queue, false).empty(), "MSAA_ENABLE on a single-sample target ignored the dithered alpha disable override");
     queue = enabled();
     queue.context[0x313] = 0x6001;
     refused(queue, "MSAA_ENABLE on a single-sample target with conservative rasterization");
@@ -653,6 +660,7 @@ void MsaaEnableSingleSampleTests() {
     queue.context[0x292] = 7;
     refused(queue, "scan conversion mode");
     clear.context[0x2fe] = 0x44;
+    clear.context[0x203] &= ~0x800u;
     clear.context[0x2dc] = 0xaa01;
     Require(DecodeState(clear).alphaToCoverage && DrawRejection(clear, false).empty(), "a single-sample target without MSAA_ENABLE was refused over its sample locations or alpha-to-coverage");
 }
@@ -893,10 +901,10 @@ bool readsBuiltin(const std::vector<spv::BuiltIn>& read, spv::BuiltIn builtin) {
     return std::find(read.begin(), read.end(), builtin) != read.end();
 }
 
-std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled) {
+std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled, std::uint32_t inputs = 0x22u) {
     auto queue = makeState();
-    queue.context[0x1b3] = 0x22u;
-    queue.context[0x1b4] = 0x22u;
+    queue.context[0x1b3] = inputs;
+    queue.context[0x1b4] = inputs;
     queue.context[0x1b6] = 2u;
     queue.context[0x191] = 0u;
     queue.context[0x192] = 1u;
@@ -930,6 +938,7 @@ std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled) 
         }
     }
     if (barycentricEnabled) Require(perVertex == 2u && perspectiveBarycentrics && linearBarycentrics, "explicit interpolation must preserve both parameter vertices and both barycentric inputs");
+    if (!barycentricEnabled) Require(!result.barycentricEmulation.active, "v_interp_p1/p2 of their own I/J pairs did not keep host interpolation");
     std::vector<std::uint32_t> result2;
     for (const auto id : noPerspective) result2.push_back(locations.count(id) != 0 ? locations.at(id) : 0xffffffffu);
     return result2;
@@ -1149,6 +1158,19 @@ void PixelInputLayoutTests() {
     const auto noPerspective = pixelNoPerspectiveLocations(false);
     Require(noPerspective.size() == 1 && noPerspective[0] == 1u, "only the parameter interpolated through the linear pair must be NoPerspective");
     Require(pixelNoPerspectiveLocations(true).empty(), "explicit interpolation must not interpolate parameter arrays a second time");
+    for (const auto inputs : {0x11u, 0x12u, 0x21u}) {
+        const auto sampleNoPerspective = pixelNoPerspectiveLocations(false, inputs);
+        Require(sampleNoPerspective.size() == 1 && sampleNoPerspective[0] == 1u, "a parameter interpolated through a sample I/J pair lost its interpolation mode: inputs " + std::to_string(inputs));
+        Require(pixelNoPerspectiveLocations(true, inputs).empty(), "explicit interpolation through a sample I/J pair interpolated parameter arrays a second time: inputs " + std::to_string(inputs));
+    }
+    for (const auto source : {0u, 1u}) {
+        const auto read = pixelBuiltinsRead(0x3u, 0x3u, source);
+        Require(readsBuiltin(read, spv::BuiltInBaryCoordKHR) && !readsBuiltin(read, spv::BuiltInFragCoord), "PERSP_SAMPLE does not hold the perspective barycentrics: v" + std::to_string(source));
+    }
+    for (const auto source : {2u, 3u}) {
+        const auto read = pixelBuiltinsRead(0x12u, 0x12u, source);
+        Require(readsBuiltin(read, spv::BuiltInBaryCoordNoPerspKHR) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR), "LINEAR_SAMPLE does not hold the linear barycentrics: v" + std::to_string(source));
+    }
     auto read = pixelBuiltinsRead(0x106u, 0x106u, 4u);
     Require(readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR), "POS_X is not in v4 after the center and centroid pairs");
     read = pixelBuiltinsRead(0x326u, 0x326u, 5u);
@@ -2661,14 +2683,86 @@ void DepthClipTests() {
     }
 }
 
-void AlphaToCoverageTests() {
+void UnditheredAlphaToCoverageTests() {
     auto queue = makeState();
+    queue.context[0x203] = 0x8010;
+    queue.context[0x2dc] = 0xaa01;
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    for (const auto samples : {1u, 8u}) {
+        if (samples == 8) {
+            queue.context[0x201] = 0x00133303;
+            queue.context[0x2f8] = 0x0030e003;
+            queue.context[0x292] = 3;
+            queue.context[0x31d] = 0x1b000;
+            for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+                queue.context[0x2fe + pixel * 4u] = 0xbd153fd1u;
+                queue.context[0x2ff + pixel * 4u] = 0x9773f95bu;
+            }
+        }
+        for (const auto disabled : {false, true}) {
+            queue.context[0x203] = 0x8010u | (disabled ? 0x800u : 0u);
+            const auto state = AgcDriver::Graphics::DecodeState(queue);
+            Require(state.alphaToCoverage && !state.ditheredAlphaToCoverage && state.samples == samples, "the existing undithered alpha-to-coverage state changed");
+            Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck changed the existing undithered alpha-to-coverage state");
+        }
+    }
+}
+
+void AlphaToCoverageTests() {
+    UnditheredAlphaToCoverageTests();
+    auto dithered = makeState();
+    dithered.context[0x203] = 0x8010;
+    dithered.context[0x201] = 0x00133303;
+    dithered.context[0x2dc] = 0x18701;
+    dithered.context[0x2f8] = 0x0030e003;
+    dithered.context[0x292] = 3;
+    dithered.context[0x31d] = 0x1b000;
+    dithered.context[0x1b3] = 2;
+    dithered.context[0x1b4] = 2;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+        dithered.context[0x2fe + pixel * 4u] = 0xbd153fd1u;
+        dithered.context[0x2ff + pixel * 4u] = 0x9773f95bu;
+    }
+    const auto rejection = AgcDriver::Graphics::DrawRejection(dithered, false);
+    Require(rejection.empty(), "eight-sample default dither refused: " + rejection);
+    const auto ditheredState = AgcDriver::Graphics::DecodeState(dithered);
+    Require(ditheredState.alphaToCoverage && ditheredState.samples == 8, "default dither did not enable eight-sample coverage");
+    Require(ditheredState.ditheredAlphaToCoverage, "default dither did not reach the shader state");
+    for (const auto eqaa : {0x00133333u, 0x00132303u, 0x00133203u, 0x00333303u}) {
+        dithered.context[0x201] = eqaa;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "DB_EQAA");
+        Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("DB_EQAA") != std::string::npos, "the precheck accepted unmatched dithered coverage samples");
+    }
+    dithered.context[0x201] = 0x00133303;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) dithered.context[0x2fe + pixel * 4u] ^= 1u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "custom sample locations");
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("custom sample locations") != std::string::npos, "the precheck accepted unmeasured dithered sample locations");
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) dithered.context[0x2fe + pixel * 4u] ^= 1u;
+    for (const auto format : {3u, 5u, 6u}) {
+        dithered.context[0x1c5] = format;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "FP16_ABGR or 32_ABGR");
+        Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("FP16_ABGR or 32_ABGR") != std::string::npos, "the precheck accepted an unmeasured dithered export format");
+    }
+    dithered.context[0x1c5] = 4;
+    Require(AgcDriver::Graphics::DecodeState(dithered).ditheredAlphaToCoverage, "FP16 default dither was refused");
+    dithered.context[0x203] |= 0x800u;
+    Require(!AgcDriver::Graphics::DecodeState(dithered).alphaToCoverage, "the shader disable override was ignored");
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).empty(), "the precheck ignored the shader disable override");
+    dithered.context[0x2dc] |= 2u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "alpha-to-coverage");
+    auto queue = makeState();
+    queue.context[0x203] = 0;
     queue.context[0x1b3] = 2;
     queue.context[0x1b4] = 2;
     Require(!AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "alpha-to-coverage decoded while disabled");
     queue.context[0x2dc] = 0xaa01;
     Require(AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "undithered alpha-to-coverage was not decoded");
     Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck rejected undithered alpha-to-coverage");
+    queue.context[0x203] |= 0x800u;
+    Require(AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "the existing undithered single-sample state changed under the shader disable override");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck changed the existing undithered single-sample state under the shader disable override");
+    queue.context[0x203] &= ~0x800u;
     for (const auto control : {0x8701u, 0x1aa01u, 0xaa03u}) {
         queue.context[0x2dc] = control;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "alpha-to-coverage");
@@ -2712,6 +2806,7 @@ void InitialContextTests() {
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_VTE_CNTL=0x");
     }
     queue.context[0x206] = 0x43f;
+    queue.context[0x203] &= ~0x800u;
     queue.context[0x2dc] |= 1;
     Require(AgcDriver::Graphics::DecodeState(queue).alphaToCoverage, "undithered alpha-to-coverage was not decoded");
     queue.context.erase(0x2dc);
@@ -5727,6 +5822,13 @@ void storeAtFlipTests() {
     for (const char* value : {"0", "", "true", "11"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1");
 }
 
+void storeAtLabelTests() {
+    using AgcDriver::Graphics::StorageTexture;
+    Require(!StorageTexture::StoreAtLabelRequested(nullptr), "an unset APS5_STORE_AT_LABEL stored at each label");
+    Require(StorageTexture::StoreAtLabelRequested("1"), "APS5_STORE_AT_LABEL=1 did not store at each label");
+    for (const char* value : {"0", "", "true", "11"}) expectFailure([&] { StorageTexture::StoreAtLabelRequested(value); }, "expected 1");
+}
+
 void nullVertexDescriptorTests() {
     using AgcDriver::Graphics::DecodeVertexFormat;
     constexpr std::array formats{VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT};
@@ -5848,6 +5950,79 @@ void parallelCompareTests() {
     CompareSpansFrom({}, none, 0);
 }
 
+void ResourceContentKeyTests(bool benchmark) {
+    using AgcDriver::Graphics::ShaderResources;
+    using ShaderRecompiler::DescriptorKind;
+    using ShaderRecompiler::DescriptorRole;
+    for (const auto count : {0u, 1u, 31u, 32u, 33u, 16384u}) {
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding images{};
+        images.kind = DescriptorKind::SampledImage;
+        images.role = DescriptorRole::GuestImages;
+        images.count = count;
+        images.guestDescriptor.resize(static_cast<std::size_t>(count) * 8u);
+        for (std::size_t i = 0; i < images.guestDescriptor.size(); ++i) images.guestDescriptor[i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
+        for (auto* bits : {&images.imageWritten, &images.samplerDepthCompare, &images.imageDepthCompare, &images.imageAtomic, &images.samplerUnnormalized, &images.samplerIntegerBorder, &images.imageUnnormalized, &images.imageUnnormalizedBaseLevel, &images.bufferWritten}) {
+            bits->resize(count);
+            for (std::size_t i = 0; i < bits->size(); ++i) (*bits)[i] = i % 3u == 0;
+        }
+        images.imageSamplers.resize(count, 7u);
+        program.bindings.push_back(std::move(images));
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = DescriptorKind::StorageBuffer;
+        data.role = DescriptorRole::ShaderData;
+        data.count = 1;
+        data.guestDescriptor.resize(257u, 0x12345678u);
+        program.bindings.push_back(std::move(data));
+        ShaderRecompiler::DescriptorBinding buffers{};
+        buffers.kind = DescriptorKind::StorageBuffer;
+        buffers.role = DescriptorRole::GuestBuffers;
+        buffers.count = 1;
+        buffers.guestDescriptor = {0x1000u, 0x10000u, 4u, 0x1234u};
+        buffers.bufferWritten = {false};
+        program.bindings.push_back(std::move(buffers));
+        const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        for (const bool dataWords : {false, true}) for (const bool movable : {false, true}) {
+            const auto original = ShaderResources::ContentKey(shader, dataWords, movable);
+            program.bindings[1].guestDescriptor.back() ^= 1u;
+            Require((ShaderResources::ContentKey(shader, dataWords, movable) != original) == (dataWords && !movable), "content key changed its data-word policy");
+            program.bindings[1].guestDescriptor.back() ^= 1u;
+            program.bindings[2].guestDescriptor[0] += 0x1000u;
+            Require((ShaderResources::ContentKey(shader, dataWords, movable) != original) == !movable, "content key changed its movable-buffer policy");
+            program.bindings[2].guestDescriptor[0] -= 0x1000u;
+            program.bindings[2].bufferWritten[0] = true;
+            Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the written-buffer mask");
+            program.bindings[2].bufferWritten[0] = false;
+            if (count != 0) {
+                for (auto* bits : {&program.bindings[0].imageWritten, &program.bindings[0].samplerDepthCompare, &program.bindings[0].imageDepthCompare, &program.bindings[0].imageAtomic, &program.bindings[0].samplerUnnormalized, &program.bindings[0].samplerIntegerBorder, &program.bindings[0].imageUnnormalized, &program.bindings[0].imageUnnormalizedBaseLevel}) {
+                    bits->back().flip();
+                    Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last packed flag");
+                    bits->back().flip();
+                }
+                ++program.bindings[0].imageSamplers.back();
+                Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last sampler association");
+                --program.bindings[0].imageSamplers.back();
+            }
+            Require(original.capacity() == original.size(), "content key reserved a different word count than it serialized");
+            std::uint64_t hash = 14695981039346656037ull;
+            for (const auto word : original) hash = (hash ^ word) * 1099511628211ull;
+            std::cout << "content-key count=" << count << " data=" << dataWords << " movable=" << movable << " words=" << original.size() << " capacity=" << original.capacity() << " hash=" << hash;
+            if (benchmark) {
+                constexpr std::size_t repeats = 256;
+                std::uint64_t checksum = 0;
+                const auto begin = std::chrono::steady_clock::now();
+                for (std::size_t i = 0; i < repeats; ++i) {
+                    const auto key = ShaderResources::ContentKey(shader, dataWords, movable);
+                    checksum += key.size() + key.back();
+                }
+                const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
+                std::cout << " us/key=" << elapsed / repeats << " checksum=" << checksum;
+            }
+            std::cout << '\n';
+        }
+    }
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -5889,9 +6064,24 @@ int main(int argc, char** argv) {
             pipelineUse.unlock();
             Require(synchronization.TryLockForSnapshot().owns_lock(), "pipeline cache snapshot stayed blocked after pipeline creation finished");
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--undithered-alpha-to-coverage-state") {
+            UnditheredAlphaToCoverageTests();
+            std::cout << "Existing undithered alpha-to-coverage states passed\n";
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--resource-content-key" || std::string_view(argv[1]) == "--benchmark-resource-content-key")) {
+            ResourceContentKeyTests(std::string_view(argv[1]) == "--benchmark-resource-content-key");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--alpha-to-coverage-state") {
+            MsaaEnableSingleSampleTests();
+            AlphaToCoverageTests();
+            std::cout << "Alpha-to-coverage state and refusal tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-reset-failure") {
@@ -5935,6 +6125,7 @@ int main(int argc, char** argv) {
             AgcDriver::Graphics::ValidateDepthBounds(unrestricted, bounded);
         }
         RunGuestLeaseWaitTests();
+        ResourceContentKeyTests(false);
         stateTests();
         pipelineLibrarySetTests();
         hdrComponentSwapTests();
@@ -6006,6 +6197,7 @@ int main(int argc, char** argv) {
         vertexCopyTests();
         highestDrawIndexTests();
         storeAtFlipTests();
+        storeAtLabelTests();
         nullVertexDescriptorTests();
         vertexZeroFillTests();
         vertexZeroFillMergeTests();

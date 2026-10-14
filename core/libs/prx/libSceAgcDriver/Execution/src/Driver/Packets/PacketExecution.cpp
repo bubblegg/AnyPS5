@@ -426,7 +426,7 @@ void Driver::execute(const Submission& submission) {
             recordQueuedLabelsBeforeRead(submission.queue);
             Pm4::Execute(packet, queue);
         } else if (sampleDump && !wroteOnGpu) {
-            dumpSampleCounters(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
+            dumpSampleCounters(Pm4::SampleDumpAddress(packet));
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
                 if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
