@@ -780,6 +780,20 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         }
     }
     if (modes.empty()) throw std::runtime_error("image instruction has no supported runtime modes");
+    // A sampled multisampled access has only single-sample modes: views of multisampled surfaces
+    // are decoded as plain 2D images (descriptorDimension), so no T# selects a multisampled mode.
+    // Kept as a mode it made a registration module declare a multisampled image heap, which has no
+    // descriptor image shape, and every draw of such a shader was skipped (Unity's copy of a
+    // multisampled depth target, which its depth of field then read as empty).
+    if (!storage && (image.dimension == RdnaImageDimension::Dim2DMsaa || image.dimension == RdnaImageDimension::Dim2DMsaaArray)) {
+        std::vector<ImageResource> single;
+        for (auto mode : modes) {
+            if (mode.dimension == RdnaImageDimension::Dim2DMsaa) mode.dimension = RdnaImageDimension::Dim2D;
+            if (mode.dimension == RdnaImageDimension::Dim2DMsaaArray) mode.dimension = RdnaImageDimension::Dim2DArray;
+            if (std::ranges::find(single, mode) == single.end()) single.push_back(mode);
+        }
+        modes = std::move(single);
+    }
     if (image.foldTexelOffsetsOnly && std::ranges::any_of(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) == nullptr; })) {
         std::erase_if(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) != nullptr; });
     }
