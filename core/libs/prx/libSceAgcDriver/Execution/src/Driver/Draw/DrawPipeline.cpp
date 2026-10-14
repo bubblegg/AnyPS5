@@ -131,6 +131,12 @@ void DrawPipeline::push(Item item, std::unique_lock<std::mutex>& lock) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     rethrowFailure();
     if (items.size() >= Depth()) {
+        // Waiting for room while holding the GPU lock never ends: the committer takes that lock for
+        // every item it runs. Reported once, so a caller that queues under the lock is found.
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) std::fprintf(stderr, "[pipeline] a full draw queue is waited on with the GPU lock held: the committer cannot drain it (deadlock)\n");
+        }
         const auto waitStart = __rdtsc();
         const auto start = std::chrono::steady_clock::now();
         // The committer makes room within one commit, tens of microseconds: the full queue is

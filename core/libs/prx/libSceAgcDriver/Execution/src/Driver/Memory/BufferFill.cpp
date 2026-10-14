@@ -384,6 +384,9 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             }
         }
     };
+    // The GPU lock taken to read a fill's pattern from guest memory is let go before the fill is
+    // queued: a full draw queue waits for the recording thread, which needs the lock to drain it.
+    if (inputLock.owns_lock()) inputLock.unlock();
     static const bool orderedFills = std::getenv("APS5_PIPELINE_DRAIN_FILLS") == nullptr;
     if (orderedFills && queueId == 0 && DrawPipeline::Active()) {
         DrawPipeline::Queue0().Enqueue([store, queueId] {
