@@ -44,7 +44,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
         image.GetRva(originalPltGotVaddr, 8);
     report(500);
     const WindowsRelocationBuilder relocationBuilder;
-    auto relocations = relocationBuilder.Apply(image, dynamicSection);
+    auto relocations = relocationBuilder.Apply(image, dynamicSection, originalHeaders);
     report(1000);
     auto sections = image.BuildSections();
     report(1500);
@@ -110,7 +110,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     }
     directories[2] = icon ? WindowsIconResourceBuilder().Build(*icon, iconName, sections, nextRva) : PeDirectory{};
     report(9500);
-    auto result = WindowsPeWriter().Write(sections, entryRva, directories, windowsGui, fixedBase ? std::optional<std::uint64_t>(image.GetImageBase()) : std::nullopt);
+    auto result = WindowsPeWriter().Write(sections, entryRva, directories, windowsGui, fixedBase ? std::optional<std::uint64_t>(image.GetImageBase()) : std::nullopt, false);
     report(10000);
     return result;
 }

@@ -35,7 +35,10 @@ GpuColorTransfer::GpuColorTransfer(const Context& context) : context(context) {
         pipelineInfo.stage.module = module;
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = pipelineLayout;
-        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines color transfer");
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines color transfer");
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
         const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
@@ -146,13 +149,13 @@ void GpuColorTransfer::dispatch(VkCommandBuffer commands, bool toTiled, bool swa
     barrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
 }
 
-void GpuColorTransfer::DetileImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t newWidth, std::uint32_t newHeight, ColorTileMode newMode, bool swapRedBlue, bool tenBit, bool halfFloat) {
+void GpuColorTransfer::DetileImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t newWidth, std::uint32_t newHeight, ColorTileMode newMode, bool swapRedBlue, bool tenBit, bool halfFloat, std::uint32_t layer) {
     Require(commands != VK_NULL_HANDLE && image != VK_NULL_HANDLE, "color transfer image source is unavailable");
     prepare(newWidth, newHeight, newMode, halfFloat ? 8u : 4u);
     Require(tiledDevice->Size() >= static_cast<VkDeviceSize>(width) * height * elementBytes, "color transfer buffer is smaller than the image");
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
     copy.imageExtent = {width, height, 1};
     context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, layout, tiledDevice->Handle(), 1, &copy);
     dispatch(commands, false, swapRedBlue, tenBit, false, halfFloat);

@@ -18,6 +18,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "SaveData.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
 
@@ -29,44 +30,6 @@ static std::atomic<float> g_convertProgress{0.0f};
 
 static std::string save_root() {
     return std::string(SAVE_DIR);
-}
-
-// The blocks (32 KiB) a save's files take, each file rounded up to whole blocks.
-static std::uint64_t used_blocks(const std::filesystem::path& path) {
-    constexpr std::uint64_t BlockBytes = 32768;
-    std::uint64_t blocks = 0;
-    std::error_code error;
-    for (auto it = std::filesystem::recursive_directory_iterator(path, error); !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
-        if (!it->is_regular_file(error)) continue;
-        const auto bytes = it->file_size(error);
-        if (!error) blocks += (bytes + BlockBytes - 1) / BlockBytes;
-    }
-    return std::min(blocks, SAVE_DATA_BLOCKS_MAX);
-}
-
-// A save's size in blocks is what the title gave when it created it (the mount's `blocks`), kept
-// beside the save; a save created before sizes were kept takes the size of its next mount that
-// names one, and one never mounted with a size has SAVE_DATA_BLOCKS_MAX.
-static std::string blocks_path(const std::string& real_path) {
-    return real_path + ".blocks";
-}
-
-static std::uint64_t save_blocks(const std::string& real_path) {
-    std::ifstream file(blocks_path(real_path));
-    std::uint64_t blocks = 0;
-    if (!(file >> blocks) || blocks == 0) return SAVE_DATA_BLOCKS_MAX;
-    return std::min(blocks, SAVE_DATA_BLOCKS_MAX);
-}
-
-static void keep_save_blocks(const std::string& real_path, std::uint64_t blocks) {
-    std::ofstream file(blocks_path(real_path), std::ios::trunc);
-    file << std::min(blocks, SAVE_DATA_BLOCKS_MAX) << '\n';
-    if (!file) throw std::runtime_error("sceSaveDataMount3: the save's size could not be kept");
-}
-
-static SaveDataSearchInfo search_info(const std::string& real_path) {
-    const auto blocks = save_blocks(real_path);
-    return SaveDataSearchInfo{blocks, blocks - std::min(blocks, used_blocks(real_path)), {}};
 }
 
 // Events the title polls with sceSaveDataGetEventResult; a backup completes at once here.
@@ -257,6 +220,10 @@ int APS5_VABI sceSaveDataCreateTransactionResource(uint32_t size) {
     return g_transaction_counter.fetch_add(1);
 }
 
+static std::string blocks_path(const std::string& real_path) {
+    return real_path + ".blocks";
+}
+
 static int deleteSave(const SaveDataDelete* del) {
     if (del == nullptr || del->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataDelete: null argument");
@@ -307,6 +274,45 @@ int APS5_VABI sceSaveDataDeleteTransactionResource(int32_t resource) {
     return SAVE_DATA_OK;
 }
 
+static constexpr std::uint64_t SAVE_DATA_BLOCK_BYTES = 32768;
+
+static std::uint64_t save_blocks(const std::string& real_path) {
+    std::ifstream file(blocks_path(real_path));
+    std::uint64_t blocks = 0;
+    if (!(file >> blocks) || blocks == 0) {
+        return SAVE_DATA_BLOCKS_MAX;
+    }
+    return std::min(blocks, SAVE_DATA_BLOCKS_MAX);
+}
+
+static void keep_save_blocks(const std::string& real_path, std::uint64_t blocks) {
+    std::ofstream file(blocks_path(real_path), std::ios::trunc);
+    file << std::min(blocks, SAVE_DATA_BLOCKS_MAX) << '\n';
+    if (!file) {
+        throw std::runtime_error("sceSaveDataMount3: the save's size could not be kept");
+    }
+}
+
+static std::uint64_t used_blocks(const std::string& real_path) {
+    std::uint64_t blocks = 0;
+    std::error_code error;
+    for (auto it = std::filesystem::recursive_directory_iterator(real_path, error); !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+        if (!it->is_regular_file(error)) {
+            continue;
+        }
+        const auto bytes = it->file_size(error);
+        if (!error) {
+            blocks += (bytes + SAVE_DATA_BLOCK_BYTES - 1) / SAVE_DATA_BLOCK_BYTES;
+        }
+    }
+    return blocks;
+}
+
+static SaveDataSearchInfo search_info(const std::string& real_path) {
+    const auto blocks = save_blocks(real_path);
+    return SaveDataSearchInfo{blocks, blocks - std::min(blocks, used_blocks(real_path)), {}};
+}
+
 static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameSearchResult* result) {
     if (cond == nullptr || result == nullptr) {
         throw std::runtime_error("sceSaveDataDirNameSearch: null argument");
@@ -317,6 +323,9 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
     if ((key > SAVE_DATA_SORT_KEY_MTIME && key != SAVE_DATA_SORT_KEY_FREE_BLOCKS) || cond->order > SAVE_DATA_SORT_ORDER_DESCENT) {
         return SAVE_DATA_ERROR_PARAMETER;
     }
+    if (cond->title_id != nullptr && std::strncmp(cond->title_id->data, GetAppTitleId_nid_postfix().value, sizeof(cond->title_id->data)) != 0) {
+        return SAVE_DATA_OK;
+    }
     const char* pattern = (cond->dir_name != nullptr) ? cond->dir_name->data : nullptr;
     const std::string root = save_root();
     if (!std::filesystem::is_directory(root)) {
@@ -326,6 +335,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
         std::string name;
         std::string path;
         SaveDataParam param;
+        SaveDataSearchInfo info;
     };
     const bool sortByParam = key == SAVE_DATA_SORT_KEY_USER_PARAM || key == SAVE_DATA_SORT_KEY_MTIME;
     std::vector<Match> matches;
@@ -337,7 +347,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
         if (!dir_name_match(name.c_str(), pattern)) {
             continue;
         }
-        Match match{name, entry.path().string(), {}};
+        Match match{name, entry.path().string(), {}, search_info(entry.path().string())};
         if (sortByParam) {
             match.param = load_param(match.path);
         }
@@ -348,6 +358,10 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
         std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.param.user_param < b.param.user_param; });
     } else if (key == SAVE_DATA_SORT_KEY_MTIME) {
         std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.param.mtime < b.param.mtime; });
+    } else if (key == SAVE_DATA_SORT_KEY_BLOCKS) {
+        std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.info.blocks < b.info.blocks; });
+    } else if (key == SAVE_DATA_SORT_KEY_FREE_BLOCKS) {
+        std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) { return a.info.free_blocks < b.info.free_blocks; });
     }
     if (cond->order == SAVE_DATA_SORT_ORDER_DESCENT) {
         std::reverse(matches.begin(), matches.end());
@@ -359,7 +373,7 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
             result->params[i] = sortByParam ? matches[i].param : load_param(matches[i].path);
         }
         if (result->infos != nullptr) {
-            result->infos[i] = search_info(matches[i].path);
+            result->infos[i] = matches[i].info;
         }
     }
     result->hit_num = static_cast<std::uint32_t>(matches.size());
@@ -369,7 +383,6 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
 
 int APS5_VABI sceSaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameSearchResult* result) {
     const int rc = dirNameSearch(cond, result);
-    SAVEDATA_TRACE("dirNameSearch asked: title %s key %u order %u; room for %u names, params %s, infos %s; first name returned: %s", cond != nullptr && cond->title_id != nullptr ? reinterpret_cast<const char*>(cond->title_id) : "(own)", cond != nullptr ? cond->key : 0u, cond != nullptr ? cond->order : 0u, result != nullptr ? result->dir_names_num : 0u, result != nullptr && result->params != nullptr ? "yes" : "no", result != nullptr && result->infos != nullptr ? "yes" : "no", result != nullptr && result->dir_names != nullptr && result->set_num != 0 ? result->dir_names[0].data : "(none)");
     SAVEDATA_TRACE("dirNameSearch user=%d pattern=%s hit=%u set=%u -> 0x%08x", cond != nullptr ? cond->user_id : -1, cond != nullptr && cond->dir_name != nullptr ? cond->dir_name->data : "(all)", result != nullptr ? result->hit_num : 0u, result != nullptr ? result->set_num : 0u, static_cast<unsigned>(rc));
     return rc;
 }
@@ -506,7 +519,6 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     if (mount == nullptr || mount_result == nullptr || mount->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataMount3: null argument");
     }
-    std::memset(mount_result, 0, sizeof(*mount_result));
     const bool create = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_CREATE) != 0;
     const bool create2 = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_CREATE2) != 0;
     const bool rdonly = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_RDONLY) != 0;
@@ -544,18 +556,21 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     if (create || create2) {
         std::filesystem::create_directories(real_path);
     }
-    std::error_code sized;
-    if (mount->blocks != 0 && ((create || (create2 && !exists)) || !std::filesystem::exists(blocks_path(real_path), sized))) keep_save_blocks(real_path, mount->blocks);
     // The title gets a short mount point (16 bytes on the PS5) and opens files under it; the
     // path resolver maps it to the save directory, whose name may be far longer.
     const std::string mountPoint = "/savedata" + std::to_string(slot);
     AddPathAlias_nid_no_patch(mountPoint.c_str(), std::filesystem::absolute(real_path).string().c_str());
+    std::memset(mount_result, 0, sizeof(*mount_result));
     g_slots[slot].used = true;
     g_slots[slot].mount_point = mountPoint;
     g_slots[slot].real_path = real_path;
     std::memcpy(mount_result->mount_point.data, mountPoint.c_str(), mountPoint.size() + 1);
     mount_result->required_blocks = 0;
     mount_result->mount_status = (create || (create2 && !exists)) ? 1u : 0u;
+    std::error_code sized;
+    if (mount->blocks != 0 && (create || (create2 && !exists) || !std::filesystem::exists(blocks_path(real_path), sized))) {
+        keep_save_blocks(real_path, mount->blocks);
+    }
     return SAVE_DATA_OK;
 }
 

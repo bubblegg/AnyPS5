@@ -275,6 +275,76 @@ void CheckPrivateMappingReuse() {
     GuestArena::GuestArenaRelease_nid_postfix(replacement, 3 * Block);
 }
 
+void CheckUntrackedHint() {
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<volatile std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    GuestArena::GuestArenaCommit_nid_postfix(const_cast<std::uint8_t*>(memory), bytes, PAGE_READWRITE, 16384);
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+        }
+    } cleanup{const_cast<std::uint8_t*>(memory)};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto hinted = base + Block;
+    constexpr std::size_t hintedBytes = 2 * Block;
+    for (std::size_t offset = 0; offset < bytes; offset += 4096) memory[offset] = 0x11;
+    BumpCollectEpoch();
+    Require(CollectWrites(base, bytes) != 0 && UntrackedHint(base, bytes) == 0, "watched memory has an untracked hint");
+    Unwatch(hinted, hintedBytes);
+    const auto stamp = NewestStamp(hinted, hintedBytes);
+    const auto first = UntrackedHint(hinted, hintedBytes);
+    Require(first != 0, "memory that left the watch has no untracked hint");
+    Require(UntrackedHint(base, bytes) == 0 && UntrackedHint(hinted - 4096, 8192) == 0, "a range with watched blocks has an untracked hint");
+    std::array<std::uint8_t, 64> host{};
+    Require(UntrackedHint(reinterpret_cast<std::uint64_t>(host.data()), host.size()) == 0, "memory outside the arena has an untracked hint");
+    Require(!Watched(hinted, hintedBytes) && CollectWrites(hinted, hintedBytes) == 0 && !UnchangedSince(hinted, hintedBytes, TrackerGeneration()), "a hinted range reads as tracked");
+    std::array<std::uint64_t, 2> generations{first, first};
+    std::array<std::uint8_t, 2> changed{};
+    Require(!ChangedBlocks(hinted, hintedBytes, generations, changed), "a hinted range uses block stamps");
+    for (unsigned epoch = 0; epoch < 8; ++epoch) {
+        BumpCollectEpoch();
+        Require(UntrackedHint(hinted, hintedBytes) == first, "an untracked hint moved without a store");
+    }
+    memory[Block + 3 * 16384 + 8] ^= 1;
+    Require(UntrackedHint(hinted, hintedBytes) == first, "an untracked hint was walked twice in one epoch");
+    BumpCollectEpoch();
+    const auto stored = UntrackedHint(hinted, hintedBytes);
+    Require(stored > first, "a CPU store into a hinted range did not move its hint");
+    Require(UntrackedHint(hinted + Block, Block) == first, "a CPU store moved the hint of another block");
+    BumpCollectEpoch();
+    Require(UntrackedHint(hinted, hintedBytes) == stored, "an untracked hint moved again without a store");
+    memory[Block + 8] = memory[Block + 8];
+    BumpCollectEpoch();
+    const auto rewritten = UntrackedHint(hinted, hintedBytes);
+    Require(rewritten > stored, "a store of the bytes already there did not move the hint");
+    std::thread([&] { memory[2 * Block + 5 * 4096] ^= 1; }).join();
+    BumpCollectEpoch();
+    const auto threaded = UntrackedHint(hinted, hintedBytes);
+    Require(threaded > rewritten, "a store from another thread did not move the hint");
+    Require(UntrackedHint(hinted + Block, Block) == threaded && UntrackedHint(hinted, Block) == rewritten, "a walk stamped a store into the wrong block");
+    Require(NewestStamp(hinted, hintedBytes) == stamp, "untracked hint walks advanced the block stamps");
+    Unwatch(hinted, hintedBytes);
+    BumpCollectEpoch();
+    Require(UntrackedHint(hinted, hintedBytes) == threaded, "unwatching a hinted range again moved its hint");
+    Unwatch(base, Block);
+    const auto own = UntrackedHint(base, Block);
+    Require(own > threaded && UntrackedHint(hinted, hintedBytes) == threaded, "a range leaving the watch did not start a hint of its own");
+    GuestArena::GuestArenaReset_nid_postfix(const_cast<std::uint8_t*>(memory) + Block, hintedBytes);
+    GuestArena::GuestArenaCommit_nid_postfix(const_cast<std::uint8_t*>(memory) + Block, hintedBytes, PAGE_READWRITE, 16384);
+    BumpCollectEpoch();
+    const auto fresh = CollectWrites(hinted, hintedBytes);
+    Require(Watched(hinted, hintedBytes) && fresh != 0 && UnchangedSince(hinted, hintedBytes, fresh), "fresh backing of a hinted range is not watched");
+    memory[Block + 8] = 0x5a;
+    BumpCollectEpoch();
+    Require(UntrackedHint(hinted, hintedBytes) == 0, "watched fresh backing has an untracked hint");
+    CollectWritesUncached(hinted, hintedBytes);
+    Require(!UnchangedSince(hinted, Block, fresh), "an untracked hint walk took a CPU store from watched memory");
+    Unwatch(hinted, hintedBytes);
+    Require(UntrackedHint(hinted, hintedBytes) > own, "fresh backing leaving the watch did not start a new hint");
+}
+
 std::uint64_t ChildHostHole() {
     std::uintptr_t arena = 0;
     std::size_t arenaBytes = 0;
@@ -562,6 +632,142 @@ void CheckUnwatchedImport() {
 #endif
 }
 
+class PartlyCommitted {
+public:
+    static constexpr std::size_t Bytes = 4 * Block;
+
+    PartlyCommitted() {
+#ifdef _WIN32
+        memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(GuestArena::GuestArenaHighestFree_nid_no_patch(Bytes, Block), Bytes, Block));
+#else
+        void* raw = mmap(nullptr, Bytes + Block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        Require(raw != MAP_FAILED, "cannot reserve the partly committed range");
+        const auto begin = reinterpret_cast<std::uintptr_t>(raw);
+        const auto aligned = (begin + Block - 1) & ~static_cast<std::uintptr_t>(Block - 1);
+        if (aligned != begin) munmap(raw, aligned - begin);
+        if (aligned + Bytes != begin + Bytes + Block) munmap(reinterpret_cast<void*>(aligned + Bytes), begin + Block - aligned);
+        memory = reinterpret_cast<std::uint8_t*>(aligned);
+#endif
+        Require(memory != nullptr, "cannot reserve the partly committed range");
+    }
+
+    ~PartlyCommitted() {
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(memory, Bytes);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address(), Bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, Bytes);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, Bytes);
+        munmap(memory, Bytes);
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address(), Bytes);
+#endif
+    }
+
+    PartlyCommitted(const PartlyCommitted&) = delete;
+    PartlyCommitted& operator=(const PartlyCommitted&) = delete;
+
+    void Commit(std::size_t block) {
+#ifdef _WIN32
+        GuestArena::GuestArenaCommit_nid_postfix(memory + block * Block, Block, PAGE_READWRITE, Block);
+#else
+        Require(mmap(memory + block * Block, Block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot commit a block of the partly committed range");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory + block * Block, Block);
+#endif
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address(block), Block);
+    }
+
+    void Decommit(std::size_t block) {
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(memory + block * Block, Block);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory + block * Block, Block);
+        Require(mmap(memory + block * Block, Block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot decommit a block of the partly committed range");
+#endif
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(Address(block), Block);
+    }
+
+    std::uint8_t* Data() const { return memory; }
+    std::uint64_t Address(std::size_t block = 0) const { return reinterpret_cast<std::uint64_t>(memory) + block * Block; }
+
+private:
+    std::uint8_t* memory = nullptr;
+};
+
+using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+std::uint64_t CollectCommitted(const PartlyCommitted& range, Runs& runs) {
+    BumpCollectEpoch();
+    return CollectCommittedWrites(range.Address(), PartlyCommitted::Bytes, runs);
+}
+
+void CheckCommittedRanges() {
+    PartlyCommitted range;
+    const auto base = range.Address();
+    range.Commit(0);
+    std::memset(range.Data(), 0x11, Block);
+    Require(CollectWrites(base, PartlyCommitted::Bytes) == 0, "a partly committed range was collected as a whole");
+    Runs runs;
+    const Runs first{{base, base + Block}};
+    const auto synced = CollectCommitted(range, runs);
+    Require(synced != 0 && runs == first, "the committed part of a partly committed range was not collected");
+    Require(UnchangedCommittedSince(runs, synced), "a collected committed part reads as changed");
+
+    range.Data()[8] = 0x22;
+    const auto written = CollectCommitted(range, runs);
+    Require(written > synced && runs == first && !UnchangedCommittedSince(runs, synced) && UnchangedCommittedSince(runs, written), "a CPU write to the committed part was missed");
+    Require(MarkWritten(base + 16, 4) != 0 && !UnchangedCommittedSince(first, written), "a driver store into the committed part was missed");
+    Require(UnchangedCommittedSince(first, CollectCommitted(range, runs)), "a collect after a driver store reads the committed part as changed");
+
+    const auto beforeCommit = CollectCommitted(range, runs);
+    range.Commit(2);
+    const Runs both{{base, base + Block}, {range.Address(2), range.Address(3)}};
+    const auto grown = CollectCommitted(range, runs);
+    Require(grown != 0 && runs == both, "a block committed inside the range is not described");
+    Require(!UnchangedCommittedSince(runs, beforeCommit), "a block committed inside the range reads as unchanged since before the commit");
+    Require(UnchangedCommittedSince(runs, grown), "the committed parts read as changed after their collect");
+
+    range.Decommit(2);
+    range.Commit(2);
+    const auto recommitted = CollectCommitted(range, runs);
+    Require(recommitted != 0 && runs == both && !UnchangedCommittedSince(runs, grown), "a block decommitted and committed again reads as unchanged");
+
+    range.Decommit(2);
+    Require(CollectCommitted(range, runs) != 0 && runs == first, "a decommitted block is still described as committed");
+
+#ifdef _WIN32
+    HANDLE firstSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Block, nullptr);
+    HANDLE secondSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Block, nullptr);
+    struct Sections {
+        HANDLE first;
+        HANDLE second;
+        ~Sections() {
+            if (first != nullptr) CloseHandle(first);
+            if (second != nullptr) CloseHandle(second);
+        }
+    } sections{firstSection, secondSection};
+    Require(firstSection != nullptr && secondSection != nullptr, "cannot create the shared backings of the partly committed range");
+    const auto beforeMap = CollectCommitted(range, runs);
+    GuestArena::GuestArenaMap_nid_postfix(range.Data() + 3 * Block, Block, firstSection, 0, PAGE_READWRITE);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(range.Address(3), Block);
+    const Runs viewed{{base, base + Block}, {range.Address(3), range.Address(4)}};
+    const auto mapped = CollectCommitted(range, runs);
+    Require(mapped != 0 && runs == viewed, "a view mapped inside the range is not described");
+    Require(!UnchangedCommittedSince(runs, beforeMap), "a view mapped inside the range reads as unchanged since before the mapping");
+    Require(UnchangedCommittedSince(runs, mapped), "a collected view reads as changed");
+    GuestArena::GuestArenaReset_nid_postfix(range.Data() + 3 * Block, Block);
+    GuestArena::GuestArenaMap_nid_postfix(range.Data() + 3 * Block, Block, secondSection, 0, PAGE_READWRITE);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(range.Address(3), Block);
+    Require(CollectCommitted(range, runs) != 0 && runs == viewed && !UnchangedCommittedSince(runs, mapped), "a view replaced inside the range reads as unchanged");
+    GuestArena::GuestArenaReset_nid_postfix(range.Data() + 3 * Block, Block);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(range.Address(3), Block);
+    Require(CollectCommitted(range, runs) != 0 && runs == first, "an unmapped view is still described as committed");
+#endif
+
+    range.Decommit(0);
+    Require(CollectCommitted(range, runs) != 0 && runs.empty() && UnchangedCommittedSince(runs, TrackerGeneration()), "a range with no committed page did not collect as empty");
+    Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
+}
+
 int main() {
     try {
         if (!WriteWatched()) {
@@ -581,12 +787,14 @@ int main() {
 #ifdef _WIN32
         CheckDeferredSharedImports();
         CheckPrivateMappingReuse();
+        CheckUntrackedHint();
         CheckHostHoleInChild();
 #endif
         CheckVersionRanges();
         CheckCollectBoundaries();
         CheckImportWindow();
         CheckUnwatchedImport();
+        CheckCommittedRanges();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

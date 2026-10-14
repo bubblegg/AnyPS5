@@ -1156,15 +1156,6 @@ private:
         DescriptorSource descriptor;
         MakeSource(*handle, width, sampler, sampleAdjust, descriptor);
         std::uint32_t badDword = 0;
-        if (expected == IrOpcode::GetImageResource) {
-            for (; badDword < descriptor.dwordCount; badDword++) {
-                const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
-                if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
-                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
-                }
-            }
-            badDword = 0;
-        }
         if (!ValidateSource(descriptor, badDword)) {
             fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
         }

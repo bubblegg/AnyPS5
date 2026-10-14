@@ -11,9 +11,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
-#include <tuple>
-#include <unordered_map>
-#include <utility>
+#include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
@@ -22,6 +20,8 @@
 #include "prx/libkernel/Module/EhFrame.hpp"
 #include "prx/libkernel/Module/ModuleArgs.hpp"
 #ifdef _WIN32
+#include <mutex>
+#include <unordered_map>
 #include <windows.h>
 #include <psapi.h>
 #elif defined(__APPLE__)
@@ -35,19 +35,86 @@
 
 #ifdef _WIN32
 namespace {
-void FillGuestUnwindInfo(const std::uint8_t* base, ModuleInfoForUnwind* info) {
+struct UnwindImage {
+  DWORD size = 0;
+  bool hasTables = false;
+  EhFrame::Tables tables;
+  std::string name;
+};
+
+std::mutex unwindImagesMutex;
+std::unordered_map<std::uintptr_t, UnwindImage>& UnwindImages() {
+  static auto& images = *new std::unordered_map<std::uintptr_t, UnwindImage>();
+  return images;
+}
+
+void WriteUnwindInfo(const UnwindImage& image, const std::uint8_t* base, ModuleInfoForUnwind* info) {
+  if (image.hasTables) {
+    info->eh_frame_hdr_addr = image.tables.header;
+    info->eh_frame_addr = image.tables.frames;
+    info->eh_frame_size = image.tables.framesSize;
+    info->seg0_addr = reinterpret_cast<std::uint64_t>(base);
+    info->seg0_size = image.size;
+  }
+  std::strncpy(info->name, image.name.c_str(), sizeof(info->name) - 1);
+  info->name[sizeof(info->name) - 1] = '\0';
+}
+
+void FillUnwindImage(void* allocationBase, ModuleInfoForUnwind* info) {
+  const auto* base = static_cast<const std::uint8_t*>(allocationBase);
+  const auto key = reinterpret_cast<std::uintptr_t>(base);
+  {
+    std::lock_guard lock(unwindImagesMutex);
+    const auto found = UnwindImages().find(key);
+    if (found != UnwindImages().end()) {
+      WriteUnwindInfo(found->second, base, info);
+      return;
+    }
+  }
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
   if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without a DOS header");
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
   if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: image without an NT header");
-  EhFrame::Tables tables;
-  if (!EhFrame::ReadEhmeta(reinterpret_cast<std::uintptr_t>(base), *nt, "sceKernelGetModuleInfoForUnwind", tables)) return;
-  info->eh_frame_hdr_addr = tables.header;
-  info->eh_frame_addr = tables.frames;
-  info->eh_frame_size = tables.framesSize;
-  info->seg0_addr = reinterpret_cast<std::uint64_t>(base);
-  info->seg0_size = nt->OptionalHeader.SizeOfImage;
+  UnwindImage fresh;
+  fresh.size = nt->OptionalHeader.SizeOfImage;
+  fresh.hasTables = EhFrame::ReadEhmeta(key, *nt, "sceKernelGetModuleInfoForUnwind", fresh.tables);
+  char path[4096] = {};
+  const DWORD length = GetMappedFileNameA(GetCurrentProcess(), allocationBase, path, sizeof(path) - 1);
+  fresh.name.assign(path, length);
+  std::lock_guard lock(unwindImagesMutex);
+  const auto& image = UnwindImages().insert_or_assign(key, std::move(fresh)).first->second;
+  WriteUnwindInfo(image, base, info);
 }
+
+bool FillKnownUnwindImage(std::uint64_t address, ModuleInfoForUnwind* info) {
+  PVOID allocationBase = nullptr;
+  if (RtlPcToFileHeader(reinterpret_cast<PVOID>(address), &allocationBase) == nullptr || allocationBase == nullptr) return false;
+  const auto* base = static_cast<const std::uint8_t*>(allocationBase);
+  std::lock_guard lock(unwindImagesMutex);
+  const auto found = UnwindImages().find(reinterpret_cast<std::uintptr_t>(base));
+  if (found == UnwindImages().end() || !found->second.hasTables) return false;
+  info->st_size = sizeof(ModuleInfoForUnwind);
+  WriteUnwindInfo(found->second, base, info);
+  return true;
+}
+}
+
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch() {
+  std::vector<std::uintptr_t> bases;
+  {
+    std::lock_guard lock(unwindImagesMutex);
+    for (const auto& image : UnwindImages()) bases.push_back(image.first);
+  }
+  std::vector<std::uintptr_t> unloaded;
+  for (const auto base : bases) {
+    HMODULE loaded = nullptr;
+    const bool present = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(base), &loaded) != 0 &&
+                         reinterpret_cast<std::uintptr_t>(loaded) == base;
+    if (!present) unloaded.push_back(base);
+  }
+  if (unloaded.empty()) return;
+  std::lock_guard lock(unwindImagesMutex);
+  for (const auto base : unloaded) UnwindImages().erase(base);
 }
 #elif !defined(__APPLE__)
 extern "C" int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info);
@@ -217,18 +284,7 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   if (!info) return SCE_KERNEL_ERROR_EFAULT;
 #ifdef _WIN32
   TraceThrow(addr);
-  // Guest images (their .ehmeta) answer for their whole extent: the stack walks of the title's
-  // runtime (many per frame, not only throws) reach them without a VirtualQuery per frame. Images
-  // stay mapped while their frames can be walked.
-  static std::shared_mutex guestRangesLock;
-  static std::map<std::uint64_t, std::pair<std::uint64_t, ModuleInfoForUnwind>> guestRanges;
-  {
-    std::shared_lock lock(guestRangesLock);
-    if (auto it = guestRanges.upper_bound(addr); it != guestRanges.begin() && addr < (--it)->second.first) {
-      *info = it->second.second;
-      return 0;
-    }
-  }
+  if (FillKnownUnwindImage(addr, info)) return 0;
   MEMORY_BASIC_INFORMATION mbi{};
   if (!VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi))) return SCE_KERNEL_ERROR_ESRCH;
   info->st_size = sizeof(ModuleInfoForUnwind);
@@ -237,63 +293,15 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   info->eh_frame_size = 0;
   info->seg0_addr = reinterpret_cast<std::uint64_t>(mbi.BaseAddress);
   info->seg0_size = mbi.RegionSize;
-  // An image's answer never changes while it is mapped, and C++ unwinding asks once per frame of
-  // every throw: the eh_frame walk (millions of bytes for a large module) and the mapped-file
-  // query are made once per image. Other regions are described per call, as before.
-  struct ImageUnwind {
-    ModuleInfoForUnwind info;
-    bool guest;
-  };
-  static std::shared_mutex imagesLock;
-  static std::unordered_map<const void*, ImageUnwind> images;
-  const auto describeName = [&](ModuleInfoForUnwind* target) {
-    char path[4096] = {};
-    DWORD len = GetMappedFileNameA(GetCurrentProcess(), mbi.BaseAddress, path, sizeof(path) - 1);
-    path[len] = '\0';
-    std::strncpy(target->name, path, sizeof(target->name) - 1);
-    target->name[sizeof(target->name) - 1] = '\0';
-  };
-  // Debug aid: APS5_TRACE_UNWIND_INFO=1 counts the lookups every 5 s by region type and names the
-  // first regions outside images.
-  static const bool trace = std::getenv("APS5_TRACE_UNWIND_INFO") != nullptr;
-  if (trace) {
-    static std::atomic<std::uint64_t> images_{0}, privates{0}, mapped{0};
-    static std::atomic<std::int64_t> lastReport{0};
-    static std::atomic<int> named{0};
-    (mbi.Type == MEM_IMAGE ? images_ : mbi.Type == MEM_PRIVATE ? privates : mapped).fetch_add(1, std::memory_order_relaxed);
-    if (mbi.Type != MEM_IMAGE && named.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[unwind-info] 0x%llx in %s region 0x%llx+0x%llx (allocation 0x%llx, protect 0x%lx)\n", static_cast<unsigned long long>(addr), mbi.Type == MEM_PRIVATE ? "private" : "mapped", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress)), static_cast<unsigned long long>(mbi.RegionSize), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(mbi.AllocationBase)), mbi.Protect);
-    const auto now = static_cast<std::int64_t>(GetTickCount64());
-    auto last = lastReport.load(std::memory_order_relaxed);
-    if (now - last >= 5000 && lastReport.compare_exchange_strong(last, now)) std::fprintf(stderr, "[unwind-info] lookups so far: %llu in images, %llu private, %llu mapped\n", static_cast<unsigned long long>(images_.load()), static_cast<unsigned long long>(privates.load()), static_cast<unsigned long long>(mapped.load()));
-  }
-  if (mbi.Type != MEM_IMAGE) {
-    // Private memory maps no file: the name query would only fail, a system call per frame.
-    if (mbi.Type == MEM_MAPPED) describeName(info);
-    else info->name[0] = '\0';
+  if (mbi.Type == MEM_IMAGE) {
+    FillUnwindImage(mbi.AllocationBase, info);
     return 0;
   }
-  {
-    std::shared_lock lock(imagesLock);
-    if (const auto found = images.find(mbi.AllocationBase); found != images.end()) {
-      const auto seg0 = std::pair{info->seg0_addr, info->seg0_size};
-      *info = found->second.info;
-      if (!found->second.guest) std::tie(info->seg0_addr, info->seg0_size) = seg0;
-      return 0;
-    }
-  }
-  ImageUnwind entry{*info, false};
-  FillGuestUnwindInfo(static_cast<const std::uint8_t*>(mbi.AllocationBase), &entry.info);
-  entry.guest = entry.info.eh_frame_hdr_addr != 0;
-  describeName(&entry.info);
-  {
-    std::unique_lock lock(imagesLock);
-    images.emplace(mbi.AllocationBase, entry);
-  }
-  if (entry.guest) {
-    std::unique_lock lock(guestRangesLock);
-    guestRanges.emplace(entry.info.seg0_addr, std::pair{entry.info.seg0_addr + entry.info.seg0_size, entry.info});
-  }
-  *info = entry.info;
+  char path[4096] = {};
+  const DWORD len = GetMappedFileNameA(GetCurrentProcess(), mbi.BaseAddress, path, sizeof(path) - 1);
+  path[len] = '\0';
+  std::strncpy(info->name, path, sizeof(info->name) - 1);
+  info->name[sizeof(info->name) - 1] = '\0';
   return 0;
 #elif defined(__APPLE__)
   struct Search {

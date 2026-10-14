@@ -11,6 +11,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Recompiler.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "DepthFastClearHarness.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -255,6 +256,59 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     device.Draw(state, draw, shaders);
 }
 
+alignas(256) std::array<std::array<std::uint32_t, 9>, 3> DepthOnlyPrograms{};
+
+void DepthOnlyCoverage(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& harness, const Block& depth, float alpha, std::size_t slot, bool written, std::uint32_t enable = 0x3u, float fourth = 0.0f) {
+    namespace Harness = DepthFastClearHarness;
+    const Harness::Surface surface{depth.Address(), 0, 0, false, VK_FORMAT_D32_SFLOAT};
+    auto& code = DepthOnlyPrograms[slot];
+    code = {0x7e0802ffu, 0x3e800000u, 0x7e0a02ffu, std::bit_cast<std::uint32_t>(alpha), 0x7e0e02ffu, std::bit_cast<std::uint32_t>(fourth), 0xf8001800u | enable, 0x07060504u, 0xbf810000u};
+    const std::span<const std::uint32_t> pixelCode(code.data(), 9);
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.wave32 = true;
+    pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
+    pixel.posX = true;
+    pixel.posY = true;
+    pixel.targetOutputMode[0] = 3;
+    pixel.targetExportMapping.fill(0xe4u);
+    pixel.alphaToCoverage = true;
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
+    ShaderRecompiler::RecompileRequest fragment{
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
+        {32, 0, {}, std::nullopt, pixel, std::nullopt, pixelMemory},
+        device.Target(),
+        PixelPushLayout(harness.vertexPush, device.Target())
+    };
+    fragment.useCache = false;
+    const auto pixelResult = ShaderRecompiler::Recompile(fragment);
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
+        {ShaderStage::Vertex, &harness.vertex, 0},
+        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(harness.vertexPush, device.Target())}
+    }};
+    AgcDriver::Graphics::State state{};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+    state.depth = AgcDriver::Graphics::DepthTarget{surface.depth, 0, {Harness::Width, Harness::Height}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0, false};
+    state.depthTest = true;
+    state.depthWrite = true;
+    state.depthCompare = VK_COMPARE_OP_ALWAYS;
+    state.alphaToCoverage = true;
+    state.renderExtent = {Harness::Width, Harness::Height};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(Harness::Height), static_cast<float>(Harness::Width), -static_cast<float>(Harness::Height), 0, 1};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, {Harness::Width, Harness::Height}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blendConstants = {};
+    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Harness::Triangles().size()), 0, 1, 0, false};
+    device.Draw(state, draw, shaders);
+    device.WaitIdle();
+    const auto passed = Harness::Draw(device, harness, surface, {.depthCompare = VK_COMPARE_OP_LESS});
+    char detail[160];
+    std::snprintf(detail, sizeof(detail), "a depth-only draw with alpha-to-coverage and a 32_AR alpha of %.2f (export mask 0x%x, fourth channel %.2f) left %u of %u pixels at the cleared depth", alpha, enable, fourth, passed, Harness::Covered);
+    Require(passed == (written ? 0u : Harness::Covered), detail);
+}
+
 std::vector<std::uint16_t> ReadBack(AgcDriver::VulkanDevice& device, const Block& block) {
     AgcDriver::Graphics::StorageTexture::FlushPending(block.Address(), block.bytes, nullptr, "test read-back");
     device.WaitIdle();
@@ -343,6 +397,13 @@ int main() {
             Check(*device, block, layout, before, [&](const Color& destination) { return test.written ? source : destination; }, name);
             programCount = 0;
         }
+        const auto harness = DepthFastClearHarness::Compile(*device);
+        const Block coveredDepth(BlockBytes);
+        const Block discardedDepth(BlockBytes);
+        DepthOnlyCoverage(*device, harness, coveredDepth, 0.75f, 0, true);
+        DepthOnlyCoverage(*device, harness, discardedDepth, 0.25f, 1, false);
+        const Block fullMaskDepth(BlockBytes);
+        DepthOnlyCoverage(*device, harness, fullMaskDepth, 0.25f, 2, false, 0xfu, 0.75f);
         std::puts("alpha-to-coverage tests passed");
         return 0;
     } catch (const std::exception& error) {

@@ -19,20 +19,9 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-// The fill kernel below with its 16-byte element loaded from a one-element source buffer (user
-// words 4-7) instead of given in the user data: Unity's clear of a target's DCC keys, some hundred
-// times a second (as a compute dispatch its result was unknown until the GPU had run it, and every
-// draw into the target waited for it: WaitForKeyWriters). APS5_NO_SOURCE_FILL_HLE=1 dispatches it
-// as before.
-bool matchesSourceFillKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData) {
-    static const bool enabled = std::getenv("APS5_NO_SOURCE_FILL_HLE") == nullptr;
+bool matchesBufferPatternFillKernel(std::span<const std::uint32_t> code) {
     static constexpr std::array<std::uint32_t, 12> kernel{0xd7460004u, 0x04010c08u, 0xf4280302u, 0xfa000000u, 0xbf8cc07fu, 0x7e00020cu, 0x7e02020du, 0x7e04020eu, 0x7e06020fu, 0xe01c2000u, 0x80000004u, 0xbf810000u};
-    if (!enabled || userData.size() != 8 || code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return false;
-    const auto sourceStride = (userData[5] >> 16u) & 0x3fffu;
-    const bool sourceSwizzled = ((userData[5] >> 31u) & 1u) != 0;
-    const bool sourceAddTid = ((userData[7] >> 23u) & 1u) != 0;
-    const auto source = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
-    return (userData[7] >> 30u) == 0 && sourceStride == 16 && !sourceSwizzled && !sourceAddTid && userData[6] >= 1 && source != 0 && source % 4 == 0;
+    return code.size() >= kernel.size() && std::equal(kernel.begin(), kernel.end(), code.begin());
 }
 
 }
@@ -42,14 +31,8 @@ bool Driver::matchesFillKernel(std::span<const std::uint32_t> code, const std::v
     static const bool patternEnabled = std::getenv("APS5_NO_PATTERN_FILL_HLE") == nullptr;
     if (!enabled || userData.size() < 8 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1) return false;
     if (patternEnabled && MatchesPatternFillKernel(code, userData, compute)) return true;
-    if (matchesSourceFillKernel(code, userData)) {
-        const auto stride = (userData[1] >> 16u) & 0x3fffu;
-        const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
-        const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
-        return (userData[3] >> 30u) == 0 && stride == 16 && !swizzled && !addTid && (userData[3] & 0xfffu) == 0xfacu && ((userData[3] >> 12u) & 0x7fu) == 0x4bu;
-    }
     static constexpr std::array<std::uint32_t, 9> fillKernel{0xd7460004u, 0x04010c08u, 0x7e000204u, 0x7e020205u, 0x7e040206u, 0x7e060207u, 0xe01c2000u, 0x80000004u, 0xbf810000u};
-    if (code.size() < fillKernel.size() || !std::equal(fillKernel.begin(), fillKernel.end(), code.begin())) return false;
+    if (!matchesBufferPatternFillKernel(code) && (code.size() < fillKernel.size() || !std::equal(fillKernel.begin(), fillKernel.end(), code.begin()))) return false;
 
     const auto stride = (userData[1] >> 16u) & 0x3fffu;
     const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
@@ -105,6 +88,32 @@ std::optional<DwordPatternFill> MatchZeroDwordFill(std::span<const std::uint32_t
     const auto base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
     if (dwords == 0 || dwords % 4u != 0 || base % 16u != 0) return std::nullopt;
     return DwordPatternFill{base, static_cast<std::size_t>(dwords * 4u), {}};
+}
+
+std::optional<Graphics::MemoryValueFill> MatchMemoryValueBufferFill(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
+    static const bool enabled = std::getenv("APS5_NO_FILL_HLE") == nullptr;
+    if (!enabled || userData.size() != 8 || packet.size() < 5 || (packet[4] & 0x20u) != 0 || !compute.groupIdEnable[0]) return std::nullopt;
+    const auto fill = Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]});
+    if (!fill) return std::nullopt;
+    if (fill->address % 16u != 0 || fill->bytes % 16u != 0) return std::nullopt;
+    return fill;
+}
+
+bool IsByteFill(const std::array<std::uint32_t, 4>& pattern) {
+    return std::all_of(pattern.begin(), pattern.end(), [&](std::uint32_t word) { return word == (pattern[0] & 0xffu) * 0x01010101u; });
+}
+
+std::optional<Graphics::DccKeys> KeysFillMemo(const std::array<std::uint32_t, 4>& pattern, bool coversStorageKeys, bool memoryValueFill) {
+    if (!IsByteFill(pattern) || !(coversStorageKeys || memoryValueFill)) return std::nullopt;
+    switch (pattern[0] & 0xffu) {
+        case 0x00: return Graphics::DccKeys::Clear0000;
+        case 0x40: return Graphics::DccKeys::Clear0001;
+        case 0x80: return Graphics::DccKeys::Clear1110;
+        case 0xc0: return Graphics::DccKeys::Clear1111;
+        case 0x20: return Graphics::DccKeys::ClearRegister;
+        case 0xff: return Graphics::DccKeys::Uncompressed;
+        default: return std::nullopt;
+    }
 }
 
 bool Driver::fillClearEnabled() {
@@ -174,7 +183,9 @@ void Driver::fillClearCount(const Graphics::StorageTexture::FillCoverage& covera
 bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice) {
     auto dwordFill = MatchDwordPatternFill(packet, code, userData, compute);
     if (!dwordFill) dwordFill = MatchZeroDwordFill(packet, code, userData, compute);
-    if (!dwordFill && !matchesFillKernel(code, userData, compute)) return false;
+    std::optional<Graphics::MemoryValueFill> memoryFill;
+    if (!dwordFill) memoryFill = MatchMemoryValueBufferFill(packet, code, userData, compute);
+    if (!dwordFill && !memoryFill && !matchesFillKernel(code, userData, compute)) return false;
     std::uint64_t base;
     std::size_t bytes;
     std::array<std::uint32_t, 4> pattern;
@@ -183,6 +194,15 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         base = dwordFill->base;
         bytes = dwordFill->bytes;
         pattern = dwordFill->pattern;
+    } else if (memoryFill) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
+        inputLock.lock();
+        recordLabelsForPacket(localDevice.get(), queueId);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(memoryFill->valueAddress), 4)) return false;
+        GuestMemory::Read(memoryFill->valueAddress, std::as_writable_bytes(std::span(pattern).first(1)), 4);
+        std::fill(pattern.begin() + 1, pattern.end(), pattern[0]);
+        base = memoryFill->address;
+        bytes = memoryFill->bytes;
     } else if (MatchesPatternFillKernel(code, userData, compute)) {
         const auto range = DecodePatternFillRange(userData, packet);
         if (!range) return false;
@@ -214,16 +234,13 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto records = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, numRecords);
         base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
         bytes = static_cast<std::size_t>(records * 16u);
-        if (matchesSourceFillKernel(code, userData)) {
-            // The element is read now, in packet order, as the pattern kernel's source is.
+        if (matchesBufferPatternFillKernel(code)) {
             const auto source = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
-            if (bytes != 0 && source < base + bytes && base < source + 16) return false;
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
             inputLock.lock();
             recordLabelsForPacket(localDevice.get(), queueId);
-            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), 16)) return false;
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), sizeof(pattern))) return false;
             GuestMemory::Read(source, std::as_writable_bytes(std::span(pattern)), 4);
-            inputLock.unlock();
         } else {
             pattern = {userData[4], userData[5], userData[6], userData[7]};
         }
@@ -238,21 +255,21 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     static std::array<double, FillPhaseCount> fillPhaseMs{};
     static std::array<double, 8> holdByCoverMs{};
     static std::array<std::uint64_t, 8> holdByCover{};
-    static std::uint64_t flushes = 0, flushed = 0;
+    static std::uint64_t flushes = 0, flushed = 0, absorbedFills = 0, absorbedBytes = 0;
     static auto fillReport = std::chrono::steady_clock::now();
     ++fills;
     filledBytes += bytes;
     if (bytes == 0) return true;
     Graphics::TraceGuestFill(dwordFill ? "title dword-pattern fill" : "title fill kernel", base, bytes, pattern[0]);
-    // Unity's key clear (the source fill kernel) was a dispatch until it was handled here, and a
+    // Unity's key clear (the buffer pattern fill kernel) was a dispatch until it was handled here, and a
     // dispatch never marked the images over the keys as filled (NoteKeysFill), which stops their
     // first write from storing uncompressed keys. With that mark the lobby's whiteboards went black
-    // as the camera moved between them (gone with the changes of that week off; this mark is the
-    // suspect being tested). Its keys are still known without a wait (NoteKeysFillOnGpu).
+    // as the camera moved between them, and were fine without it. Its keys are still known without
+    // a wait (NoteKeysFillOnGpu).
     // APS5_SOURCE_FILL_NOTES=1 marks the images as for the other fills.
     static const bool sourceFillNotes = std::getenv("APS5_SOURCE_FILL_NOTES") != nullptr;
-    const bool noteImages = dwordFill || sourceFillNotes || !matchesSourceFillKernel(code, userData);
-    const auto store = [this, queueId, base, bytes, pattern, localDevice, noteImages] {
+    const bool noteImages = dwordFill || sourceFillNotes || !matchesBufferPatternFillKernel(code);
+    const auto store = [this, queueId, base, bytes, pattern, localDevice, memoryFill, noteImages] {
         // In packet order with the draws before it: a draw still in the pipeline binds the depth
         // plane before this fill clears it, and stores its DCC keys before the title's metadata fill.
         if (pattern[0] == pattern[1] && pattern[0] == pattern[2] && pattern[0] == pattern[3]) {
@@ -279,7 +296,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
 
         static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
         if (traceKeys && coverage.cover == Graphics::StorageTexture::FillCover::Keys) std::fprintf(stderr, "[dcc-keys] title fills keys 0x%llx+0x%zx with %08x %08x %08x %08x (queue 0x%x)\n", static_cast<unsigned long long>(base), bytes, pattern[0], pattern[1], pattern[2], pattern[3], queueId);
-        const bool uniformKeysFill = coverage.cover == Graphics::StorageTexture::FillCover::Keys && std::all_of(pattern.begin(), pattern.end(), [&](std::uint32_t word) { return word == (pattern[0] & 0xffu) * 0x01010101u; });
+        const bool uniformKeysFill = coverage.cover == Graphics::StorageTexture::FillCover::Keys && IsByteFill(pattern);
         if (uniformKeysFill && noteImages) {
             Graphics::StorageTexture::NoteKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
             Graphics::StorageTexture::ClearByKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
@@ -304,29 +321,23 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         fillClearCount(coverage, bytes, pattern, discarded, cleared, refusal);
         noteForeignWriter(base, base + bytes, queueId);
 
-        if (!cleared) {
+        const bool uniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
+        const bool absorbed = !cleared && uniform && coverage.cover == Graphics::StorageTexture::FillCover::None && Graphics::MultisampledColorFillAbsorbs(base, bytes, pattern[0]);
+        if (absorbed) {
+            ++absorbedFills;
+            absorbedBytes += bytes;
+        } else if (!cleared) {
             ++flushes;
 
             if (Graphics::StorageTexture::FlushPending(base, bytes, nullptr, "buffer fill", Graphics::PublishScope::PartialUnits)) ++flushed;
         }
         phase(FillFlush);
-        const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern);
+        const bool stored = cleared || absorbed || localDevice->FillBuffer(base, bytes, pattern);
         phase(FillDevice);
-        if (uniformKeysFill && stored && !cleared) {
-            Graphics::DccKeys filled = Graphics::DccKeys::Mixed;
-            switch (pattern[0] & 0xffu) {
-                case 0x00: filled = Graphics::DccKeys::Clear0000; break;
-                case 0x40: filled = Graphics::DccKeys::Clear0001; break;
-                case 0x80: filled = Graphics::DccKeys::Clear1110; break;
-                case 0xc0: filled = Graphics::DccKeys::Clear1111; break;
-                case 0x20: filled = Graphics::DccKeys::ClearRegister; break;
-                case 0xff: filled = Graphics::DccKeys::Uncompressed; break;
-                default: break;
-            }
-            if (filled != Graphics::DccKeys::Mixed) Graphics::NoteKeysFillOnGpu(base, bytes, filled);
+        if (stored && !cleared && !absorbed) {
+            if (const auto filled = KeysFillMemo(pattern, uniformKeysFill, memoryFill.has_value())) Graphics::NoteKeysFillOnGpu(base, bytes, *filled);
         }
-        if (profile && stored && !cleared) {
-            const bool uniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
+        if (profile && stored && !cleared && !absorbed) {
             ++(uniform ? uniformFills : patternFills);
             (uniform ? uniformBytes : patternBytes) += bytes;
             if (!uniform) chainCopies += static_cast<std::uint64_t>(std::bit_width((bytes / 16) - 1));
@@ -343,7 +354,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             for (std::size_t done = 0; done < bytes; done += chunk) GuestMemory::Write(base + done, std::span<const std::byte>(block).first(std::min(chunk, bytes - done)), 16);
             phase(FillCpu);
         }
-        if (pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3]) {
+        if (uniform) {
             Graphics::NoteDepthMetadataFill(base, bytes, pattern[0]);
             Graphics::NoteColorMetadataFill(base, bytes, pattern[0]);
         }
@@ -361,6 +372,9 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
                     std::snprintf(text, sizeof(text), " %s %.0f", fillPhaseNames[i], fillPhaseMs[i]);
                     line += text;
                 }
+                char absorbedText[128];
+                std::snprintf(absorbedText, sizeof(absorbedText), "; multisampled clears not stored %llu (%.0f MiB)", static_cast<unsigned long long>(absorbedFills), static_cast<double>(absorbedBytes) / 1048576.0);
+                line += absorbedText;
                 line += "; hold by cover (count/ms):";
                 for (std::size_t i = 0; i < coverNames.size(); ++i) {
                     std::snprintf(text, sizeof(text), " %s %llu/%.0f", coverNames[i], static_cast<unsigned long long>(holdByCover[i]), holdByCoverMs[i]);

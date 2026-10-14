@@ -5,6 +5,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -157,6 +158,7 @@ def elf_exports(path, data):
             continue
         if entry != 24 or size % 24 or link >= len(sections) or sections[link][1] != 3:
             raise AuditError(f"{path}: invalid dynamic symbol table (entry size {entry}, size {size}, string table section {link})")
+        take(data, offset, size, path, "dynamic symbol table")
         strings_offset, strings_size = sections[link][4], sections[link][5]
         take(data, strings_offset, strings_size, path, "dynamic string table")
         indexes = [candidate for candidate in sections if candidate[1] == 18 and candidate[6] == section_index]
@@ -342,17 +344,30 @@ def source_stubs(source):
     if not Path(source).is_dir():
         raise AuditError(f"{source}: not a directory")
     stubs = {}
+    shared = {}
     for library in sorted(item for item in Path(source).iterdir() if item.is_dir()):
         aliases = {}
         for file in library.rglob("*.cpp"):
             for nid, name in nid_names.source_aliases(file.read_text(errors="ignore")):
                 aliases[name] = nid
         group = progress.scan_library(library)
+        if "shared_sources" in group:
+            shared[library.name] = group["shared_sources"]
         done = {nid_of(name, aliases) for name in group["done_names"]}
         for name in group["todo_names"]:
             nid = nid_of(name, aliases)
             if nid not in done:
                 stubs.setdefault((library.name + ".prx", nid), name)
+    for library, owner in shared.items():
+        chain = [library]
+        while owner in shared:
+            if owner in chain:
+                raise AuditError(f"{source}: shared source cycle: {' -> '.join(chain + [owner])}")
+            chain.append(owner)
+            owner = shared[owner]
+        for (provider, nid), name in list(stubs.items()):
+            if provider == owner + ".prx":
+                stubs[(library + ".prx", nid)] = name
     return stubs
 
 
@@ -446,6 +461,23 @@ def attach_names(records, names):
             name = names[record["nid"]]
             record["name"] = name
             record["name_verified"] = nid_names.compute_nid(name) == record["nid"]
+
+
+def write_json(path, result):
+    if path.is_dir():
+        raise AuditError(f"{path}: JSON output is a directory")
+    destination = path.resolve()
+    with tempfile.TemporaryDirectory(dir=destination.parent, prefix=destination.name + ".", suffix=".tmp") as directory:
+        temporary = Path(directory) / destination.name
+        try:
+            temporary.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+            if destination.exists():
+                temporary.chmod(destination.stat().st_mode & 0o7777)
+            temporary.replace(destination)
+        finally:
+            if temporary.exists():
+                temporary.chmod(0o600)
+            temporary.unlink(missing_ok=True)
 
 
 def git_stamp(source=ROOT):
@@ -544,7 +576,7 @@ def main(argv=None):
                            "library": entry["stop"]["library"] if entry["stop"] else None,
                            "name": entry["stop"]["name"] if entry["stop"] else None} for entry in stops]
             result = {"source_commit": commit, "source_dirty": dirty, "registries": [str(path) for path in args.registries], **summary, "stops": json_stops, "imports": records}
-            args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+            write_json(args.json, result)
     except AuditError as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 2

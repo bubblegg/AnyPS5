@@ -11,10 +11,6 @@ Entries about one library or component are in [debt](debt/), one file per librar
   - libstdc++-6.dll
   - libwinpthread-1.dll
 
-### Direct memory
-
-- Windows direct-memory backing reserves a paging-file section and commits each mapped guest page before setting its protection. Committed physical contents remain in the section across unmap/remap and are released when the backing and its remaining views are destroyed; commitment is not recovered merely by unmapping a page. Linux retains its existing backing. Peak gameplay memory and Windows versions other than the tested host remain unverified.
-
 ### Silent stubs
 
 Throughout the project, every function at every stage either **does exactly what it's supposed to or throws an exception**. Everywhere... except:

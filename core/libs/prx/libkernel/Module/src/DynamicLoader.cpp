@@ -27,6 +27,10 @@
 #include <link.h>
 #endif
 
+#ifdef _WIN32
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch();
+#endif
+
 namespace {
 thread_local std::array<char, 512> loaderError{};
 thread_local bool pendingError = false;
@@ -42,6 +46,7 @@ struct Module {
         if (owned && native) {
 #ifdef _WIN32
             FreeLibrary(static_cast<HMODULE>(native));
+            ForgetUnloadedUnwindImages_nid_no_patch();
 #else
             ::dlclose(native);
 #endif
