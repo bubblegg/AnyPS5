@@ -244,7 +244,15 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     filledBytes += bytes;
     if (bytes == 0) return true;
     Graphics::TraceGuestFill(dwordFill ? "title dword-pattern fill" : "title fill kernel", base, bytes, pattern[0]);
-    const auto store = [this, queueId, base, bytes, pattern, localDevice] {
+    // Unity's key clear (the source fill kernel) was a dispatch until it was handled here, and a
+    // dispatch never marked the images over the keys as filled (NoteKeysFill), which stops their
+    // first write from storing uncompressed keys. With that mark the lobby's whiteboards went black
+    // as the camera moved between them (gone with the changes of that week off; this mark is the
+    // suspect being tested). Its keys are still known without a wait (NoteKeysFillOnGpu).
+    // APS5_SOURCE_FILL_NOTES=1 marks the images as for the other fills.
+    static const bool sourceFillNotes = std::getenv("APS5_SOURCE_FILL_NOTES") != nullptr;
+    const bool noteImages = dwordFill || sourceFillNotes || !matchesSourceFillKernel(code, userData);
+    const auto store = [this, queueId, base, bytes, pattern, localDevice, noteImages] {
         // In packet order with the draws before it: a draw still in the pipeline binds the depth
         // plane before this fill clears it, and stores its DCC keys before the title's metadata fill.
         if (pattern[0] == pattern[1] && pattern[0] == pattern[2] && pattern[0] == pattern[3]) {
@@ -272,7 +280,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
         if (traceKeys && coverage.cover == Graphics::StorageTexture::FillCover::Keys) std::fprintf(stderr, "[dcc-keys] title fills keys 0x%llx+0x%zx with %08x %08x %08x %08x (queue 0x%x)\n", static_cast<unsigned long long>(base), bytes, pattern[0], pattern[1], pattern[2], pattern[3], queueId);
         const bool uniformKeysFill = coverage.cover == Graphics::StorageTexture::FillCover::Keys && std::all_of(pattern.begin(), pattern.end(), [&](std::uint32_t word) { return word == (pattern[0] & 0xffu) * 0x01010101u; });
-        if (uniformKeysFill) {
+        if (uniformKeysFill && noteImages) {
             Graphics::StorageTexture::NoteKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
             Graphics::StorageTexture::ClearByKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
         }
