@@ -1480,10 +1480,11 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::
     // which blocks are active follows from the structural words and the memory read, so it is as in
     // the walk before. A descriptor that differs from its user word was inactive and stays zero; an
     // all-zero one over a zero user word may be either, so a change of that word needs the walk.
-    const auto inactive = [&](const auto& passed) { return was.buffers[passed.buffer].dwords[passed.dword] != was.userData[passed.word]; };
+    // A word's value in the snapshot is masked as the materialization normalizes it.
+    const auto inactive = [&](const auto& passed) { return was.buffers[passed.buffer].dwords[passed.dword] != (was.userData[passed.word] & passed.mask); };
     for (const auto& passed : walk->passedWords) {
         const auto& descriptor = was.buffers[passed.buffer];
-        const auto changed = user[passed.word] ^ was.userData[passed.word];
+        const auto changed = (user[passed.word] ^ was.userData[passed.word]) & passed.mask;
         if (inactive(passed)) {
             if (descriptor.dwords != DescriptorValue{}.dwords) return nullptr;
             continue;
@@ -1500,9 +1501,9 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Recapture(std::
     bool same = true;
     for (const auto& passed : walk->passedWords) {
         auto& descriptor = snapshot.buffers[passed.buffer];
-        if (descriptor.dwords[passed.dword] != snapshot.userData[passed.word]) continue;
+        if (descriptor.dwords[passed.dword] != (snapshot.userData[passed.word] & passed.mask)) continue;
         const auto before = planBits(descriptor);
-        descriptor.dwords[passed.dword] = user[passed.word];
+        descriptor.dwords[passed.dword] = user[passed.word] & passed.mask;
         same = same && planBits(descriptor) == before;
     }
     snapshot.userData.assign(user.begin(), user.begin() + plan.userDataCount);

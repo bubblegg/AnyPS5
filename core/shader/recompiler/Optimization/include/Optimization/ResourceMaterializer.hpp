@@ -20,6 +20,9 @@ public:
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
+    // A buffer the program only loads through scalar instructions: its descriptor's reserved bit in
+    // dword 1 and its dword 3 are cleared after the walk (materializeTables).
+    static bool ScalarOnlyBuffer(const IrResourcePlan& plan, std::uint32_t buffer);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
     static std::uint64_t SpecializationNanoseconds();

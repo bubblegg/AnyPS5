@@ -75,10 +75,13 @@ struct CompiledWalk {
     // a walk differs from the last one in the passed words alone (of the buffers whose source is
     // active, with control flow in the plan: the conditions are structural). `replayable` is false
     // for a plan this is not worked out for (an image table, a user word beyond the plan's count).
+    // `mask`: the bits of the word the snapshot keeps (a scalar-only buffer's descriptor is
+    // normalized after the walk, ResourceMaterializer::ScalarOnlyBuffer).
     struct PassedWord {
         std::uint32_t buffer;
         std::uint32_t dword;
         std::uint32_t word;
+        std::uint32_t mask = 0xffffffffu;
     };
     bool replayable = false;
     std::vector<std::uint32_t> structuralWords;

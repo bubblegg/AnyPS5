@@ -587,10 +587,7 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
 
 void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables) {
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
-        const auto& buffer = plan.info.buffers[i];
-        const bool scalarOnly = buffer.scalar && !buffer.written && !buffer.atomic && !buffer.formatted && buffer.imageAlias == BufferResource::NoImageAlias
-            && std::none_of(plan.memoryInfo.begin(), plan.memoryInfo.end(), [i](const MemoryInfo& memory) { return memory.kind == ResourceKind::Buffer && memory.resource == i; });
-        if (scalarOnly) {
+        if (ResourceMaterializer::ScalarOnlyBuffer(plan, i)) {
             snapshot.buffers.at(i).dwords[1] &= ~0x40000000u;
             snapshot.buffers.at(i).dwords[3] = 0u;
         }
@@ -634,6 +631,12 @@ void materializeSrtGuards(const IrResourcePlan& plan, ResourceSnapshot& snapshot
     }
 }
 
+}
+
+bool ResourceMaterializer::ScalarOnlyBuffer(const IrResourcePlan& plan, std::uint32_t i) {
+    const auto& buffer = plan.info.buffers.at(i);
+    return buffer.scalar && !buffer.written && !buffer.atomic && !buffer.formatted && buffer.imageAlias == BufferResource::NoImageAlias
+        && std::none_of(plan.memoryInfo.begin(), plan.memoryInfo.end(), [i](const MemoryInfo& memory) { return memory.kind == ResourceKind::Buffer && memory.resource == i; });
 }
 
 std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageResource& image) {

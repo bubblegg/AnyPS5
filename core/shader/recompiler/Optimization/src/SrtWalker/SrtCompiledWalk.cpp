@@ -1,6 +1,7 @@
 #include "Optimization/SrtWalker/SrtCompiledWalk.hpp"
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -144,7 +145,10 @@ private:
                 const auto node = passed(dwords[dword]);
                 if (node == NoWalkNode) continue;
                 const auto word = static_cast<std::uint32_t>(_walk.nodes[node].immediate);
-                if (!std::binary_search(_walk.structuralWords.begin(), _walk.structuralWords.end(), word)) _walk.passedWords.push_back({static_cast<std::uint32_t>(buffer), dword, word});
+                if (std::binary_search(_walk.structuralWords.begin(), _walk.structuralWords.end(), word)) continue;
+                const bool scalarOnly = ResourceMaterializer::ScalarOnlyBuffer(_plan, static_cast<std::uint32_t>(buffer));
+                const auto mask = !scalarOnly ? 0xffffffffu : dword == 1u ? ~0x40000000u : dword == 3u ? 0u : 0xffffffffu;
+                _walk.passedWords.push_back({static_cast<std::uint32_t>(buffer), dword, word, mask});
             }
         }
         _walk.replayable = true;
